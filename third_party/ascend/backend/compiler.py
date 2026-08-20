@@ -284,8 +284,12 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             # Keep the existing default-on buffer insertion behavior.
             ascend.passes.ttir.set_enable_buffer_insert_optimization(mod)
 
+
         if try_cv_split:
-            ascend.passes.ttir.add_cv_split_scheduling(pm, compile_on_910_95, metadata["cv_split_unroll_factor"])
+            ascend.passes.ttir.add_cv_split_scheduling(
+                pm, compile_on_910_95, metadata["cv_split_unroll_factor"],
+                private_buffer_ub_budget_bytes=metadata["cv_split_private_buffer_ub_budget_bytes"],
+                promote_private_buffer_pools=metadata["cv_split_promote_private_buffer_pools"])
 
         if try_dynamic_cv:
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
@@ -1138,8 +1142,28 @@ class NPUOptions:
     # A5 defaults to transactional auto mode: CV split is attempted first and
     # the unchanged DynamicCVPipeline runs when the candidate rejects. Callers
     # retain an immediate kill switch by setting this option to False.
-    enable_cv_split_scheduling: bool = True if is_compile_on_910_95 else False
+    # Left None here and resolved in parse_options, like every other
+    # target-dependent default: is_compile_on_910_95 is a function, so testing
+    # it directly would be true on every target.
+    enable_cv_split_scheduling: bool = None
     cv_split_unroll_factor: int = 4
+    # Spare UB, in bytes, that cross-scope transfers may spend to stop reusing
+    # buffers across unrolled lanes. It funds merging the two CUBE->VECTOR
+    # roles onto one union slot per lane, which is what lets HEAD_DIM differ
+    # from BLOCK_N: the slot is sized for the larger role and the smaller takes
+    # a contiguous view of its front. Negative means the headroom is not known
+    # here -- this is settled before bufferization, and the backend's memory
+    # planner assigns the addresses and reports an overflow with the exact
+    # requirement -- so spend what the schedule asks and let it arbitrate.
+    # Zero declines any spend, keeping the rotating pools.
+    cv_split_private_buffer_ub_budget_bytes: int = -1
+    # Additionally give individual pools one buffer per lane rather than a
+    # rotating set, cheapest-first against the same budget. Off by default: at
+    # the unroll factors in use, the reuse this removes is already ordered by a
+    # flag the schedule needs for its own data, so it costs buffers and flags
+    # without removing a stall. Turn it on to stop relying on that ordering
+    # being emergent rather than explicit.
+    cv_split_promote_private_buffer_pools: bool = False
     hfusion_enable_multiple_consumer_fusion: bool = False
     buf_slot_num_of_veccore: int = None
     buf_slot_num_of_crosscore: int = None
@@ -1398,6 +1422,13 @@ class AscendBackend(BaseBackend):
                 object.__setattr__(options, "enable_dynamic_cv_pipeline", options.compile_on_910_95)
             if not internal_options:
                 _normalize_bishengir_simt_optimization_for_context(options, opts)
+            # Lazy init enable_cv_split_scheduling if not provided
+            if options.enable_cv_split_scheduling is None:
+                object.__setattr__(options, "enable_cv_split_scheduling", is_compile_on_910_95())
+            # Costmodel path should avoid extra BC<->MLIR conversion stages
+            # to keep compile-only autotune routing lightweight and stable.
+            if getattr(options, "enable_costmodel_backend", False):
+                object.__setattr__(options, "use_bytecode", False)
         else:
             raise NotImplementedError(f"Backend '{self.target.backend}' is not supported. "
                                       "Please ensure the target backend is set to 'npu'.")

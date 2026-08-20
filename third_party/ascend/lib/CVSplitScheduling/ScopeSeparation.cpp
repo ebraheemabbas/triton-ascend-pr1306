@@ -455,7 +455,7 @@ static Type retileRowHalve(Type t, int64_t Mfull) {
       // semantics in a way this local transformation cannot prove.
       SmallVector<int64_t> strides;
       int64_t offset;
-      if (failed(getStridesAndOffset(mt, strides, offset)))
+      if (failed(mt.getStridesAndOffset(strides, offset)))
         return t;
       SmallVector<int64_t> ns(sh.begin(), sh.end());
       ns[0] = half;
@@ -811,7 +811,7 @@ rebuildVectorToCubePacks(ArrayRef<VectorToCubePack> packs, Value sbidx,
     // to_memref + cast to UB
     auto memT = MemRefType::get({N16, M16, kNzTileSize, kNzTileSize}, elemType);
     auto toMem =
-        b.create<bufferization::ToMemrefOp>(loc, memT, resh2.getResult());
+        b.create<bufferization::ToBufferOp>(loc, memT, resh2.getResult());
     auto ubMemT = MemRefType::get({N16, M16, kNzTileSize, kNzTileSize},
                                   elemType, nullptr, ubAddrSpace);
     auto cast =
