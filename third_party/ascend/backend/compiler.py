@@ -289,7 +289,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             ascend.passes.ttir.add_cv_split_scheduling(
                 pm, compile_on_910_95, metadata["cv_split_unroll_factor"],
                 private_buffer_ub_budget_bytes=metadata["cv_split_private_buffer_ub_budget_bytes"],
-                promote_private_buffer_pools=metadata["cv_split_promote_private_buffer_pools"])
+                promote_private_buffer_pools=metadata["cv_split_promote_private_buffer_pools"],
+                sink_scale_into_fixpipe=metadata["cv_split_sink_scale_into_fixpipe"])
 
         if try_dynamic_cv:
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
@@ -1164,6 +1165,13 @@ class NPUOptions:
     # without removing a stall. Turn it on to stop relying on that ordering
     # being emergent rather than explicit.
     cv_split_promote_private_buffer_pools: bool = False
+    # When a score tile's only consumer is one multiply by a constant splat,
+    # the fixpipe applies that constant during the transfer it already makes
+    # (QF322F32_PRE quant scale) and the VECTOR-side multiply disappears. Off
+    # by default: measured 10.7% slower on the FA kernel at hd=64, because the
+    # 305us it adds to the contended fixpipe outweighs the 187us it saves on
+    # VECTOR, which has slack. Turn on only with a measurement behind it.
+    cv_split_sink_scale_into_fixpipe: bool = False
     hfusion_enable_multiple_consumer_fusion: bool = False
     buf_slot_num_of_veccore: int = None
     buf_slot_num_of_crosscore: int = None

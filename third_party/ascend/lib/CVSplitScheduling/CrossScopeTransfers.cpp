@@ -199,6 +199,13 @@ struct TransferEmitContext {
   hivm::PipeAttr pipeVAttr;
   hivm::PipeAttr pipeMte3Attr;
   hivm::PipeAttr pipeMte1Attr;
+  bool sinkScaleIntoFixpipe;
+  // Multiplies absorbed into a fixpipe quant_scale. They stay in the IR until
+  // every transfer and the merged-slot release have consumed their anchors --
+  // wait anchors, phase ends and last-reader scans all hold Operation
+  // pointers into the consumer lists, and erasing mid-emission leaves them
+  // dangling.
+  SmallVector<arith::MulFOp> *absorbedScaleMuls;
 };
 
 // alloc + annotation.mark{effects=["write","read"]}. One shared buffer per
@@ -377,6 +384,41 @@ static Value getOrCreateL1NdView(const TransferEmitContext &c,
 /// been emitted, because the synchronization it should sit next to may belong
 /// to a later phase that does not exist yet while this one is being built.
 
+// A score tile's only VECTOR consumer is often one multiply by a constant
+// splat (softmax's sm_scale).  The fixpipe performing the transfer can apply
+// a scalar during the move it already makes -- pre-stage quantization -- so
+// that multiply rides along for free and the VECTOR-side op disappears.
+// QF322F32_PRE must be explicit: the f32->f32 lowering derives no pre-quant
+// mode on its own and would hand the scalar to a library call that ignores it.
+//
+// Returns the multiply to absorb and its scalar via `quantScale`, or nullptr
+// when the pattern does not apply.  Constant scalars only: anything computed
+// would create a cross-core dependency the schedule does not order.
+static arith::MulFOp matchSinkableScale(const CrossScopeTransfer &xfer,
+                                        Type elemType, FloatAttr &quantScale) {
+  if (!elemType.isF32())
+    return nullptr;
+  if (xfer.consumers.size() != 1)
+    return nullptr;
+  auto mul = dyn_cast<arith::MulFOp>(xfer.consumers.front());
+  if (!mul)
+    return nullptr;
+  Value other = mul.getLhs() == xfer.value ? mul.getRhs() : mul.getLhs();
+  if (other == xfer.value)
+    return nullptr;
+  auto fill = other.getDefiningOp<linalg::FillOp>();
+  if (!fill || fill.getInputs().size() != 1)
+    return nullptr;
+  auto cst = fill.getInputs().front().getDefiningOp<arith::ConstantOp>();
+  if (!cst)
+    return nullptr;
+  auto attr = dyn_cast<FloatAttr>(cst.getValue());
+  if (!attr || !attr.getType().isF32())
+    return nullptr;
+  quantScale = attr;
+  return mul;
+}
+
 static void emitCubeToVectorTransfer(const TransferEmitContext &c,
                                      CrossScopeTransfer &xfer,
                                      RankedTensorType tensorType,
@@ -411,6 +453,20 @@ static void emitCubeToVectorTransfer(const TransferEmitContext &c,
   // and keeps its full score tile live across the synchronization boundary.
   builder.setInsertionPointAfter(xfer.producer);
 
+  FloatAttr quantScaleAttr;
+  arith::MulFOp absorbedScale;
+  if (c.sinkScaleIntoFixpipe)
+    absorbedScale = matchSinkableScale(xfer, elemType, quantScaleAttr);
+  Value quantScale;
+  hivm::FixpipePreQuantModeAttr preQuantAttr;
+  if (absorbedScale) {
+    auto scaleCst = builder.create<arith::ConstantOp>(c.loc, quantScaleAttr);
+    setOpEngineTypeAttr(scaleCst, EngineType::CUBE);
+    quantScale = scaleCst.getResult();
+    preQuantAttr = hivm::FixpipePreQuantModeAttr::get(
+        c.ctx, hivm::FixpipePreQuantMode::QF322F32_PRE);
+  }
+
   auto dmaModeAttr =
       hivm::FixpipeDMAModeAttr::get(c.ctx, hivm::FixpipeDMAMode::NZ2ND);
   auto dualDstAttr = hivm::FixpipeDualDstModeAttr::get(
@@ -420,10 +476,9 @@ static void emitCubeToVectorTransfer(const TransferEmitContext &c,
       xfer.value, // src (full M-row tile from matmul)
       slotBuffer, // dst (M/2-row shared UB slot)
       mlir::ValueRange{}, dmaModeAttr, dualDstAttr,
-      /*sub_block_idx=*/nullptr, /*pre_quant=*/nullptr,
+      /*sub_block_idx=*/nullptr, preQuantAttr,
       /*pre_relu=*/nullptr, /*channel_split=*/nullptr,
-      /*c0_pad_en=*/nullptr, /*unit_flag_mode=*/mlir::ArrayAttr{},
-      /*quant_scale=*/nullptr);
+      /*c0_pad_en=*/nullptr, /*unit_flag_mode=*/mlir::ArrayAttr{}, quantScale);
   setOpEngineTypeAttr(fixpipeOp, EngineType::CUBE);
 
   // CUBE signals VECTOR.
@@ -454,6 +509,9 @@ static void emitCubeToVectorTransfer(const TransferEmitContext &c,
 
   for (auto *consumer : xfer.consumers)
     consumer->replaceUsesOfWith(xfer.value, toTensorOp.getResult());
+
+  if (absorbedScale)
+    c.absorbedScaleMuls->push_back(absorbedScale);
 
   LLVM_DEBUG(llvm::dbgs() << "[cv-split]   C→V transfer #" << flagId << ": "
                           << xfer.producer->getName() << " → " << ubShape[0]
@@ -730,11 +788,32 @@ std::optional<uint64_t> cubeToVectorUnionExtraBytes(
   return unionBytes > pooled ? unionBytes - pooled : 0;
 }
 
+// Retires multiplies whose scalar now rides the fixpipe: each result is
+// rewired to the unscaled score tensor (already scaled in-flight), and the
+// splat and its init are erased once the last multiply lets go of them.
+static void retireAbsorbedScaleMuls(ArrayRef<arith::MulFOp> muls) {
+  for (arith::MulFOp mul : muls) {
+    const bool lhsIsScore =
+        mul.getLhs().getDefiningOp<bufferization::ToTensorOp>() != nullptr;
+    Value score = lhsIsScore ? mul.getLhs() : mul.getRhs();
+    Value splat = lhsIsScore ? mul.getRhs() : mul.getLhs();
+    mul.getResult().replaceAllUsesWith(score);
+    mul->erase();
+    if (Operation *fill = splat.getDefiningOp(); fill && fill->use_empty()) {
+      Value init = cast<linalg::FillOp>(fill).getOutputs().front();
+      fill->erase();
+      if (Operation *empty = init.getDefiningOp(); empty && empty->use_empty())
+        empty->erase();
+    }
+  }
+}
+
 FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
     scf::ForOp loop, const DenseMap<Operation *, EngineType> &classification,
     const DenseMap<Operation *, Operation *> &transferPhaseEnds,
     unsigned interCoreBufferDepth, uint64_t privateBufferUbBudgetBytes,
-    bool promotePrivateBufferPools, unsigned vectorToCubeSlotOverride) {
+    bool promotePrivateBufferPools, unsigned vectorToCubeSlotOverride,
+    bool sinkScaleIntoFixpipe) {
 
   MLIRContext *ctx = loop.getContext();
   Location loc = loop.getLoc();
@@ -877,6 +956,7 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
   LLVM_DEBUG(llvm::dbgs() << "[cv-split] Found " << transfers.size()
                           << " cross-scope value transfers\n");
 
+  SmallVector<arith::MulFOp> absorbedScaleMuls;
   const TransferEmitContext ec{
       ctx,
       loc,
@@ -886,7 +966,9 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
       hivm::PipeAttr::get(ctx, hivm::PIPE::PIPE_FIX),
       hivm::PipeAttr::get(ctx, hivm::PIPE::PIPE_V),
       hivm::PipeAttr::get(ctx, hivm::PIPE::PIPE_MTE3),
-      hivm::PipeAttr::get(ctx, hivm::PIPE::PIPE_MTE1)};
+      hivm::PipeAttr::get(ctx, hivm::PIPE::PIPE_MTE1),
+      sinkScaleIntoFixpipe,
+      &absorbedScaleMuls};
 
   // Flag allocation.
   //
@@ -1245,6 +1327,8 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
     emitMergedSlotRelease(ec, transfers, slotGroupOfOrigin, key,
                           flagBase +
                               static_cast<int>(releaseFlagOffsetByGroup[key]));
+
+  retireAbsorbedScaleMuls(absorbedScaleMuls);
 
   LLVM_DEBUG(llvm::dbgs() << "[cv-split] Inserted " << transfers.size()
                           << " transfers across " << phaseCount
