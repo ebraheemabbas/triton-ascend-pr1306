@@ -64,7 +64,15 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
            "budget. Off by default: at the unroll factors in use the reuse it "
            "removes is already ordered by a flag the schedule needs anyway, so "
            "it costs buffers and flags without removing a stall. Turn it on to "
-           "stop depending on that ordering being emergent.">
+           "stop depending on that ordering being emergent.">,
+    Option<"sinkScaleIntoFixpipe", "sink-scale-into-fixpipe",
+           "bool", /*default*/"true",
+           "when a CUBE-to-VECTOR score tile's only consumer is one multiply "
+           "by a constant splat, apply that constant as the fixpipe's "
+           "quant_scale (QF322F32_PRE) during the transfer and drop the "
+           "VECTOR-side multiply. Turn off to keep the multiply on VECTOR, "
+           "for example if the dual-destination scale path misbehaves on some "
+           "hardware revision.">
   ];
   let dependentDialects = [
     "mlir::scf::SCFDialect",

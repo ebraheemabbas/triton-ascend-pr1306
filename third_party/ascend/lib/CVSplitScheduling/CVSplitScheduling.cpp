@@ -1029,7 +1029,7 @@ private:
             privateBufferUbBudgetBytes < 0
                 ? std::numeric_limits<uint64_t>::max()
                 : static_cast<uint64_t>(privateBufferUbBudgetBytes),
-            promotePrivateBufferPools, vectorToCubeSlots);
+            promotePrivateBufferPools, vectorToCubeSlots, sinkScaleIntoFixpipe);
     if (failed(transferInfo)) {
       return failure();
     }
