@@ -307,7 +307,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             ascend.passes.ttir.add_cv_split_scheduling(
                 pm, compile_on_910_95, metadata["cv_split_unroll_factor"],
                 private_buffer_ub_budget_bytes=metadata["cv_split_private_buffer_ub_budget_bytes"],
-                promote_private_buffer_pools=metadata["cv_split_promote_private_buffer_pools"])
+                promote_private_buffer_pools=metadata["cv_split_promote_private_buffer_pools"],
+                sink_scale_into_fixpipe=metadata["cv_split_sink_scale_into_fixpipe"])
 
         if try_dynamic_cv:
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
@@ -1208,6 +1209,12 @@ class NPUOptions:
     # without removing a stall. Turn it on to stop relying on that ordering
     # being emergent rather than explicit.
     cv_split_promote_private_buffer_pools: bool = False
+    # When a score tile's only consumer is one multiply by a constant splat,
+    # the fixpipe applies that constant during the transfer it already makes
+    # (QF322F32_PRE quant scale) and the VECTOR-side multiply disappears. Off
+    # switches the multiply back onto VECTOR without a rebuild, for example if
+    # the dual-destination scale path misbehaves on some hardware revision.
+    cv_split_sink_scale_into_fixpipe: bool = True
     hfusion_enable_multiple_consumer_fusion: bool = False
     enable_cross_if_fusion: bool = False
     has_auto_blockify_blacklist_op: Optional[bool] = None

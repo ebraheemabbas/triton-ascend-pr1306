@@ -8,8 +8,9 @@
 
 // Invariant accumulator templates are materialized once, outside the physical
 // program loop, instead of being rebuilt by every program.
+// The sm_scale splat is gone: its scalar rides each score fixpipe's
+// quant_scale, so neither the splat nor the multiply that used it survives.
 // CHECK: %{{.*}} = linalg.fill ins(%{{.*}} : f32) outs(%{{.*}} : tensor<64x128xf32>) -> tensor<64x128xf32>
-// CHECK: %{{.*}} = linalg.fill ins(%{{.*}} : f32) outs(%{{.*}} : tensor<32x128xf32>) -> tensor<32x128xf32>
 // CHECK: %{{.*}} = linalg.fill ins(%{{.*}} : f32) outs(%{{.*}} : tensor<32xf32>) -> tensor<32xf32>
 // CHECK: %{{.*}} = linalg.fill ins(%{{.*}} : f32) outs(%{{.*}} : tensor<32x64xf32>) -> tensor<32x64xf32>
 // CHECK: scf.for
@@ -63,18 +64,20 @@
 // No slot is reused, so no release runs backwards and the schedule has nothing
 // to pipeline against: all four score tiles are produced before CUBE waits on
 // the first P hand-off.  See cv_split_scheduling_fa.mlir for the full account.
-// CHECK: hivm.hir.fixpipe {dma_mode = #hivm.dma_mode{{<}}nz2nd{{>}}} ins(%{{.*}} : tensor<64x128xf32>) outs(%{{.*}} : memref<32x128xf32, #hivm.address_space<ub>>) dual_dst_mode = {{<}}ROW_SPLIT{{>}}
+// Each score fixpipe applies sm_scale in flight (quant_scale + explicit
+// QF322F32_PRE); the product fixpipes below stay bare.
+// CHECK: hivm.hir.fixpipe {dma_mode = #hivm.dma_mode{{<}}nz2nd{{>}}, pre_quant = #hivm.fixpipe_pre_quant_mode{{<}}QF322F32_PRE{{>}}} ins(%{{.*}} : tensor<64x128xf32>) outs(%{{.*}} : memref<32x128xf32, #hivm.address_space<ub>>) quant_scale = %{{.*}} : f32 dual_dst_mode = {{<}}ROW_SPLIT{{>}}
 // CHECK-NEXT: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 0
-// CHECK: hivm.hir.fixpipe {{.*}} dual_dst_mode = {{<}}ROW_SPLIT{{>}}
+// CHECK: hivm.hir.fixpipe {{.*}} quant_scale = %{{.*}} : f32 dual_dst_mode = {{<}}ROW_SPLIT{{>}}
 // CHECK-NEXT: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 1
-// CHECK: hivm.hir.fixpipe {{.*}} dual_dst_mode = {{<}}ROW_SPLIT{{>}}
+// CHECK: hivm.hir.fixpipe {{.*}} quant_scale = %{{.*}} : f32 dual_dst_mode = {{<}}ROW_SPLIT{{>}}
 // CHECK-NEXT: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 2
-// CHECK: hivm.hir.fixpipe {{.*}} dual_dst_mode = {{<}}ROW_SPLIT{{>}}
+// CHECK: hivm.hir.fixpipe {{.*}} quant_scale = %{{.*}} : f32 dual_dst_mode = {{<}}ROW_SPLIT{{>}}
 // CHECK-NEXT: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 3
 
 // Then each product tile, behind its own lane's P hand-off.
 // CHECK: hivm.hir.sync_block_wait[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 4
-// CHECK: hivm.hir.fixpipe {{.*}} dual_dst_mode = {{<}}ROW_SPLIT{{>}}
+// CHECK: hivm.hir.fixpipe {dma_mode = #hivm.dma_mode{{<}}nz2nd{{>}}} ins(%{{.*}} : tensor<64x64xf32>)
 // CHECK-NEXT: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 8
 // CHECK: hivm.hir.sync_block_wait[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 5
 // CHECK: hivm.hir.fixpipe {{.*}} dual_dst_mode = {{<}}ROW_SPLIT{{>}}
