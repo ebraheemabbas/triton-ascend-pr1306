@@ -160,7 +160,7 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       py::arg("promote_fully_unrolled") = true,
       py::arg("private_buffer_ub_budget_bytes") = -1,
       py::arg("promote_private_buffer_pools") = false,
-      py::arg("sink_scale_into_fixpipe") = true);
+      py::arg("sink_scale_into_fixpipe") = false);
 
   m.def(
       "add_graph_optimize",
