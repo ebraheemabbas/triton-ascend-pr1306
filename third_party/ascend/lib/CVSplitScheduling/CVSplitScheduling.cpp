@@ -26,6 +26,7 @@
 #include "ascend/include/CVSplitScheduling/DependencyScheduler.h"
 #include "ascend/include/CVSplitScheduling/PreCheck.h"
 #include "ascend/include/CVSplitScheduling/ScopeSeparation.h"
+#include "ascend/include/CVSplitScheduling/SoftmaxRegroup.h"
 #include "ascend/include/CVSplitScheduling/UnfusePVMatmuls.h"
 #include "ascend/include/CVSplitScheduling/UnrollOrigin.h"
 #include "ascend/include/CVSplitScheduling/classifyAllOps.h"
@@ -906,6 +907,9 @@ private:
     LLVM_DEBUG(if (fullyUnrolled) llvm::dbgs()
                << "[cv-split] Unroll consumes the whole trip count; keeping a "
                   "single-iteration loop for the remaining stages\n");
+    if (regroupSoftmaxMax && failed(cv_split::regroupSoftmaxMax(
+                                 loop, static_cast<unsigned>(unrollFactor))))
+      return failure();
     reuseUnrolledTransposeDestinations(loop);
     reuseUnrolledReductionInitializers(loop);
     FailureOr<scf::ForOp> reducedLoop = strengthReduceUnrolledAddresses(loop);
@@ -1029,7 +1033,8 @@ private:
             privateBufferUbBudgetBytes < 0
                 ? std::numeric_limits<uint64_t>::max()
                 : static_cast<uint64_t>(privateBufferUbBudgetBytes),
-            promotePrivateBufferPools, vectorToCubeSlots, sinkScaleIntoFixpipe);
+            promotePrivateBufferPools, vectorToCubeSlots, sinkScaleIntoFixpipe,
+            static_cast<unsigned>(std::max<int>(0, l0cPipelineDistance)));
     if (failed(transferInfo)) {
       return failure();
     }

@@ -36,6 +36,7 @@
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
@@ -77,6 +78,10 @@ struct TransferSyncPlan {
 struct CrossScopeTransfer {
   Value value;
   Operation *producer;
+  /// Where the CUBE-to-VECTOR fixpipe is emitted. Normally the producer, so
+  /// the tile is drained as soon as it is formed; software pipelining moves it
+  /// past a later matmul so the drain and that matmul overlap.
+  Operation *fixpipeAnchor;
   Operation *transferInsertionAnchor;
   Operation *waitInsertionAnchor;
   SmallVector<Operation *> consumers;
@@ -143,7 +148,8 @@ static FailureOr<SmallVector<CrossScopeTransfer>> findCrossScopeValues(
           FailureOr<int64_t> originId = getUnrollOriginId(&op);
           if (failed(originId))
             return failure();
-          transfers.push_back({result, &op, &op, crossUsers.front(), crossUsers,
+          transfers.push_back({result, &op, /*fixpipeAnchor=*/&op, &op,
+                               crossUsers.front(), crossUsers,
                                CrossScopeTransfer::CUBE_TO_VECTOR, *originId});
         }
       }
@@ -176,9 +182,9 @@ static FailureOr<SmallVector<CrossScopeTransfer>> findCrossScopeValues(
                 "VECTOR-to-CUBE producer is missing its scheduled phase end");
             return failure();
           }
-          transfers.push_back({result, &op, transferAnchor, crossUsers.front(),
-                               crossUsers, CrossScopeTransfer::VECTOR_TO_CUBE,
-                               *originId});
+          transfers.push_back({result, &op, /*fixpipeAnchor=*/&op,
+                               transferAnchor, crossUsers.front(), crossUsers,
+                               CrossScopeTransfer::VECTOR_TO_CUBE, *originId});
         }
       }
     }
@@ -451,7 +457,7 @@ static void emitCubeToVectorTransfer(const TransferEmitContext &c,
   // denominator reduction) in one fusible region.  Inserting the pack and
   // sync immediately after the P producer splits that region into two VFs
   // and keeps its full score tile live across the synchronization boundary.
-  builder.setInsertionPointAfter(xfer.producer);
+  builder.setInsertionPointAfter(xfer.fixpipeAnchor);
 
   FloatAttr quantScaleAttr;
   arith::MulFOp absorbedScale;
@@ -813,7 +819,7 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
     const DenseMap<Operation *, Operation *> &transferPhaseEnds,
     unsigned interCoreBufferDepth, uint64_t privateBufferUbBudgetBytes,
     bool promotePrivateBufferPools, unsigned vectorToCubeSlotOverride,
-    bool sinkScaleIntoFixpipe) {
+    bool sinkScaleIntoFixpipe, unsigned l0cPipelineDistance) {
 
   MLIRContext *ctx = loop.getContext();
   Location loc = loop.getLoc();
@@ -1293,6 +1299,31 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
   // The shared DCVP buffer-count policy controls the pool depth. Same-typed
   // buffers (all unrolled qk_ub, all pv_ub, all P L1) rotate over that many
   // physical allocations; absence of a frontend policy defaults to two.
+  // Software-pipeline the L0C drain. A matmul and the fixpipe that drains it
+  // are different units, but emitting them adjacently keeps every accumulator's
+  // live range disjoint from the next one's -- so the memory planner overlays
+  // them all onto one L0C address and the resulting write-after-read ordering
+  // makes the two units take turns. Moving each drain past the following matmul
+  // makes consecutive live ranges overlap, which forces the planner to keep
+  // them apart and lets the units run at the same time. Costs one extra live
+  // accumulator per pool, and delays that tile's arrival on VECTOR by one
+  // matmul -- so the first lane of each pool stays eager, keeping VECTOR's
+  // start time unchanged.
+  if (l0cPipelineDistance > 0) {
+    llvm::MapVector<int64_t, SmallVector<CrossScopeTransfer *>> byOrigin;
+    for (CrossScopeTransfer &xfer : transfers)
+      if (xfer.direction == CrossScopeTransfer::CUBE_TO_VECTOR)
+        byOrigin[xfer.originId].push_back(&xfer);
+    for (auto &entry : byOrigin) {
+      SmallVector<CrossScopeTransfer *> &lanes = entry.second;
+      for (unsigned i = 0; i + 1 < lanes.size(); ++i) {
+        const unsigned ahead =
+            std::min<unsigned>(i + l0cPipelineDistance, lanes.size() - 1);
+        lanes[i]->fixpipeAnchor = lanes[ahead]->producer;
+      }
+    }
+  }
+
   BufferPool bufferPool;
   SmallVector<VectorToCubeTransferChain> vectorToCubeChains;
   DenseMap<int64_t, unsigned> laneOrdinalByOrigin;
