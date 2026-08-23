@@ -1260,9 +1260,10 @@ class NPUOptions:
     # When a score tile's only consumer is one multiply by a constant splat,
     # the fixpipe applies that constant during the transfer it already makes
     # (QF322F32_PRE quant scale) and the VECTOR-side multiply disappears. Off
-    # switches the multiply back onto VECTOR without a rebuild, for example if
-    # the dual-destination scale path misbehaves on some hardware revision.
-    cv_split_sink_scale_into_fixpipe: bool = True
+    # by default: measured 10.7% slower on the FA kernel at hd=64, because the
+    # 305us it adds to the contended fixpipe outweighs the 187us it saves on
+    # VECTOR, which has slack. Turn on only with a measurement behind it.
+    cv_split_sink_scale_into_fixpipe: bool = False
     hfusion_enable_multiple_consumer_fusion: bool = False
     enable_cross_if_fusion: bool = False
     has_auto_blockify_blacklist_op: Optional[bool] = None
