@@ -603,7 +603,16 @@ def _parse_ttir_metadata(ttir: str, metadata: dict):
 def get_common_bishengir_compile_options(metadata):
     bishengir_target = metadata['target'].arch
     bishengir_target_opt = f"--target={bishengir_target}"
-    return [bishengir_target_opt]
+    options = [bishengir_target_opt]
+    # Per-memory auto multi-buffering. Doubling a buffer costs that memory's
+    # capacity, and when the result does not fit the backend silently reuses
+    # addresses instead -- which serializes the pipes that share the buffer and
+    # is only reported as a "may stall pipe" warning. Turning a level off is how
+    # you trade its multi-buffering for the reuse going away.
+    for level in ("l0c", "l1", "ub"):
+        if metadata.get(f"disable_multi_buffer_on_{level}"):
+            options += [f"--disable-multi-buffer-on-{level}"]
+    return options
 
 
 def get_auto_bind_sub_block_option(metadata):
@@ -1264,6 +1273,14 @@ class NPUOptions:
     # 305us it adds to the contended fixpipe outweighs the 187us it saves on
     # VECTOR, which has slack. Turn on only with a measurement behind it.
     cv_split_sink_scale_into_fixpipe: bool = False
+    # Turn off the backend's automatic double-buffering for one memory level.
+    # At unroll 4 the CUBE accumulators want 3-4x the 256KB L0C, so the backend
+    # reuses addresses and the resulting WAR ordering makes the MAC array and
+    # the fixpipe take turns. Disabling L0C multi-buffering halves the demand,
+    # which is what lets unroll 2 fit exactly and the reuse stalls disappear.
+    disable_multi_buffer_on_l0c: bool = False
+    disable_multi_buffer_on_l1: bool = False
+    disable_multi_buffer_on_ub: bool = False
     hfusion_enable_multiple_consumer_fusion: bool = False
     enable_cross_if_fusion: bool = False
     has_auto_blockify_blacklist_op: Optional[bool] = None
