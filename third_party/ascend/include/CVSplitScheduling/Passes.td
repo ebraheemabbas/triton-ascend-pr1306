@@ -75,7 +75,37 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
            "us of vector time but adds 305 us of fixpipe time, and the "
            "fixpipe is the contended pipe while VECTOR has slack. Kept as an "
            "option because the trade may invert on a shape whose fixpipe is "
-           "idle; measure before turning it on.">
+           "idle; measure before turning it on.">,
+    Option<"l0cPipelineDistance", "l0c-pipeline-distance",
+           "int", /*default*/"0",
+           "how many matmuls to move each CUBE-to-VECTOR drain past, so the "
+           "drain overlaps them. Zero drains each accumulator immediately, "
+           "which keeps every accumulator's live range disjoint from the next "
+           "one's -- the memory planner then overlays them onto a single L0C "
+           "address and the write-after-read ordering that creates makes the "
+           "MAC array and the fixpipe take turns. One makes consecutive live "
+           "ranges overlap, so the planner must keep them apart and the two "
+           "units run together; it costs one more live accumulator per pool "
+           "and delays that tile reaching VECTOR by one matmul, so the first "
+           "lane of each pool stays eager.">,
+    Option<"regroupSoftmaxMax", "regroup-softmax-max",
+           "bool", /*default*/"false",
+           "give the unrolled lanes of a streaming softmax one shared maximum, "
+           "taken over the whole group before any exponential. The later "
+           "lanes' rescale factors become one, so the accumulator is rescaled "
+           "once per group instead of once per lane and the products "
+           "accumulate into each other rather than each being drained back to "
+           "VECTOR. Same arithmetic, different association: the group maximum "
+           "is at least every lane's, so the exponents stay <= 0. Off by "
+           "default: measured 1% to 9% SLOWER depending on configuration. It "
+           "removes real work -- three of four product drains, four cross-core "
+           "syncs, half the flag pressure -- but VECTOR can no longer start a "
+           "lane's softmax when that lane's tile lands, since nothing may "
+           "exponentiate until the last row max exists, and the group's score "
+           "tiles all stay live, which pushes UB from 1.5% to 19% over budget. "
+           "On this kernel that overlap is worth more than the work removed. "
+           "It also changes results bit-for-bit, so any use needs an accuracy "
+           "run behind it.">
   ];
   let dependentDialects = [
     "mlir::scf::SCFDialect",

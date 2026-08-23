@@ -90,7 +90,8 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
     const llvm::DenseMap<Operation *, Operation *> &transferPhaseEnds,
     unsigned interCoreBufferDepth, uint64_t privateBufferUbBudgetBytes = 0,
     bool promotePrivateBufferPools = false,
-    unsigned vectorToCubeSlotOverride = 0, bool sinkScaleIntoFixpipe = true);
+    unsigned vectorToCubeSlotOverride = 0, bool sinkScaleIntoFixpipe = true,
+    unsigned l0cPipelineDistance = 0);
 
 } // namespace mlir::triton::cv_split
 
