@@ -75,7 +75,19 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
            "us of vector time but adds 305 us of fixpipe time, and the "
            "fixpipe is the contended pipe while VECTOR has slack. Kept as an "
            "option because the trade may invert on a shape whose fixpipe is "
-           "idle; measure before turning it on.">
+           "idle; measure before turning it on.">,
+    Option<"l0cPipelineDistance", "l0c-pipeline-distance",
+           "int", /*default*/"0",
+           "how many matmuls to move each CUBE-to-VECTOR drain past, so the "
+           "drain overlaps them. Zero drains each accumulator immediately, "
+           "which keeps every accumulator's live range disjoint from the next "
+           "one's -- the memory planner then overlays them onto a single L0C "
+           "address and the write-after-read ordering that creates makes the "
+           "MAC array and the fixpipe take turns. One makes consecutive live "
+           "ranges overlap, so the planner must keep them apart and the two "
+           "units run together; it costs one more live accumulator per pool "
+           "and delays that tile reaching VECTOR by one matmul, so the first "
+           "lane of each pool stays eager.">
   ];
   let dependentDialects = [
     "mlir::scf::SCFDialect",
