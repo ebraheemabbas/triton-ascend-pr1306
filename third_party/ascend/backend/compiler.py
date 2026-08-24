@@ -309,7 +309,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                 private_buffer_ub_budget_bytes=metadata["cv_split_private_buffer_ub_budget_bytes"],
                 promote_private_buffer_pools=metadata["cv_split_promote_private_buffer_pools"],
                 sink_scale_into_fixpipe=metadata["cv_split_sink_scale_into_fixpipe"],
-                l0c_pipeline_distance=metadata["cv_split_l0c_pipeline_distance"])
+                l0c_pipeline_distance=metadata["cv_split_l0c_pipeline_distance"],
+                regroup_softmax_max=metadata["cv_split_regroup_softmax_max"])
 
         if try_dynamic_cv:
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
@@ -1270,6 +1271,11 @@ class NPUOptions:
     # memory planner overlay every accumulator onto one L0C address and
     # so serializes the MAC array against the fixpipe.
     cv_split_l0c_pipeline_distance: int = 0
+    # Give the unrolled lanes of a streaming softmax one shared maximum, so
+    # the accumulator is rescaled once per group and the products chain in
+    # L0C instead of each being drained back to VECTOR. Changes results
+    # bit-for-bit, so it is off until an accuracy run says otherwise.
+    cv_split_regroup_softmax_max: bool = False
     hfusion_enable_multiple_consumer_fusion: bool = False
     enable_cross_if_fusion: bool = False
     has_auto_blockify_blacklist_op: Optional[bool] = None
