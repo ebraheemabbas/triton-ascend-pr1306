@@ -87,7 +87,18 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
            "ranges overlap, so the planner must keep them apart and the two "
            "units run together; it costs one more live accumulator per pool "
            "and delays that tile reaching VECTOR by one matmul, so the first "
-           "lane of each pool stays eager.">
+           "lane of each pool stays eager.">,
+    Option<"regroupSoftmaxMax", "regroup-softmax-max",
+           "bool", /*default*/"false",
+           "give the unrolled lanes of a streaming softmax one shared maximum, "
+           "taken over the whole group before any exponential. The later "
+           "lanes' rescale factors become one, so the accumulator is rescaled "
+           "once per group instead of once per lane and the products "
+           "accumulate into each other rather than each being drained back to "
+           "VECTOR. Same arithmetic, different association: the group maximum "
+           "is at least every lane's, so the exponents stay <= 0. Off by "
+           "default; it changes what the kernel computes bit-for-bit, so it "
+           "needs an accuracy run behind it.">
   ];
   let dependentDialects = [
     "mlir::scf::SCFDialect",
