@@ -97,8 +97,15 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
            "accumulate into each other rather than each being drained back to "
            "VECTOR. Same arithmetic, different association: the group maximum "
            "is at least every lane's, so the exponents stay <= 0. Off by "
-           "default; it changes what the kernel computes bit-for-bit, so it "
-           "needs an accuracy run behind it.">
+           "default: measured 1% to 9% SLOWER depending on configuration. It "
+           "removes real work -- three of four product drains, four cross-core "
+           "syncs, half the flag pressure -- but VECTOR can no longer start a "
+           "lane's softmax when that lane's tile lands, since nothing may "
+           "exponentiate until the last row max exists, and the group's score "
+           "tiles all stay live, which pushes UB from 1.5% to 19% over budget. "
+           "On this kernel that overlap is worth more than the work removed. "
+           "It also changes results bit-for-bit, so any use needs an accuracy "
+           "run behind it.">
   ];
   let dependentDialects = [
     "mlir::scf::SCFDialect",

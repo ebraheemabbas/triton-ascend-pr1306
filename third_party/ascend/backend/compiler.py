@@ -1273,8 +1273,11 @@ class NPUOptions:
     cv_split_l0c_pipeline_distance: int = 0
     # Give the unrolled lanes of a streaming softmax one shared maximum, so
     # the accumulator is rescaled once per group and the products chain in
-    # L0C instead of each being drained back to VECTOR. Changes results
-    # bit-for-bit, so it is off until an accuracy run says otherwise.
+    # L0C instead of each being drained back to VECTOR. Off: measured 1-9%
+    # slower depending on configuration. It removes the work it promised, but
+    # VECTOR can then no longer start a lane's softmax when that lane's tile
+    # lands, and on this kernel that overlap is worth more than the work.
+    # Also changes results bit-for-bit.
     cv_split_regroup_softmax_max: bool = False
     hfusion_enable_multiple_consumer_fusion: bool = False
     enable_cross_if_fusion: bool = False
