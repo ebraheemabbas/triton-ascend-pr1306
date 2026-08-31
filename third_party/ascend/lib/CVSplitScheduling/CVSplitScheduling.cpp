@@ -21,6 +21,7 @@
  */
 
 #include "ascend/include/CVSplitScheduling/CVSplitScheduling.h"
+#include "ascend/include/CVSplitScheduling/CrossCorePipelinePlan.h"
 #include "ascend/include/CVSplitScheduling/Attributes.h"
 #include "ascend/include/CVSplitScheduling/CrossScopeTransfers.h"
 #include "ascend/include/CVSplitScheduling/DependencyScheduler.h"
@@ -945,6 +946,19 @@ private:
                     "skip\n");
       return failure();
     }
+
+    // Stage 3.5: build the lane/boundary/resource/lifetime model before any
+    // scheduling or transfer mutation. This stage is diagnostic-only while the
+    // generalized planner is rolled out; failure leaves the current generic
+    // scheduling path unchanged.
+    FailureOr<cv_split::CrossCorePipelinePlan> analysisPlan =
+        cv_split::buildCrossCorePipelinePlan(body, classification);
+    if (succeeded(analysisPlan))
+      cv_split::logCrossCorePipelinePlan(*analysisPlan);
+    else
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[cv-split] analysis plan unavailable; using generic "
+                    "scheduling\n");
 
     // Stages 4-7: build the dependency graph, assign BFS levels, verify the
     // CUBE/VECTOR work is cleanly separable, and reorder the body by level.
