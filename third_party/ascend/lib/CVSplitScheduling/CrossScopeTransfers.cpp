@@ -723,14 +723,14 @@ emitMergedSlotRelease(const TransferEmitContext &c,
 
   builder.setInsertionPointAfter(lastConsumer);
   auto syncSetOp = builder.create<hivm::SyncBlockSetOp>(
-      c.loc, c.vecCoreAttr, c.pipeMte3Attr, c.pipeMte1Attr,
+      c.loc, c.vecCoreAttr, c.pipeVAttr, c.pipeFixAttr,
       OpFoldResult(builder.getI64IntegerAttr(flagId)));
   setOpEngineTypeAttr(syncSetOp, EngineType::VECTOR);
 
   scf::ForOp loop = c.loop;
   builder.setInsertionPoint(loop.getBody()->getTerminator());
   auto syncWaitOp = builder.create<hivm::SyncBlockWaitOp>(
-      c.loc, c.cubeCoreAttr, c.pipeMte3Attr, c.pipeMte1Attr,
+      c.loc, c.cubeCoreAttr, c.pipeVAttr, c.pipeFixAttr,
       OpFoldResult(builder.getI64IntegerAttr(flagId)));
   setOpEngineTypeAttr(syncWaitOp, EngineType::CUBE);
 
