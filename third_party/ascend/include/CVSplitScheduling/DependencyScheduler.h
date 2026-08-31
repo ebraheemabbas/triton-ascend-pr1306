@@ -23,6 +23,7 @@
 #ifndef TRITON_ASCEND_CV_SPLIT_SCHEDULING_DEPENDENCY_SCHEDULER_H
 #define TRITON_ASCEND_CV_SPLIT_SCHEDULING_DEPENDENCY_SCHEDULER_H
 
+#include "ascend/include/CVSplitScheduling/CrossCorePipelinePlan.h"
 #include "ascend/include/CVSplitScheduling/classifyAllOps.h"
 #include "mlir/IR/Block.h"
 #include "mlir/Support/LogicalResult.h"
@@ -42,9 +43,16 @@ public:
   /// scheduled that many boundaries after the boundary it belongs to, so an
   /// existing cross-core handoff always separates a slot's read from the
   /// write that reuses it.
+  ///
+  /// When 'enablePlanDrivenEarlyPublish' is true and 'pipelinePlan' is
+  /// available, the terminal VECTOR-to-CUBE boundary of each lineage commits
+  /// at its analyzed earliest-publish anchor. All other boundaries retain the
+  /// generic phase-end anchor.
   LogicalResult run(Block *body, const Classification &classification,
                     llvm::DenseMap<Operation *, Operation *> &transferPhaseEnds,
-                    unsigned pipelineDistance);
+                    unsigned pipelineDistance,
+                    const CrossCorePipelinePlan *pipelinePlan,
+                    bool enablePlanDrivenEarlyPublish);
 };
 
 } // namespace mlir::triton::cv_split

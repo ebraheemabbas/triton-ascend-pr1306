@@ -329,6 +329,41 @@ collectVectorToCubeProducers(Block *body,
   return producers;
 }
 
+/// Select one early-publish candidate per VECTOR-to-CUBE lineage.
+///
+/// The terminal boundary has no younger boundary in the same lineage whose
+/// production can hide independent local state. Delaying this handoff therefore
+/// extends the other core's critical path directly. Earlier boundaries retain
+/// the generic phase-end anchor until a later resource/cost model proves that
+/// publishing them early is profitable.
+static DenseMap<Operation *, const CrossCoreBoundary *>
+collectTerminalEarlyPublishBoundaries(
+    const CrossCorePipelinePlan *pipelinePlan,
+    bool enablePlanDrivenEarlyPublish) {
+  DenseMap<Operation *, const CrossCoreBoundary *> selected;
+  if (!enablePlanDrivenEarlyPublish || !pipelinePlan)
+    return selected;
+
+  for (const CrossCorePhaseLineage &lineage : pipelinePlan->lineages) {
+    if (lineage.direction != CrossCoreDirection::VectorToCube)
+      continue;
+
+    const CrossCoreBoundary *terminal = nullptr;
+    for (unsigned boundaryIndex : lineage.boundaryIndices) {
+      if (boundaryIndex >= pipelinePlan->boundaries.size())
+        continue;
+      const CrossCoreBoundary &boundary =
+          pipelinePlan->boundaries[boundaryIndex];
+      if (!terminal || boundary.producerOrder > terminal->producerOrder)
+        terminal = &boundary;
+    }
+
+    if (terminal && terminal->producer && terminal->earliestPublishAnchor)
+      selected[terminal->producer] = terminal;
+  }
+  return selected;
+}
+
 unsigned countVectorToCubeBoundaries(Block *body,
                                      const Classification &classification) {
   return collectVectorToCubeProducers(body, classification).size();
@@ -340,7 +375,8 @@ static void reorderForCrossScopeProducerPhases(
     const DenseMap<Operation *, int> &levels,
     const Classification &classification,
     DenseMap<Operation *, Operation *> &transferPhaseEnds,
-    unsigned pipelineDistance) {
+    unsigned pipelineDistance, const CrossCorePipelinePlan *pipelinePlan,
+    bool enablePlanDrivenEarlyPublish) {
   SmallVector<Operation *> originalOrder;
   for (Operation &op : *body) {
     if (!isa<scf::YieldOp>(&op))
@@ -349,6 +385,9 @@ static void reorderForCrossScopeProducerPhases(
 
   SmallVector<Operation *> boundaryProducers =
       collectVectorToCubeProducers(body, classification);
+  DenseMap<Operation *, const CrossCoreBoundary *> earlyPublishBoundaries =
+      collectTerminalEarlyPublishBoundaries(
+          pipelinePlan, enablePlanDrivenEarlyPublish);
   SmallVector<Operation *> scheduled;
   DenseSet<Operation *> alreadyScheduled;
 
@@ -366,10 +405,11 @@ static void reorderForCrossScopeProducerPhases(
       extendWithReadyVectorState(body, predecessors, classification,
                                  alreadyScheduled, slice);
 
-      // Keep the original topological order of the complete producer
-      // phase. The actual cross-core handoff is inserted after the last
-      // operation in this phase, so independent recurrent state can be
-      // updated in the same vector function after the P value is formed.
+      // Keep the original topological order of the complete producer phase.
+      // Generic scheduling commits the handoff after the complete phase. The
+      // The early-publication policy may instead use the terminal lineage boundary's
+      // analyzed earliest-publish anchor, allowing independent local state to
+      // continue while the other core consumes the transferred value.
       Operation *phaseEnd = producer;
       for (Operation *op : originalOrder) {
         if (!slice.contains(op))
@@ -379,7 +419,34 @@ static void reorderForCrossScopeProducerPhases(
           phaseEnd = op;
         }
       }
-      transferPhaseEnds[producer] = phaseEnd;
+
+      Operation *transferAnchor = phaseEnd;
+      const CrossCoreBoundary *earlyBoundary =
+          earlyPublishBoundaries.lookup(producer);
+      if (earlyBoundary) {
+        Operation *candidateAnchor = earlyBoundary->earliestPublishAnchor;
+        const bool anchorInPhase =
+            candidateAnchor && candidateAnchor->getBlock() == body &&
+            slice.contains(candidateAnchor);
+        const bool anchorNoLaterThanPhaseEnd =
+            candidateAnchor == phaseEnd ||
+            (candidateAnchor && candidateAnchor->isBeforeInBlock(phaseEnd));
+        if (anchorInPhase && anchorNoLaterThanPhaseEnd) {
+          transferAnchor = candidateAnchor;
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[cv-split] early-publish origin="
+                     << earlyBoundary->key.originId << " lane="
+                     << earlyBoundary->key.lane << " publish@"
+                     << earlyBoundary->earliestPublishOrder
+                     << " local-phase-end=" << phaseEnd->getName() << "\n");
+        } else {
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[cv-split] reject early-publish origin="
+                     << earlyBoundary->key.originId
+                     << ": analyzed anchor is not in the scheduled phase\n");
+        }
+      }
+      transferPhaseEnds[producer] = transferAnchor;
     }
 
     // Everything left consumes results the other engine produces from a
@@ -466,7 +533,9 @@ static void reorderForCrossScopeProducerPhases(
 LogicalResult
 DependencyScheduler::run(Block *body, const Classification &classification,
                          DenseMap<Operation *, Operation *> &transferPhaseEnds,
-                         unsigned pipelineDistance) {
+                         unsigned pipelineDistance,
+                         const CrossCorePipelinePlan *pipelinePlan,
+                         bool enablePlanDrivenEarlyPublish) {
   DenseMap<Operation *, SmallVector<Operation *>> predecessors;
   DenseMap<Operation *, int> levels;
 
@@ -484,7 +553,9 @@ DependencyScheduler::run(Block *body, const Classification &classification,
   logLevelHistogram(body, levels, classification, maxLevel);
 
   reorderForCrossScopeProducerPhases(body, predecessors, levels, classification,
-                                     transferPhaseEnds, pipelineDistance);
+                                     transferPhaseEnds, pipelineDistance,
+                                     pipelinePlan,
+                                     enablePlanDrivenEarlyPublish);
   LLVM_DEBUG(
       llvm::dbgs() << "[cv-split] Reordered by cross-scope producer phase\n");
   return success();

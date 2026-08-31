@@ -21,6 +21,8 @@
  */
 
 #include "ascend/include/CVSplitScheduling/CVSplitScheduling.h"
+#include "ascend/include/CVSplitScheduling/CrossCorePipelinePlan.h"
+#include "ascend/include/CVSplitScheduling/CrossCoreResourcePlan.h"
 #include "ascend/include/CVSplitScheduling/Attributes.h"
 #include "ascend/include/CVSplitScheduling/CrossScopeTransfers.h"
 #include "ascend/include/CVSplitScheduling/DependencyScheduler.h"
@@ -31,6 +33,7 @@
 #include "ascend/include/CVSplitScheduling/UnrollOrigin.h"
 #include "ascend/include/CVSplitScheduling/classifyAllOps.h"
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
+#include "ascend/include/DynamicCVPipeline/Common/FlagIdManager.h"
 
 #include "bishengir/Dialect/HACC/IR/HACC.h"
 #include "bishengir/Dialect/Scope/IR/Scope.h"
@@ -88,7 +91,7 @@ using namespace mlir::triton;
 //                                    VECTOR)
 //   4-7 DependencyScheduler          graph -> BFS levels -> reorder so
 //                                    same-engine work is contiguous
-//   7.5 unfusePVMatmuls              undo matmul(p,v,acc) fusion that entangles
+//   7.5 unfuse accumulator joins     separate CUBE work from VECTOR joins
 //                                    the engines
 //   8.  insertCrossScopeTransfers    materialize C->V (fixpipe->UB) and V->C
 //                                    (NZ pack->L1) buffers +
@@ -743,6 +746,7 @@ public:
   explicit CVSplitSchedulingPass(const CVSplitSchedulingOptions &options) {
     this->compileOn91095 = options.compileOn91095;
     this->unrollFactor = options.unrollFactor;
+    this->enablePlanDrivenEarlyPublish = options.enablePlanDrivenEarlyPublish;
     this->promoteFullyUnrolled = options.promoteFullyUnrolled;
     this->pipelineDistance = options.pipelineDistance;
     this->privateBufferUbBudgetBytes = options.privateBufferUbBudgetBytes;
@@ -946,6 +950,21 @@ private:
       return failure();
     }
 
+    // Pipeline-analysis phase: build the lane/boundary/resource/lifetime model before any
+    // scheduling or transfer mutation. This analysis is diagnostic-only while the
+    // generalized planner is rolled out; failure leaves the current generic
+    // scheduling path unchanged.
+    FailureOr<cv_split::CrossCorePipelinePlan> analysisPlan =
+        cv_split::buildCrossCorePipelinePlan(body, classification);
+    if (succeeded(analysisPlan))
+      cv_split::logCrossCorePipelinePlan(*analysisPlan);
+    else
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[cv-split] analysis plan unavailable; using generic "
+                    "scheduling\n");
+    const cv_split::CrossCorePipelinePlan *pipelinePlan =
+        succeeded(analysisPlan) ? &*analysisPlan : nullptr;
+
     // Dependency scheduling builds the graph, assign BFS levels, verify the
     // CUBE/VECTOR work is cleanly separable, and reorder the body by level.
     // The buffer depth drives both the scheduler's pipeline distance and the
@@ -1017,15 +1036,82 @@ private:
                << (everyPoolPrivate ? "taken" : "declined")
                << ", so pipelining at distance " << reorderDistance << "\n");
 
+    // Resource-projection phase: model the qualified slot/union policy before scheduling.
+    // This version is diagnostic-only: unresolved ownership paths make it
+    // ineligible for selection, and the scheduler/emitter continue to use
+    // their qualified inputs unchanged.
+    std::optional<cv_split::CrossCoreResourceLimits> resourceLimits;
+    if (pipelinePlan) {
+      FlagIdManager resourceFlagManager(moduleOp, /*firstAvailableId=*/0);
+      const int firstAvailableFlagId = resourceFlagManager.acquireId();
+      if (firstAvailableFlagId >= 0) {
+        resourceLimits.emplace();
+        resourceLimits->interCoreBufferDepth =
+            static_cast<unsigned>(interCoreBufferDepth);
+        if (privateBufferUbBudgetBytes >= 0)
+          resourceLimits->extraUbBudgetBytes =
+              static_cast<uint64_t>(privateBufferUbBudgetBytes);
+        resourceLimits->firstAvailableFlagId =
+            static_cast<unsigned>(firstAvailableFlagId);
+        resourceLimits->maximumFlagId = cv_split::kMaxTransferFlagId;
+        resourceLimits->vectorToCubeSlotOverride = vectorToCubeSlots;
+        resourceLimits->promotePrivatePools = promotePrivateBufferPools;
+
+        FailureOr<cv_split::CrossCoreResourcePlan> resourcePlan =
+            cv_split::buildCrossCoreResourcePlan(*pipelinePlan,
+                                                 *resourceLimits);
+        if (succeeded(resourcePlan))
+          cv_split::logCrossCoreResourcePlan(*resourcePlan);
+        else
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[cv-split] resource-plan unavailable; qualified "
+                        "scheduler/emitter policy remains active\n");
+      }
+    }
+
     cv_split::DependencyScheduler scheduler;
     llvm::DenseMap<Operation *, Operation *> transferPhaseEnds;
     if (failed(scheduler.run(body, classification, transferPhaseEnds,
-                             reorderDistance)))
+                             reorderDistance, pipelinePlan,
+                             enablePlanDrivenEarlyPublish)))
       return failure();
 
-    // Accumulator-separation phase: unfuse PV matmuls (split matmul(p,v,acc*alpha) into pv + addf)
-    if (failed(cv_split::unfusePVMatmuls(body, classification)))
+    // Accumulator-separation phase: separate VECTOR-produced accumulator joins from CUBE matmuls.
+    FailureOr<cv_split::AccumulatorJoinRewriteResult> accumulatorJoins =
+        cv_split::unfuseVectorAccumulatorMatmuls(body, classification);
+    if (failed(accumulatorJoins))
       return failure();
+
+    // Materialized-plan binding phase: bind the immutable logical boundaries to the real joins that
+    // now exist and refresh order after scheduling. This remains diagnostic:
+    // the qualified scheduler and transfer emitter do not consume either plan.
+    std::optional<cv_split::CrossCorePipelinePlan> materializedPlan;
+    std::optional<cv_split::CrossCoreResourcePlan> materializedResources;
+    if (pipelinePlan && resourceLimits) {
+      FailureOr<cv_split::CrossCorePipelinePlan> materializedPlanResult =
+          cv_split::bindCrossCorePipelinePlan(
+              *pipelinePlan, *accumulatorJoins, body, classification);
+      if (succeeded(materializedPlanResult)) {
+        materializedPlan.emplace(std::move(*materializedPlanResult));
+        cv_split::logMaterializedCrossCorePipelinePlan(*materializedPlan);
+        FailureOr<cv_split::CrossCoreResourcePlan> resourceResult =
+            cv_split::buildCrossCoreResourcePlan(*materializedPlan,
+                                                 *resourceLimits);
+        if (succeeded(resourceResult)) {
+          materializedResources.emplace(std::move(*resourceResult));
+          cv_split::logMaterializedCrossCoreResourcePlan(
+              *materializedResources);
+        } else {
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[cv-split] bound resource-plan unavailable; "
+                        "qualified emitter remains active\n");
+        }
+      } else {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[cv-split] materialized pipeline-plan unavailable; "
+                      "qualified emitter remains active\n");
+      }
+    }
 
     // Transfer-materialization phase (before scope separation)
     LLVM_DEBUG(llvm::dbgs()
@@ -1033,6 +1119,8 @@ private:
     FailureOr<cv_split::CrossScopeTransferInfo> transferInfo =
         cv_split::insertCrossScopeTransfers(
             loop, classification, transferPhaseEnds,
+            materializedPlan ? &*materializedPlan : nullptr,
+            materializedResources ? &*materializedResources : nullptr,
             static_cast<unsigned>(interCoreBufferDepth),
             privateBufferUbBudgetBytes < 0
                 ? std::numeric_limits<uint64_t>::max()

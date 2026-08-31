@@ -292,7 +292,10 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                 promote_private_buffer_pools=metadata["cv_split_promote_private_buffer_pools"],
                 sink_scale_into_fixpipe=metadata["cv_split_sink_scale_into_fixpipe"],
                 l0c_pipeline_distance=metadata["cv_split_l0c_pipeline_distance"],
-                regroup_softmax_max=metadata["cv_split_regroup_softmax_max"])
+                regroup_softmax_max=metadata["cv_split_regroup_softmax_max"],
+                enable_plan_driven_early_publish=metadata[
+                    "cv_split_enable_plan_driven_early_publish"
+                ])
 
         if try_dynamic_cv:
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
@@ -1198,6 +1201,9 @@ class NPUOptions:
     # it directly would be true on every target.
     enable_cv_split_scheduling: bool = None
     cv_split_unroll_factor: int = 4
+    # Plan-driven early-publication control. Keep off until the plan-driven publication
+    # policy has passed compile, simulator, accuracy, and profiler qualification.
+    cv_split_enable_plan_driven_early_publish: bool = False
     # Spare UB, in bytes, that cross-scope transfers may spend to stop reusing
     # buffers across unrolled lanes. It funds merging the two CUBE->VECTOR
     # roles onto one union slot per lane, which is what lets HEAD_DIM differ

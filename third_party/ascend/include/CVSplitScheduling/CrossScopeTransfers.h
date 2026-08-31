@@ -24,6 +24,7 @@
 #define TRITON_ASCEND_CV_SPLIT_SCHEDULING_CROSS_SCOPE_TRANSFERS_H
 
 #include "ascend/include/CVSplitScheduling/classifyAllOps.h"
+#include "ascend/include/CVSplitScheduling/CrossCoreResourcePlan.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
@@ -78,9 +79,10 @@ struct CrossScopeTransferInfo {
 /// synchronization for `loop`.
 ///
 /// `classification` assigns each operation to its execution engine.
-/// `transferPhaseEnds` maps a VECTOR-engine operation whose result is consumed
-/// by CUBE to the last VECTOR operation that must finish before its final
-/// UB-to-L1 copy and ready signal may be committed.
+/// transferPhaseEnds maps a VECTOR-engine operation whose result is consumed
+/// by CUBE to its selected UB-to-L1 copy and ready-signal commit anchor. The
+/// generic scheduler chooses the local phase end; the early-publication policy may choose an earlier
+/// validated plan anchor for a terminal lineage boundary.
 /// The returned handles remain owned by the mutated IR and must be consumed
 /// before the referenced operations are erased or reordered.
 /// `blockM`, derived internally from the leading transfer, must be positive and
@@ -88,6 +90,8 @@ struct CrossScopeTransferInfo {
 FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
     scf::ForOp loop, const Classification &classification,
     const llvm::DenseMap<Operation *, Operation *> &transferPhaseEnds,
+    const CrossCorePipelinePlan *materializedPlan,
+    const CrossCoreResourcePlan *resourcePlan,
     unsigned interCoreBufferDepth, uint64_t privateBufferUbBudgetBytes = 0,
     bool promotePrivateBufferPools = false,
     unsigned vectorToCubeSlotOverride = 0, bool sinkScaleIntoFixpipe = true,

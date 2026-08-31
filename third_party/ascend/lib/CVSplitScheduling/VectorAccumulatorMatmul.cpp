@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -20,32 +20,29 @@
  * THE SOFTWARE.
  */
 
-#ifndef TRITON_ASCEND_CV_SPLIT_SCHEDULING_UNFUSE_PV_MATMULS_H
-#define TRITON_ASCEND_CV_SPLIT_SCHEDULING_UNFUSE_PV_MATMULS_H
-
-#include "ascend/include/CVSplitScheduling/classifyAllOps.h"
-#include "mlir/IR/Block.h"
-#include "mlir/IR/Operation.h"
-#include "mlir/Support/LogicalResult.h"
-#include "llvm/ADT/SmallVector.h"
+#include "ascend/include/CVSplitScheduling/VectorAccumulatorMatmul.h"
 
 namespace mlir::triton::cv_split {
 
-struct AccumulatorJoinBinding {
-  Operation *matmulProducer;
-  Operation *vectorJoin;
-};
+FailureOr<bool>
+isVectorAccumulatorMatmul(linalg::MatmulOp matmul, Block *body,
+                          const Classification &classification) {
+  if (!body)
+    return failure();
+  if (!matmul || matmul->getBlock() != body)
+    return false;
 
-struct AccumulatorJoinRewriteResult {
-  llvm::SmallVector<AccumulatorJoinBinding> bindings;
-};
+  Value init = matmul.getDpsInitOperand(0)->get();
+  Operation *producer = init.getDefiningOp();
+  if (!producer || producer->getBlock() != body)
+    return false;
 
-/// Separates VECTOR-produced accumulator joins from their matmuls and returns
-/// one in-memory producer-to-join binding for every rewrite.
-FailureOr<AccumulatorJoinRewriteResult>
-unfuseVectorAccumulatorMatmuls(Block *body,
-                               Classification &classification);
+  auto classIt = classification.find(producer);
+  if (classIt == classification.end()) {
+    matmul.emitError("missing classification for matmul accumulator producer");
+    return failure();
+  }
+  return classIt->second == EngineType::VECTOR;
+}
 
 } // namespace mlir::triton::cv_split
-
-#endif // TRITON_ASCEND_CV_SPLIT_SCHEDULING_UNFUSE_PV_MATMULS_H

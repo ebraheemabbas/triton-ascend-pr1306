@@ -1,5 +1,8 @@
 add_triton_library(CVSplitScheduling
   CVSplitScheduling.cpp
+  CrossCoreOwnershipProof.cpp
+  CrossCorePipelinePlan.cpp
+  CrossCoreResourcePlan.cpp
   CrossScopeTransfers.cpp
   classifyAllOps.cpp
   DependencyScheduler.cpp
@@ -7,6 +10,7 @@ add_triton_library(CVSplitScheduling
   ScopeSeparation.cpp
   SoftmaxRegroup.cpp
   UnfusePVMatmuls.cpp
+  VectorAccumulatorMatmul.cpp
 
   DEPENDS
   CVSplitSchedulingPassIncGen

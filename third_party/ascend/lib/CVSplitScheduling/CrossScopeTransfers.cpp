@@ -155,7 +155,8 @@ static FailureOr<SmallVector<CrossScopeTransfer>> findCrossScopeValues(
       }
     } else if (prodType == EngineType::VECTOR) {
       // V→C: transfer VECTOR results that feed matmul input operands.
-      // A VECTOR-produced DPS init should have been removed by unfusePVMatmuls.
+      // A VECTOR-produced DPS init should have been separated by the
+      // accumulator-join rewrite.
       for (Value result : op.getResults()) {
         if (!isa<RankedTensorType>(result.getType()))
           continue;
@@ -597,10 +598,9 @@ emitVectorToCubeTransfer(const TransferEmitContext &c, CrossScopeTransfer &xfer,
     packedTensor = transp->getResult(0);
   }
 
-  // Commit the UB->L1 handoff only after every operation in this producer
-  // phase has executed. This keeps P packing, denominator/alpha maintenance,
-  // and the copy in one VF instead of splitting the state update behind a
-  // synchronization boundary.
+  // Commit at the scheduler-selected anchor. Generic scheduling selects the
+  // complete local phase end; early publication may select the producer itself for a
+  // terminal lineage boundary. Packing still has to finish before the copy.
   Operation *lateAnchor = xfer.transferInsertionAnchor;
   if (lateAnchor == xfer.producer && !packingOps.empty())
     lateAnchor = packingOps.back();
@@ -819,6 +819,8 @@ static void retireAbsorbedScaleMuls(ArrayRef<arith::MulFOp> muls) {
 FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
     scf::ForOp loop, const DenseMap<Operation *, EngineType> &classification,
     const DenseMap<Operation *, Operation *> &transferPhaseEnds,
+    const CrossCorePipelinePlan *materializedPlan,
+    const CrossCoreResourcePlan *resourcePlan,
     unsigned interCoreBufferDepth, uint64_t privateBufferUbBudgetBytes,
     bool promotePrivateBufferPools, unsigned vectorToCubeSlotOverride,
     bool sinkScaleIntoFixpipe, unsigned l0cPipelineDistance) {
@@ -1298,6 +1300,125 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
     return failure();
   }
 
+  const bool hasMaterializedPlan = materializedPlan != nullptr;
+  const bool hasResourcePlan = resourcePlan != nullptr;
+  if (hasMaterializedPlan != hasResourcePlan)
+    return failure();
+  const bool useVerifiedPlan = hasMaterializedPlan && hasResourcePlan;
+  DenseMap<Operation *, const ResourceSlotAssignment *>
+      verifiedAssignmentByProducer;
+  DenseMap<int64_t, int64_t> verifiedGroupByOrigin;
+  DenseMap<int64_t, unsigned> verifiedReleaseFlagByGroup;
+
+  if (useVerifiedPlan) {
+    auto rejectVerifiedPlan = [&](llvm::StringRef reason) -> LogicalResult {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[cv-split] verified emission plan rejected: " << reason
+                 << "\n");
+      return failure();
+    };
+    const bool validStatus =
+        resourcePlan->status == ResourcePlanStatus::ValidKnownCapacity ||
+        resourcePlan->status == ResourcePlanStatus::ValidUnknownCapacity;
+    if (!validStatus || !resourcePlan->completeLaneCoverage ||
+        !resourcePlan->anchorsComplete || !resourcePlan->ownershipResolved ||
+        !resourcePlan->flagCapacityProven ||
+        resourcePlan->unresolvedOwnershipEdges != 0 ||
+        resourcePlan->seedRequirements != 0 ||
+        resourcePlan->firstAvailableFlagId !=
+            static_cast<unsigned>(flagBase) ||
+        resourcePlan->requiredFlags != requiredFlags ||
+        resourcePlan->assignments.size() != transfers.size())
+      return rejectVerifiedPlan("envelope");
+
+    for (const ResourceLineagePlan &lineage : resourcePlan->lineages) {
+      auto slotIt = slotCountByOrigin.find(lineage.originId);
+      auto groupIt = slotGroupOfOrigin.find(lineage.originId);
+      if (slotIt == slotCountByOrigin.end() ||
+          groupIt == slotGroupOfOrigin.end() ||
+          slotIt->second != lineage.slotCount ||
+          groupIt->second != lineage.physicalGroup ||
+          !verifiedGroupByOrigin
+               .try_emplace(lineage.originId, lineage.physicalGroup)
+               .second)
+        return rejectVerifiedPlan("lineage");
+    }
+
+    for (const ResourceSlotAssignment &assignment :
+         resourcePlan->assignments) {
+      if (assignment.boundaryIndex >= materializedPlan->boundaries.size() ||
+          assignment.lineageIndex >= resourcePlan->lineages.size())
+        return rejectVerifiedPlan("assignment");
+      const CrossCoreBoundary &boundary =
+          materializedPlan->boundaries[assignment.boundaryIndex];
+      const ResourceLineagePlan &lineage =
+          resourcePlan->lineages[assignment.lineageIndex];
+      auto phaseIt = phaseFlagOffsetByOrigin.find(lineage.originId);
+      if (!boundary.producer)
+        return rejectVerifiedPlan("assignment-producer");
+      if (phaseIt == phaseFlagOffsetByOrigin.end())
+        return rejectVerifiedPlan("assignment-phase");
+      if (boundary.key.originId != lineage.originId ||
+          boundary.key.direction != lineage.direction ||
+          boundary.key.lane != assignment.lane ||
+          assignment.physicalGroup != lineage.physicalGroup)
+        return rejectVerifiedPlan("assignment-key");
+      if (assignment.slot != assignment.lane % lineage.slotCount)
+        return rejectVerifiedPlan("assignment-slot");
+      const unsigned expectedFlag =
+          static_cast<unsigned>(flagBase) + phaseIt->second +
+          assignment.slot;
+      if (assignment.forwardFlagId != expectedFlag) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[cv-split] verified flag mismatch origin="
+                   << lineage.originId << " lane=" << assignment.lane
+                   << " planned=" << assignment.forwardFlagId
+                   << " shadow=" << expectedFlag << "\n");
+        return rejectVerifiedPlan("assignment-flag");
+      }
+      if (!verifiedAssignmentByProducer
+               .try_emplace(boundary.producer, &assignment)
+               .second)
+        return rejectVerifiedPlan("assignment-duplicate-producer");
+    }
+
+    for (const ResourcePhysicalGroup &group : resourcePlan->groups) {
+      if (!group.releaseFlagId)
+        continue;
+      auto releaseIt = releaseFlagOffsetByGroup.find(group.groupId);
+      if (releaseIt == releaseFlagOffsetByGroup.end() ||
+          *group.releaseFlagId !=
+              static_cast<unsigned>(flagBase) + releaseIt->second ||
+          !verifiedReleaseFlagByGroup
+               .try_emplace(group.groupId, *group.releaseFlagId)
+               .second)
+        return rejectVerifiedPlan("release");
+    }
+    if (verifiedReleaseFlagByGroup.size() != mergedGroupKeys.size())
+      return rejectVerifiedPlan("release-count");
+
+    for (const CrossScopeTransfer &xfer : transfers) {
+      auto assignmentIt = verifiedAssignmentByProducer.find(xfer.producer);
+      if (assignmentIt == verifiedAssignmentByProducer.end())
+        return rejectVerifiedPlan("transfer-assignment");
+      const ResourceSlotAssignment &assignment = *assignmentIt->second;
+      const ResourceLineagePlan &lineage =
+          resourcePlan->lineages[assignment.lineageIndex];
+      const CrossCoreDirection direction =
+          xfer.direction == CrossScopeTransfer::CUBE_TO_VECTOR
+              ? CrossCoreDirection::CubeToVector
+              : CrossCoreDirection::VectorToCube;
+      if (lineage.originId != xfer.originId ||
+          lineage.direction != direction)
+        return rejectVerifiedPlan("transfer-lineage");
+    }
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split] verified emission plan matched "
+               << transfers.size() << " transfers, "
+               << resourcePlan->groups.size() << " groups and "
+               << requiredFlags << " flags\n");
+  }
+
   // The shared DCVP buffer-count policy controls the pool depth. Same-typed
   // buffers (all unrolled qk_ub, all pv_ub, all P L1) rotate over that many
   // physical allocations; absence of a frontend policy defaults to two.
@@ -1338,12 +1459,20 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
     }
 
     const unsigned ordinal = laneOrdinalByOrigin[xfer.originId]++;
-    const unsigned slot = ordinal % slotCountByOrigin[xfer.originId];
-    const unsigned phaseBase =
-        flagBase + phaseFlagOffsetByOrigin[xfer.originId];
+    unsigned slot = ordinal % slotCountByOrigin[xfer.originId];
+    unsigned forwardFlagId =
+        flagBase + phaseFlagOffsetByOrigin[xfer.originId] + slot;
+    int64_t groupKey = slotGroupOfOrigin[xfer.originId];
+    if (useVerifiedPlan) {
+      const ResourceSlotAssignment &assignment =
+          *verifiedAssignmentByProducer.lookup(xfer.producer);
+      slot = assignment.slot;
+      forwardFlagId = assignment.forwardFlagId;
+      groupKey = assignment.physicalGroup;
+    }
     const TransferSyncPlan plan{
-        /*forwardFlagId=*/static_cast<int>(phaseBase + slot),
-        /*slotGroupKey=*/slotGroupOfOrigin[xfer.originId],
+        /*forwardFlagId=*/static_cast<int>(forwardFlagId),
+        /*slotGroupKey=*/groupKey,
         /*slot=*/slot,
         /*slotAllocType=*/unionTypeOfOrigin.lookup(xfer.originId)};
 
@@ -1356,10 +1485,17 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
 
   // Every consumer is in place now, so the last reader of each merged group is
   // known and its back-edge can be closed.
-  for (int64_t key : mergedGroupKeys)
-    emitMergedSlotRelease(ec, transfers, slotGroupOfOrigin, key,
-                          flagBase +
-                              static_cast<int>(releaseFlagOffsetByGroup[key]));
+  if (useVerifiedPlan) {
+    for (const ResourcePhysicalGroup &group : resourcePlan->groups)
+      if (group.releaseFlagId)
+        emitMergedSlotRelease(ec, transfers, verifiedGroupByOrigin,
+                              group.groupId, *group.releaseFlagId);
+  } else {
+    for (int64_t key : mergedGroupKeys)
+      emitMergedSlotRelease(
+          ec, transfers, slotGroupOfOrigin, key,
+          flagBase + static_cast<int>(releaseFlagOffsetByGroup[key]));
+  }
 
   retireAbsorbedScaleMuls(absorbedScaleMuls);
 
