@@ -744,8 +744,12 @@ public:
     this->compileOn91095 = options.compileOn91095;
     this->unrollFactor = options.unrollFactor;
     this->promoteFullyUnrolled = options.promoteFullyUnrolled;
+    this->pipelineDistance = options.pipelineDistance;
     this->privateBufferUbBudgetBytes = options.privateBufferUbBudgetBytes;
     this->promotePrivateBufferPools = options.promotePrivateBufferPools;
+    this->sinkScaleIntoFixpipe = options.sinkScaleIntoFixpipe;
+    this->l0cPipelineDistance = options.l0cPipelineDistance;
+    this->regroupSoftmaxMax = options.regroupSoftmaxMax;
   }
 
   void runOnOperation() override {
