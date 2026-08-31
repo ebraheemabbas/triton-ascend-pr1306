@@ -484,7 +484,9 @@ static void emitCubeToVectorTransfer(const TransferEmitContext &c,
       mlir::ValueRange{}, dmaModeAttr, dualDstAttr,
       /*sub_block_idx=*/nullptr, preQuantAttr,
       /*pre_relu=*/nullptr, /*channel_split=*/nullptr,
-      /*c0_pad_en=*/nullptr, /*unit_flag_mode=*/mlir::ArrayAttr{}, quantScale);
+      /*c0_pad_en=*/nullptr, quantScale,
+      /*unit_flag_mode=*/mlir::ArrayAttr{},
+      /*unit_flag_group_id=*/nullptr);
   setOpEngineTypeAttr(fixpipeOp, EngineType::CUBE);
 
   // CUBE signals VECTOR.
