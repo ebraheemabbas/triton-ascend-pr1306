@@ -32,10 +32,13 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include <cstdint>
+#include <optional>
 
 namespace mlir::triton::cv_split {
 
 enum class CrossCoreDirection { CubeToVector, VectorToCube };
+
+enum class BoundaryMaterialization { Observed, PostUnfuseDpsJoin };
 
 enum class PipelineMemorySpace { UB, L1 };
 
@@ -57,18 +60,29 @@ struct PipelineResourceUse {
 
 /// One value crossing between the two execution engines.
 ///
-/// originId identifies the original operation before unrolling and lane is
-/// the clone ordinal within that origin. Operation and value handles are
-/// non-owning and remain valid only while the analyzed body is not rewritten.
-struct CrossCoreBoundary {
+/// Stable identity for one logical boundary across scheduling and the
+/// accumulator-join rewrite.
+struct CrossCoreBoundaryKey {
   int64_t originId;
   unsigned lane;
   CrossCoreDirection direction;
+  unsigned resultNumber;
+};
+
+/// One logical value crossing between the two execution engines.
+///
+/// Observed boundaries have concrete consumers and a last reader. A projected
+/// boundary describes the consumer that the accumulator-join rewrite will
+/// create; those anchors stay absent until a later binding stage. Operation and
+/// value handles are non-owning.
+struct CrossCoreBoundary {
+  CrossCoreBoundaryKey key;
+  BoundaryMaterialization materialization;
   Value value;
   Operation *producer;
   Operation *earliestPublishAnchor;
   llvm::SmallVector<Operation *> consumers;
-  Operation *lastReader;
+  Operation *lastReader = nullptr;
   uint64_t footprintBytes;
   PipelineMemorySpace memorySpace;
   Type elementType;
@@ -77,7 +91,7 @@ struct CrossCoreBoundary {
   PrincipalResource consumeResource;
   unsigned producerOrder;
   unsigned earliestPublishOrder;
-  unsigned lastReaderOrder;
+  std::optional<unsigned> lastReaderOrder;
 };
 
 /// Every unrolled clone of one original cross-core producer.

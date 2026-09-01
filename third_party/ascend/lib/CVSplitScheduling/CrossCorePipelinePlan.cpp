@@ -22,6 +22,7 @@
 
 #include "ascend/include/CVSplitScheduling/CrossCorePipelinePlan.h"
 #include "ascend/include/CVSplitScheduling/UnrollOrigin.h"
+#include "ascend/include/CVSplitScheduling/VectorAccumulatorMatmul.h"
 
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -48,6 +49,13 @@ namespace {
 
 static llvm::StringRef directionName(CrossCoreDirection direction) {
   return direction == CrossCoreDirection::CubeToVector ? "C2V" : "V2C";
+}
+
+static llvm::StringRef
+materializationName(BoundaryMaterialization materialization) {
+  return materialization == BoundaryMaterialization::Observed
+             ? "observed"
+             : "post-unfuse-dps-join";
 }
 
 static llvm::StringRef memorySpaceName(PipelineMemorySpace memorySpace) {
@@ -189,14 +197,25 @@ buildCrossCorePipelinePlan(Block *body,
     else
       continue;
 
-    for (Value value : op.getResults()) {
+    bool projectsAccumulatorJoin = false;
+    if (auto matmul = dyn_cast<linalg::MatmulOp>(&op)) {
+      FailureOr<bool> projected =
+          isVectorAccumulatorMatmul(matmul, body, classification);
+      if (failed(projected))
+        return failure();
+      projectsAccumulatorJoin = *projected;
+    }
+
+    for (auto [resultNumber, value] : llvm::enumerate(op.getResults())) {
       auto tensorType = dyn_cast<RankedTensorType>(value.getType());
       if (!tensorType)
         continue;
 
-      SmallVector<Operation *> consumers =
-          collectCrossCoreConsumers(value, *direction, body, classification);
-      if (consumers.empty())
+      SmallVector<Operation *> consumers;
+      if (!projectsAccumulatorJoin)
+        consumers = collectCrossCoreConsumers(value, *direction, body,
+                                              classification);
+      if (!projectsAccumulatorJoin && consumers.empty())
         continue;
 
       auto originAttr =
@@ -219,12 +238,18 @@ buildCrossCorePipelinePlan(Block *body,
         lane = laneIt->second;
       }
 
-      Operation *lastReader = consumers.back();
+      Operation *lastReader =
+          projectsAccumulatorJoin ? nullptr : consumers.back();
+      std::optional<unsigned> lastReaderOrder;
+      if (lastReader)
+        lastReaderOrder = operationOrder.lookup(lastReader);
       const unsigned boundaryIndex = plan.boundaries.size();
       plan.boundaries.push_back(
-          {originId,
-           lane,
-           *direction,
+          {{originId, lane, *direction,
+            static_cast<unsigned>(resultNumber)},
+           projectsAccumulatorJoin
+               ? BoundaryMaterialization::PostUnfuseDpsJoin
+               : BoundaryMaterialization::Observed,
            value,
            &op,
            &op,
@@ -245,7 +270,7 @@ buildCrossCorePipelinePlan(Block *body,
                : PrincipalResource::Mte1,
            operationOrder.lookup(&op),
            operationOrder.lookup(&op),
-           operationOrder.lookup(lastReader)});
+           lastReaderOrder});
 
       auto lineageIt = lineageIndexByOrigin.find(originId);
       if (lineageIt == lineageIndexByOrigin.end()) {
@@ -287,15 +312,23 @@ void logCrossCorePipelinePlan(const CrossCorePipelinePlan &plan) {
                    << "\n";
     }
 
-    for (const CrossCoreBoundary &boundary : plan.boundaries)
+    for (const CrossCoreBoundary &boundary : plan.boundaries) {
       llvm::dbgs() << "[cv-split] analysis boundary origin="
-                   << boundary.originId << " lane=" << boundary.lane << " "
-                   << directionName(boundary.direction)
+                   << boundary.key.originId
+                   << " lane=" << boundary.key.lane << " "
+                   << directionName(boundary.key.direction)
+                   << " materialization="
+                   << materializationName(boundary.materialization)
                    << " publish@" << boundary.earliestPublishOrder
-                   << " last-read@" << boundary.lastReaderOrder
-                   << " lifetime="
-                   << (boundary.lastReaderOrder - boundary.earliestPublishOrder)
-                   << "\n";
+                   << " last-read@";
+      if (boundary.lastReaderOrder)
+        llvm::dbgs() << *boundary.lastReaderOrder << " lifetime="
+                     << (*boundary.lastReaderOrder -
+                         boundary.earliestPublishOrder);
+      else
+        llvm::dbgs() << "pending lifetime=pending";
+      llvm::dbgs() << "\n";
+    }
 
     constexpr unsigned resourceCount =
         static_cast<unsigned>(PrincipalResource::ScalarControl) + 1;

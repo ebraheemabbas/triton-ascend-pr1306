@@ -37,7 +37,8 @@ enum class ResourcePlanStatus {
   ValidUnknownCapacity,
   FlagOverflow,
   MemoryBudgetExceeded,
-  IncompleteBoundarySet
+  IncompleteBoundarySet,
+  PendingMaterialization
 };
 
 enum class ResourceOwnershipOrdering {
@@ -108,6 +109,7 @@ struct CrossCoreResourcePlan {
   bool flagCapacityProven = false;
   bool ownershipResolved = false;
   bool completeLaneCoverage = false;
+  bool anchorsComplete = false;
   bool selectionEligible = false;
   unsigned firstAvailableFlagId = 0;
   unsigned maximumFlagId = 0;

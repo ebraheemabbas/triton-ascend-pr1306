@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Source-contract checks for Stage 5.1 resource feasibility analysis."""
+"""Source-contract checks for Stage 5 resource feasibility analysis."""
 
 from pathlib import Path
 import re
@@ -30,6 +30,7 @@ def test_resource_plan_has_required_neutral_records() -> None:
         "incrementalUbBytes",
         "requiredFlags",
         "completeLaneCoverage",
+        "anchorsComplete",
         "selectionEligible",
     }
     missing = sorted(name for name in required if name not in text)
@@ -50,7 +51,7 @@ def test_resource_policy_is_lane_generic_and_kernel_agnostic() -> None:
     matches = [pattern for pattern in forbidden if re.search(pattern, text, re.I)]
     assert not matches, f"kernel-specific resource-plan logic: {matches}"
     assert "std::min(lanes, interCoreBufferDepth)" in SOURCE.read_text()
-    assert "boundary.lane % lineage.slotCount" in SOURCE.read_text()
+    assert "boundary.key.lane % lineage.slotCount" in SOURCE.read_text()
 
 
 def test_resource_analysis_does_not_mutate_ir() -> None:
@@ -77,6 +78,7 @@ def test_stage51_is_analysis_only_and_runs_before_scheduler() -> None:
     assert "resourcePlan" not in text[scheduler:transfer]
     assert "Unresolved" in SOURCE.read_text()
     assert "IncompleteBoundarySet" in SOURCE.read_text()
+    assert "PendingMaterialization" in SOURCE.read_text()
     assert "selectionEligible" in SOURCE.read_text()
 
 
@@ -90,4 +92,4 @@ if __name__ == "__main__":
     test_resource_analysis_does_not_mutate_ir()
     test_stage51_is_analysis_only_and_runs_before_scheduler()
     test_resource_source_is_built()
-    print("Stage 5.1 resource-plan source contract: PASS")
+    print("Stage 5 resource-plan source contract: PASS")

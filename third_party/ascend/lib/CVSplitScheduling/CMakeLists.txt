@@ -9,6 +9,7 @@ add_triton_library(CVSplitScheduling
   ScopeSeparation.cpp
   SoftmaxRegroup.cpp
   UnfusePVMatmuls.cpp
+  VectorAccumulatorMatmul.cpp
 
   DEPENDS
   CVSplitSchedulingPassIncGen

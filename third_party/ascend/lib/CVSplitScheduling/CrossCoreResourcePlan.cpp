@@ -61,6 +61,8 @@ static llvm::StringRef statusName(ResourcePlanStatus status) {
     return "memory-budget-exceeded";
   case ResourcePlanStatus::IncompleteBoundarySet:
     return "incomplete-boundary-set";
+  case ResourcePlanStatus::PendingMaterialization:
+    return "pending-materialization";
   }
   llvm_unreachable("unknown resource-plan status");
 }
@@ -115,13 +117,13 @@ buildLineagePlan(const CrossCorePipelinePlan &pipelinePlan,
   for (auto [expectedLane, boundaryIndex] : llvm::enumerate(indices)) {
     const CrossCoreBoundary &boundary =
         pipelinePlan.boundaries[boundaryIndex];
-    if (boundary.originId != lineage.originId ||
-        boundary.direction != lineage.direction ||
-        boundary.lane != expectedLane ||
+    if (boundary.key.originId != lineage.originId ||
+        boundary.key.direction != lineage.direction ||
+        boundary.key.lane != expectedLane ||
         boundary.footprintBytes != first.footprintBytes ||
         boundary.memorySpace != first.memorySpace ||
         boundary.elementType != first.elementType || !boundary.producer ||
-        !boundary.lastReader)
+        !boundary.earliestPublishAnchor)
       return failure();
   }
 
@@ -175,6 +177,16 @@ buildCrossCoreResourcePlan(const CrossCorePipelinePlan &pipelinePlan,
       pipelinePlan.laneCount > 0 &&
       llvm::all_of(plan.lineages, [&](const ResourceLineagePlan &lineage) {
         return lineage.laneCount == pipelinePlan.laneCount;
+      });
+  plan.anchorsComplete =
+      llvm::all_of(plan.lineages, [&](const ResourceLineagePlan &lineage) {
+        return llvm::all_of(lineage.boundaryIndices,
+                            [&](unsigned boundaryIndex) {
+          const CrossCoreBoundary &boundary =
+              pipelinePlan.boundaries[boundaryIndex];
+          return !boundary.consumers.empty() && boundary.lastReader &&
+                 boundary.lastReaderOrder.has_value();
+        });
       });
 
   for (ResourceLineagePlan &lineage : plan.lineages) {
@@ -343,8 +355,9 @@ buildCrossCoreResourcePlan(const CrossCorePipelinePlan &pipelinePlan,
       const CrossCoreBoundary &boundary =
           pipelinePlan.boundaries[boundaryIndex];
       plan.assignments.push_back(ResourceSlotAssignment{
-          boundaryIndex, static_cast<unsigned>(lineageIndex), boundary.lane,
-          lineage.physicalGroup, boundary.lane % lineage.slotCount});
+          boundaryIndex, static_cast<unsigned>(lineageIndex),
+          boundary.key.lane, lineage.physicalGroup,
+          boundary.key.lane % lineage.slotCount});
     }
 
   for (const ResourcePhysicalGroup &group : plan.groups) {
@@ -409,6 +422,8 @@ buildCrossCoreResourcePlan(const CrossCorePipelinePlan &pipelinePlan,
 
   if (!plan.completeLaneCoverage)
     plan.status = ResourcePlanStatus::IncompleteBoundarySet;
+  else if (!plan.anchorsComplete)
+    plan.status = ResourcePlanStatus::PendingMaterialization;
   else if (!plan.flagCapacityProven)
     plan.status = ResourcePlanStatus::FlagOverflow;
   else if (!ubWithinBudget || !l1WithinBudget)
@@ -432,6 +447,8 @@ void logCrossCoreResourcePlan(const CrossCoreResourcePlan &plan) {
                  << " groups=" << plan.groups.size()
                  << " complete-lanes="
                  << (plan.completeLaneCoverage ? "yes" : "no")
+                 << " anchors-complete="
+                 << (plan.anchorsComplete ? "yes" : "no")
                  << " selection-eligible="
                  << (plan.selectionEligible ? "yes" : "no") << "\n";
 

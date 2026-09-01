@@ -21,6 +21,7 @@
  */
 
 #include "ascend/include/CVSplitScheduling/UnfusePVMatmuls.h"
+#include "ascend/include/CVSplitScheduling/VectorAccumulatorMatmul.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -50,31 +51,20 @@ LogicalResult unfusePVMatmuls(Block *body, Classification &classification) {
     if (!matmulOp)
       continue;
 
-    // The outs value is the DPS init.
-    Value outsVal = matmulOp.getDpsInitOperand(0)->get();
-
-    // Check if outs is produced by a VECTOR op (e.g. arith.mulf for acc*alpha)
-    Operation *outsDef = outsVal.getDefiningOp();
-    if (!outsDef || outsDef->getBlock() != body)
-      continue;
-    auto outsClassIt = classification.find(outsDef);
-    if (outsClassIt == classification.end()) {
-      matmulOp.emitError(
-          "missing classification for matmul accumulator producer");
+    FailureOr<bool> matches =
+        isVectorAccumulatorMatmul(matmulOp, body, classification);
+    if (failed(matches))
       return failure();
-    }
-    if (outsClassIt->second != EngineType::VECTOR)
-      continue;
-
-    // This is a fused PV matmul with VECTOR-produced accumulator init
-    toUnfuse.push_back(matmulOp);
+    if (*matches)
+      toUnfuse.push_back(matmulOp);
   }
 
   if (toUnfuse.empty())
     return success();
 
-  LLVM_DEBUG(llvm::dbgs() << "[cv-split] Unfusing " << toUnfuse.size()
-                          << " PV matmuls with VECTOR outs\n");
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] Unfusing " << toUnfuse.size()
+             << " matmuls with VECTOR-produced accumulators\n");
 
   DenseMap<Type, Value> zeroInitByType;
   for (auto matmulOp : toUnfuse) {
