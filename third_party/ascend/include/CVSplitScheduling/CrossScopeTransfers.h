@@ -78,9 +78,10 @@ struct CrossScopeTransferInfo {
 /// synchronization for `loop`.
 ///
 /// `classification` assigns each operation to its execution engine.
-/// `transferPhaseEnds` maps a VECTOR-engine operation whose result is consumed
-/// by CUBE to the last VECTOR operation that must finish before its final
-/// UB-to-L1 copy and ready signal may be committed.
+/// transferPhaseEnds maps a VECTOR-engine operation whose result is consumed
+/// by CUBE to its selected UB-to-L1 copy and ready-signal commit anchor. The
+/// generic scheduler chooses the local phase end; Stage 4 may choose an earlier
+/// validated plan anchor for a terminal lineage boundary.
 /// The returned handles remain owned by the mutated IR and must be consumed
 /// before the referenced operations are erased or reordered.
 /// `blockM`, derived internally from the leading transfer, must be positive and

@@ -35,6 +35,15 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
     Option<"unrollFactor", "unroll-factor",
            "int", /*default*/"2",
            "loop unroll factor (2, 4, or 8)">,
+    Option<"enablePlanDrivenEarlyPublish",
+           "enable-plan-driven-early-publish",
+           "bool", /*default*/"false",
+           "publish the terminal VECTOR-to-CUBE boundary in each unroll "
+           "lineage at its earliest legal plan anchor instead of waiting for "
+           "independent scalar/rank-1 local state. This is the isolated Stage "
+           "4 experiment: storage, slot reuse, and arithmetic remain "
+           "unchanged, and a missing/invalid analysis plan keeps the generic "
+           "late-publish behavior.">,
     Option<"promoteFullyUnrolled", "promote-fully-unrolled",
            "bool", /*default*/"true",
            "promote the scope loops left by a candidate whose unroll consumed "

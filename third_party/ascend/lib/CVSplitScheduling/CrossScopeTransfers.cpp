@@ -597,10 +597,9 @@ emitVectorToCubeTransfer(const TransferEmitContext &c, CrossScopeTransfer &xfer,
     packedTensor = transp->getResult(0);
   }
 
-  // Commit the UB->L1 handoff only after every operation in this producer
-  // phase has executed. This keeps P packing, denominator/alpha maintenance,
-  // and the copy in one VF instead of splitting the state update behind a
-  // synchronization boundary.
+  // Commit at the scheduler-selected anchor. Generic scheduling selects the
+  // complete local phase end; Stage 4 may select the producer itself for a
+  // terminal lineage boundary. Packing still has to finish before the copy.
   Operation *lateAnchor = xfer.transferInsertionAnchor;
   if (lateAnchor == xfer.producer && !packingOps.empty())
     lateAnchor = packingOps.back();

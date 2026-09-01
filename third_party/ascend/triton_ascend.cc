@@ -147,10 +147,12 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       [](mlir::PassManager &pm, bool compileOn91095, int unrollFactor,
          bool promoteFullyUnrolled, int64_t privateBufferUbBudgetBytes,
          bool promotePrivateBufferPools, bool sinkScaleIntoFixpipe,
-         int l0cPipelineDistance, bool regroupSoftmaxMax) {
+         int l0cPipelineDistance, bool regroupSoftmaxMax,
+         bool enablePlanDrivenEarlyPublish) {
         CVSplitSchedulingOptions opts;
         opts.compileOn91095 = compileOn91095;
         opts.unrollFactor = unrollFactor;
+        opts.enablePlanDrivenEarlyPublish = enablePlanDrivenEarlyPublish;
         opts.promoteFullyUnrolled = promoteFullyUnrolled;
         opts.privateBufferUbBudgetBytes = privateBufferUbBudgetBytes;
         opts.promotePrivateBufferPools = promotePrivateBufferPools;
@@ -165,7 +167,8 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       py::arg("promote_private_buffer_pools") = false,
       py::arg("sink_scale_into_fixpipe") = false,
       py::arg("l0c_pipeline_distance") = 0,
-      py::arg("regroup_softmax_max") = false);
+      py::arg("regroup_softmax_max") = false,
+      py::arg("enable_plan_driven_early_publish") = false);
 
   m.def(
       "add_graph_optimize",

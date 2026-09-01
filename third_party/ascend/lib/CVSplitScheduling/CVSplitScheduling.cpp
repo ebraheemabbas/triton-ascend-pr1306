@@ -744,6 +744,7 @@ public:
   explicit CVSplitSchedulingPass(const CVSplitSchedulingOptions &options) {
     this->compileOn91095 = options.compileOn91095;
     this->unrollFactor = options.unrollFactor;
+    this->enablePlanDrivenEarlyPublish = options.enablePlanDrivenEarlyPublish;
     this->promoteFullyUnrolled = options.promoteFullyUnrolled;
     this->pipelineDistance = options.pipelineDistance;
     this->privateBufferUbBudgetBytes = options.privateBufferUbBudgetBytes;
@@ -959,6 +960,8 @@ private:
       LLVM_DEBUG(llvm::dbgs()
                  << "[cv-split] analysis plan unavailable; using generic "
                     "scheduling\n");
+    const cv_split::CrossCorePipelinePlan *pipelinePlan =
+        succeeded(analysisPlan) ? &*analysisPlan : nullptr;
 
     // Stages 4-7: build the dependency graph, assign BFS levels, verify the
     // CUBE/VECTOR work is cleanly separable, and reorder the body by level.
@@ -1034,7 +1037,8 @@ private:
     cv_split::DependencyScheduler scheduler;
     llvm::DenseMap<Operation *, Operation *> transferPhaseEnds;
     if (failed(scheduler.run(body, classification, transferPhaseEnds,
-                             reorderDistance)))
+                             reorderDistance, pipelinePlan,
+                             enablePlanDrivenEarlyPublish)))
       return failure();
 
     // Stage 7.5: Unfuse PV matmuls (split matmul(p,v,acc*alpha) into pv + addf)
