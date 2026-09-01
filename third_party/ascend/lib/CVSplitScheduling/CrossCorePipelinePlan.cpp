@@ -21,6 +21,7 @@
  */
 
 #include "ascend/include/CVSplitScheduling/CrossCorePipelinePlan.h"
+#include "ascend/include/CVSplitScheduling/UnfusePVMatmuls.h"
 #include "ascend/include/CVSplitScheduling/UnrollOrigin.h"
 #include "ascend/include/CVSplitScheduling/VectorAccumulatorMatmul.h"
 
@@ -29,6 +30,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
@@ -293,16 +295,111 @@ buildCrossCorePipelinePlan(Block *body,
   return plan;
 }
 
-void logCrossCorePipelinePlan(const CrossCorePipelinePlan &plan) {
+FailureOr<CrossCorePipelinePlan> bindCrossCorePipelinePlan(
+    const CrossCorePipelinePlan &logicalPlan,
+    const AccumulatorJoinRewriteResult &rewriteResult, Block *body,
+    const Classification &classification) {
+  if (!body)
+    return failure();
+
+  DenseMap<Operation *, Operation *> joinByProducer;
+  DenseSet<Operation *> uniqueJoins;
+  for (const AccumulatorJoinBinding &binding : rewriteResult.bindings) {
+    if (!binding.matmulProducer || !binding.vectorJoin ||
+        !joinByProducer.try_emplace(binding.matmulProducer, binding.vectorJoin)
+             .second ||
+        !uniqueJoins.insert(binding.vectorJoin).second)
+      return failure();
+  }
+
+  DenseMap<Operation *, unsigned> operationOrder;
+  unsigned nextOrder = 0;
+  CrossCorePipelinePlan materialized = logicalPlan;
+  materialized.resourceUses.clear();
+  for (Operation &op : *body) {
+    if (isa<scf::YieldOp>(op))
+      continue;
+    auto classIt = classification.find(&op);
+    if (classIt == classification.end())
+      return failure();
+    operationOrder[&op] = nextOrder++;
+    materialized.resourceUses.push_back(
+        {&op, inferPrincipalResource(&op, classIt->second)});
+  }
+
+  DenseSet<Operation *> usedBindings;
+  for (CrossCoreBoundary &boundary : materialized.boundaries) {
+    if (!boundary.producer || boundary.producer->getBlock() != body ||
+        !boundary.earliestPublishAnchor ||
+        boundary.earliestPublishAnchor->getBlock() != body ||
+        boundary.key.resultNumber >= boundary.producer->getNumResults() ||
+        boundary.producer->getResult(boundary.key.resultNumber) !=
+            boundary.value)
+      return failure();
+
+    if (boundary.materialization ==
+        BoundaryMaterialization::PostUnfuseDpsJoin) {
+      auto joinIt = joinByProducer.find(boundary.producer);
+      if (joinIt == joinByProducer.end())
+        return failure();
+      Operation *join = joinIt->second;
+      if (!usedBindings.insert(boundary.producer).second ||
+          join->getBlock() != body)
+        return failure();
+      auto classIt = classification.find(join);
+      if (classIt == classification.end() ||
+          classIt->second != EngineType::VECTOR ||
+          !llvm::is_contained(join->getOperands(), boundary.value))
+        return failure();
+
+      SmallVector<Operation *> directConsumers;
+      for (Operation *user : boundary.value.getUsers())
+        if (user->getBlock() == body && !isa<scf::YieldOp>(user))
+          directConsumers.push_back(user);
+      if (directConsumers.size() != 1 || directConsumers.front() != join)
+        return failure();
+      boundary.consumers = {join};
+      boundary.lastReader = join;
+    } else {
+      if (boundary.consumers.empty())
+        return failure();
+      for (Operation *consumer : boundary.consumers)
+        if (!consumer || consumer->getBlock() != body ||
+            !llvm::is_contained(consumer->getOperands(), boundary.value))
+          return failure();
+      llvm::sort(boundary.consumers, [&](Operation *lhs, Operation *rhs) {
+        return operationOrder.lookup(lhs) < operationOrder.lookup(rhs);
+      });
+      boundary.lastReader = boundary.consumers.back();
+    }
+
+    if (!operationOrder.contains(boundary.producer) ||
+        !operationOrder.contains(boundary.earliestPublishAnchor) ||
+        !operationOrder.contains(boundary.lastReader))
+      return failure();
+    boundary.producerOrder = operationOrder.lookup(boundary.producer);
+    boundary.earliestPublishOrder =
+        operationOrder.lookup(boundary.earliestPublishAnchor);
+    boundary.lastReaderOrder = operationOrder.lookup(boundary.lastReader);
+  }
+
+  if (usedBindings.size() != joinByProducer.size())
+    return failure();
+  return materialized;
+}
+
+static void logPipelinePlan(const CrossCorePipelinePlan &plan,
+                            llvm::StringRef label) {
   LLVM_DEBUG({
-    llvm::dbgs() << "[cv-split] analysis plan: lanes=" << plan.laneCount
+    llvm::dbgs() << "[cv-split] " << label << " plan: lanes=" << plan.laneCount
                  << " boundaries=" << plan.boundaries.size()
                  << " lineages=" << plan.lineages.size() << "\n";
 
     for (const CrossCorePhaseLineage &lineage : plan.lineages) {
       const CrossCoreBoundary &first =
           plan.boundaries[lineage.boundaryIndices.front()];
-      llvm::dbgs() << "[cv-split] analysis lineage " << lineage.originId << ": "
+      llvm::dbgs() << "[cv-split] " << label << " lineage "
+                   << lineage.originId << ": "
                    << directionName(lineage.direction) << ", "
                    << lineage.boundaryIndices.size() << " lane(s), "
                    << first.footprintBytes << " bytes/boundary, "
@@ -313,7 +410,7 @@ void logCrossCorePipelinePlan(const CrossCorePipelinePlan &plan) {
     }
 
     for (const CrossCoreBoundary &boundary : plan.boundaries) {
-      llvm::dbgs() << "[cv-split] analysis boundary origin="
+      llvm::dbgs() << "[cv-split] " << label << " boundary origin="
                    << boundary.key.originId
                    << " lane=" << boundary.key.lane << " "
                    << directionName(boundary.key.direction)
@@ -335,13 +432,21 @@ void logCrossCorePipelinePlan(const CrossCorePipelinePlan &plan) {
     unsigned counts[resourceCount] = {};
     for (const PipelineResourceUse &use : plan.resourceUses)
       ++counts[static_cast<unsigned>(use.resource)];
-    llvm::dbgs() << "[cv-split] analysis resources:";
+    llvm::dbgs() << "[cv-split] " << label << " resources:";
     for (unsigned i = 0; i < resourceCount; ++i)
       llvm::dbgs() << " "
                    << resourceName(static_cast<PrincipalResource>(i)) << "="
                    << counts[i];
     llvm::dbgs() << "\n";
   });
+}
+
+void logCrossCorePipelinePlan(const CrossCorePipelinePlan &plan) {
+  logPipelinePlan(plan, "analysis");
+}
+
+void logMaterializedCrossCorePipelinePlan(const CrossCorePipelinePlan &plan) {
+  logPipelinePlan(plan, "materialized");
 }
 
 } // namespace mlir::triton::cv_split

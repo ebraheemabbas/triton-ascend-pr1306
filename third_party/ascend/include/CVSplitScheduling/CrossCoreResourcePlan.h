@@ -38,7 +38,8 @@ enum class ResourcePlanStatus {
   FlagOverflow,
   MemoryBudgetExceeded,
   IncompleteBoundarySet,
-  PendingMaterialization
+  PendingMaterialization,
+  UnresolvedOwnership
 };
 
 enum class ResourceOwnershipOrdering {
@@ -131,6 +132,8 @@ buildCrossCoreResourcePlan(const CrossCorePipelinePlan &pipelinePlan,
                            const CrossCoreResourceLimits &limits);
 
 void logCrossCoreResourcePlan(const CrossCoreResourcePlan &plan);
+
+void logMaterializedCrossCoreResourcePlan(const CrossCoreResourcePlan &plan);
 
 } // namespace mlir::triton::cv_split
 

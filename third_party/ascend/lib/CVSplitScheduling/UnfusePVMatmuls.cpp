@@ -41,10 +41,13 @@ namespace mlir::triton::cv_split {
 // x) into matmul(..., x), creating an unresolvable CUBE→VECTOR→CUBE chain
 // through the accumulator. Unfusing makes the PV matmul independent of the
 // accumulator.
-LogicalResult unfusePVMatmuls(Block *body, Classification &classification) {
+FailureOr<AccumulatorJoinRewriteResult>
+unfuseVectorAccumulatorMatmuls(Block *body,
+                               Classification &classification) {
   if (!body)
     return failure();
 
+  AccumulatorJoinRewriteResult rewriteResult;
   SmallVector<linalg::MatmulOp> toUnfuse;
   for (Operation &op : *body) {
     auto matmulOp = dyn_cast<linalg::MatmulOp>(&op);
@@ -60,7 +63,7 @@ LogicalResult unfusePVMatmuls(Block *body, Classification &classification) {
   }
 
   if (toUnfuse.empty())
-    return success();
+    return rewriteResult;
 
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] Unfusing " << toUnfuse.size()
@@ -110,9 +113,11 @@ LogicalResult unfusePVMatmuls(Block *body, Classification &classification) {
     }
     classification[addOp] = EngineType::VECTOR;
     setOpEngineTypeAttr(addOp, EngineType::VECTOR);
+    rewriteResult.bindings.push_back(
+        {matmulOp.getOperation(), addOp.getOperation()});
   }
 
-  return success();
+  return rewriteResult;
 }
 
 } // namespace mlir::triton::cv_split

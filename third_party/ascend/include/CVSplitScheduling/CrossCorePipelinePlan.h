@@ -36,6 +36,8 @@
 
 namespace mlir::triton::cv_split {
 
+struct AccumulatorJoinRewriteResult;
+
 enum class CrossCoreDirection { CubeToVector, VectorToCube };
 
 enum class BoundaryMaterialization { Observed, PostUnfuseDpsJoin };
@@ -114,8 +116,17 @@ struct CrossCorePipelinePlan {
 FailureOr<CrossCorePipelinePlan>
 buildCrossCorePipelinePlan(Block *body, const Classification &classification);
 
+/// Binds projected boundaries to real post-rewrite consumers and refreshes all
+/// operation-order fields after dependency scheduling.
+FailureOr<CrossCorePipelinePlan> bindCrossCorePipelinePlan(
+    const CrossCorePipelinePlan &logicalPlan,
+    const AccumulatorJoinRewriteResult &rewriteResult, Block *body,
+    const Classification &classification);
+
 /// Emits deterministic LLVM_DEBUG diagnostics for an analysis plan.
 void logCrossCorePipelinePlan(const CrossCorePipelinePlan &plan);
+
+void logMaterializedCrossCorePipelinePlan(const CrossCorePipelinePlan &plan);
 
 } // namespace mlir::triton::cv_split
 

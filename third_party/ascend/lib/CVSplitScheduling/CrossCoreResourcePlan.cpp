@@ -63,6 +63,8 @@ static llvm::StringRef statusName(ResourcePlanStatus status) {
     return "incomplete-boundary-set";
   case ResourcePlanStatus::PendingMaterialization:
     return "pending-materialization";
+  case ResourcePlanStatus::UnresolvedOwnership:
+    return "unresolved-ownership";
   }
   llvm_unreachable("unknown resource-plan status");
 }
@@ -430,6 +432,8 @@ buildCrossCoreResourcePlan(const CrossCorePipelinePlan &pipelinePlan,
     plan.status = ResourcePlanStatus::FlagOverflow;
   else if (!ubWithinBudget || !l1WithinBudget)
     plan.status = ResourcePlanStatus::MemoryBudgetExceeded;
+  else if (!plan.ownershipResolved)
+    plan.status = ResourcePlanStatus::UnresolvedOwnership;
   else if (plan.ubCapacityKnown && plan.l1CapacityKnown)
     plan.status = ResourcePlanStatus::ValidKnownCapacity;
   else
@@ -441,9 +445,10 @@ buildCrossCoreResourcePlan(const CrossCorePipelinePlan &pipelinePlan,
   return plan;
 }
 
-void logCrossCoreResourcePlan(const CrossCoreResourcePlan &plan) {
+static void logResourcePlan(const CrossCoreResourcePlan &plan,
+                            llvm::StringRef label) {
   LLVM_DEBUG({
-    llvm::dbgs() << "[cv-split] resource-plan status="
+    llvm::dbgs() << "[cv-split] " << label << "-plan status="
                  << statusName(plan.status)
                  << " lineages=" << plan.lineages.size()
                  << " groups=" << plan.groups.size()
@@ -455,7 +460,7 @@ void logCrossCoreResourcePlan(const CrossCoreResourcePlan &plan) {
                  << (plan.selectionEligible ? "yes" : "no") << "\n";
 
     for (const ResourceLineagePlan &lineage : plan.lineages)
-      llvm::dbgs() << "[cv-split] resource-lineage origin="
+      llvm::dbgs() << "[cv-split] " << label << "-lineage origin="
                    << lineage.originId
                    << " direction=" << directionName(lineage.direction)
                    << " lanes=" << lineage.laneCount
@@ -467,7 +472,8 @@ void logCrossCoreResourcePlan(const CrossCoreResourcePlan &plan) {
                    << "\n";
 
     for (const ResourcePhysicalGroup &group : plan.groups)
-      llvm::dbgs() << "[cv-split] resource-group id=" << group.groupId
+      llvm::dbgs() << "[cv-split] " << label << "-group id="
+                   << group.groupId
                    << " roles=" << group.lineageIndices.size()
                    << " slots=" << group.slotCount
                    << " bytes-per-slot=" << group.bytesPerSlot
@@ -477,7 +483,7 @@ void logCrossCoreResourcePlan(const CrossCoreResourcePlan &plan) {
                    << "\n";
 
     for (const ResourceOwnershipEdge &edge : plan.ownershipEdges)
-      llvm::dbgs() << "[cv-split] resource-edge group="
+      llvm::dbgs() << "[cv-split] " << label << "-edge group="
                    << edge.physicalGroup << " slot=" << edge.slot
                    << " from=" << edge.fromBoundaryIndex
                    << " to=" << edge.toBoundaryIndex
@@ -485,7 +491,7 @@ void logCrossCoreResourcePlan(const CrossCoreResourcePlan &plan) {
                    << " ordering=" << orderingName(edge.ordering)
                    << " seed=" << (edge.needsSeed ? "yes" : "no") << "\n";
 
-    llvm::dbgs() << "[cv-split] resource-flags first="
+    llvm::dbgs() << "[cv-split] " << label << "-flags first="
                  << plan.firstAvailableFlagId
                  << " required=" << plan.requiredFlags
                  << " forward=" << plan.forwardFlags
@@ -493,7 +499,7 @@ void logCrossCoreResourcePlan(const CrossCoreResourcePlan &plan) {
                  << " maximum=" << plan.maximumFlagId
                  << " proven=" << (plan.flagCapacityProven ? "yes" : "no")
                  << "\n";
-    llvm::dbgs() << "[cv-split] resource-memory UB="
+    llvm::dbgs() << "[cv-split] " << label << "-memory UB="
                  << plan.allocatedUbBytes
                  << " L1=" << plan.allocatedL1Bytes
                  << " baseline-UB=" << plan.baselineUbBytes
@@ -502,6 +508,14 @@ void logCrossCoreResourcePlan(const CrossCoreResourcePlan &plan) {
                  << " L1-known=" << (plan.l1CapacityKnown ? "yes" : "no")
                  << "\n";
   });
+}
+
+void logCrossCoreResourcePlan(const CrossCoreResourcePlan &plan) {
+  logResourcePlan(plan, "resource");
+}
+
+void logMaterializedCrossCoreResourcePlan(const CrossCoreResourcePlan &plan) {
+  logResourcePlan(plan, "bound-resource");
 }
 
 } // namespace mlir::triton::cv_split

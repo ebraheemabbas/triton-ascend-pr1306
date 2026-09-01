@@ -155,7 +155,8 @@ static FailureOr<SmallVector<CrossScopeTransfer>> findCrossScopeValues(
       }
     } else if (prodType == EngineType::VECTOR) {
       // V→C: transfer VECTOR results that feed matmul input operands.
-      // A VECTOR-produced DPS init should have been removed by unfusePVMatmuls.
+      // A VECTOR-produced DPS init should have been separated by the
+      // accumulator-join rewrite.
       for (Value result : op.getResults()) {
         if (!isa<RankedTensorType>(result.getType()))
           continue;

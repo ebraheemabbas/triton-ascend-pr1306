@@ -70,13 +70,18 @@ def test_resource_analysis_does_not_mutate_ir() -> None:
     assert not present, f"resource analysis mutates IR: {present}"
 
 
-def test_stage51_is_analysis_only_and_runs_before_scheduler() -> None:
+def test_resource_plans_are_analysis_only() -> None:
     text = PASS.read_text()
     resource = text.index("buildCrossCoreResourcePlan")
     scheduler = text.index("cv_split::DependencyScheduler scheduler")
     transfer = text.index("cv_split::insertCrossScopeTransfers")
     assert resource < scheduler < transfer
-    assert "resourcePlan" not in text[scheduler:transfer]
+    scheduler_call = text[text.index("scheduler.run"):text.index("return failure();", scheduler)]
+    transfer_call = text[transfer:text.index("if (failed(transferInfo))", transfer)]
+    assert "resourcePlan" not in scheduler_call
+    assert "materializedPlan" not in scheduler_call
+    assert "resourcePlan" not in transfer_call
+    assert "materializedPlan" not in transfer_call
     assert "Unresolved" in SOURCE.read_text()
     assert "IncompleteBoundarySet" in SOURCE.read_text()
     assert "PendingMaterialization" in SOURCE.read_text()
@@ -91,6 +96,6 @@ if __name__ == "__main__":
     test_resource_plan_has_required_neutral_records()
     test_resource_policy_is_lane_generic_and_kernel_agnostic()
     test_resource_analysis_does_not_mutate_ir()
-    test_stage51_is_analysis_only_and_runs_before_scheduler()
+    test_resource_plans_are_analysis_only()
     test_resource_source_is_built()
     print("Stage 5 resource-plan source contract: PASS")

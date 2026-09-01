@@ -91,7 +91,7 @@ using namespace mlir::triton;
 //                                    VECTOR)
 //   4-7 DependencyScheduler          graph -> BFS levels -> reorder so
 //                                    same-engine work is contiguous
-//   7.5 unfusePVMatmuls              undo matmul(p,v,acc) fusion that entangles
+//   7.5 unfuse accumulator joins     separate CUBE work from VECTOR joins
 //                                    the engines
 //   8.  insertCrossScopeTransfers    materialize C->V (fixpipe->UB) and V->C
 //                                    (NZ pack->L1) buffers +
@@ -1040,25 +1040,26 @@ private:
     // This version is diagnostic-only: unresolved ownership paths make it
     // ineligible for selection, and the scheduler/emitter continue to use
     // their qualified inputs unchanged.
+    std::optional<cv_split::CrossCoreResourceLimits> resourceLimits;
     if (pipelinePlan) {
       FlagIdManager resourceFlagManager(moduleOp, /*firstAvailableId=*/0);
       const int firstAvailableFlagId = resourceFlagManager.acquireId();
       if (firstAvailableFlagId >= 0) {
-        cv_split::CrossCoreResourceLimits resourceLimits;
-        resourceLimits.interCoreBufferDepth =
+        resourceLimits.emplace();
+        resourceLimits->interCoreBufferDepth =
             static_cast<unsigned>(interCoreBufferDepth);
         if (privateBufferUbBudgetBytes >= 0)
-          resourceLimits.extraUbBudgetBytes =
+          resourceLimits->extraUbBudgetBytes =
               static_cast<uint64_t>(privateBufferUbBudgetBytes);
-        resourceLimits.firstAvailableFlagId =
+        resourceLimits->firstAvailableFlagId =
             static_cast<unsigned>(firstAvailableFlagId);
-        resourceLimits.maximumFlagId = cv_split::kMaxTransferFlagId;
-        resourceLimits.vectorToCubeSlotOverride = vectorToCubeSlots;
-        resourceLimits.promotePrivatePools = promotePrivateBufferPools;
+        resourceLimits->maximumFlagId = cv_split::kMaxTransferFlagId;
+        resourceLimits->vectorToCubeSlotOverride = vectorToCubeSlots;
+        resourceLimits->promotePrivatePools = promotePrivateBufferPools;
 
         FailureOr<cv_split::CrossCoreResourcePlan> resourcePlan =
             cv_split::buildCrossCoreResourcePlan(*pipelinePlan,
-                                                 resourceLimits);
+                                                 *resourceLimits);
         if (succeeded(resourcePlan))
           cv_split::logCrossCoreResourcePlan(*resourcePlan);
         else
@@ -1075,9 +1076,37 @@ private:
                              enablePlanDrivenEarlyPublish)))
       return failure();
 
-    // Stage 7.5: Unfuse PV matmuls (split matmul(p,v,acc*alpha) into pv + addf)
-    if (failed(cv_split::unfusePVMatmuls(body, classification)))
+    // Stage 7.5: separate VECTOR-produced accumulator joins from CUBE matmuls.
+    FailureOr<cv_split::AccumulatorJoinRewriteResult> accumulatorJoins =
+        cv_split::unfuseVectorAccumulatorMatmuls(body, classification);
+    if (failed(accumulatorJoins))
       return failure();
+
+    // Stage 5.3a: bind the immutable logical boundaries to the real joins that
+    // now exist and refresh order after scheduling. This remains diagnostic:
+    // the qualified scheduler and transfer emitter do not consume either plan.
+    if (pipelinePlan && resourceLimits) {
+      FailureOr<cv_split::CrossCorePipelinePlan> materializedPlan =
+          cv_split::bindCrossCorePipelinePlan(
+              *pipelinePlan, *accumulatorJoins, body, classification);
+      if (succeeded(materializedPlan)) {
+        cv_split::logMaterializedCrossCorePipelinePlan(*materializedPlan);
+        FailureOr<cv_split::CrossCoreResourcePlan> materializedResources =
+            cv_split::buildCrossCoreResourcePlan(*materializedPlan,
+                                                 *resourceLimits);
+        if (succeeded(materializedResources))
+          cv_split::logMaterializedCrossCoreResourcePlan(
+              *materializedResources);
+        else
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[cv-split] bound resource-plan unavailable; "
+                        "qualified emitter remains active\n");
+      } else {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[cv-split] materialized pipeline-plan unavailable; "
+                      "qualified emitter remains active\n");
+      }
+    }
 
     // Stage 8: Insert cross-scope transfers (BEFORE scope separation)
     LLVM_DEBUG(llvm::dbgs()
