@@ -1,6 +1,7 @@
 add_triton_library(CVSplitScheduling
   CVSplitScheduling.cpp
   CrossCorePipelinePlan.cpp
+  CrossCoreResourcePlan.cpp
   CrossScopeTransfers.cpp
   classifyAllOps.cpp
   DependencyScheduler.cpp

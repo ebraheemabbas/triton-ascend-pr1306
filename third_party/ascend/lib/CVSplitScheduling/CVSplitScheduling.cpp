@@ -22,6 +22,7 @@
 
 #include "ascend/include/CVSplitScheduling/CVSplitScheduling.h"
 #include "ascend/include/CVSplitScheduling/CrossCorePipelinePlan.h"
+#include "ascend/include/CVSplitScheduling/CrossCoreResourcePlan.h"
 #include "ascend/include/CVSplitScheduling/Attributes.h"
 #include "ascend/include/CVSplitScheduling/CrossScopeTransfers.h"
 #include "ascend/include/CVSplitScheduling/DependencyScheduler.h"
@@ -32,6 +33,7 @@
 #include "ascend/include/CVSplitScheduling/UnrollOrigin.h"
 #include "ascend/include/CVSplitScheduling/classifyAllOps.h"
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
+#include "ascend/include/DynamicCVPipeline/Common/FlagIdManager.h"
 
 #include "bishengir/Dialect/HACC/IR/HACC.h"
 #include "bishengir/Dialect/Scope/IR/Scope.h"
@@ -1033,6 +1035,38 @@ private:
                << " extra bytes and is "
                << (everyPoolPrivate ? "taken" : "declined")
                << ", so pipelining at distance " << reorderDistance << "\n");
+
+    // Stage 5.1: model the qualified slot/union policy before scheduling.
+    // This version is diagnostic-only: unresolved ownership paths make it
+    // ineligible for selection, and the scheduler/emitter continue to use
+    // their qualified inputs unchanged.
+    if (pipelinePlan) {
+      FlagIdManager resourceFlagManager(moduleOp, /*firstAvailableId=*/0);
+      const int firstAvailableFlagId = resourceFlagManager.acquireId();
+      if (firstAvailableFlagId >= 0) {
+        cv_split::CrossCoreResourceLimits resourceLimits;
+        resourceLimits.interCoreBufferDepth =
+            static_cast<unsigned>(interCoreBufferDepth);
+        if (privateBufferUbBudgetBytes >= 0)
+          resourceLimits.extraUbBudgetBytes =
+              static_cast<uint64_t>(privateBufferUbBudgetBytes);
+        resourceLimits.firstAvailableFlagId =
+            static_cast<unsigned>(firstAvailableFlagId);
+        resourceLimits.maximumFlagId = cv_split::kMaxTransferFlagId;
+        resourceLimits.vectorToCubeSlotOverride = vectorToCubeSlots;
+        resourceLimits.promotePrivatePools = promotePrivateBufferPools;
+
+        FailureOr<cv_split::CrossCoreResourcePlan> resourcePlan =
+            cv_split::buildCrossCoreResourcePlan(*pipelinePlan,
+                                                 resourceLimits);
+        if (succeeded(resourcePlan))
+          cv_split::logCrossCoreResourcePlan(*resourcePlan);
+        else
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[cv-split] resource-plan unavailable; qualified "
+                        "scheduler/emitter policy remains active\n");
+      }
+    }
 
     cv_split::DependencyScheduler scheduler;
     llvm::DenseMap<Operation *, Operation *> transferPhaseEnds;
