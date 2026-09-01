@@ -51,6 +51,7 @@ def test_resource_policy_is_lane_generic_and_kernel_agnostic() -> None:
     matches = [pattern for pattern in forbidden if re.search(pattern, text, re.I)]
     assert not matches, f"kernel-specific resource-plan logic: {matches}"
     assert "std::min(lanes, interCoreBufferDepth)" in SOURCE.read_text()
+    assert "left.key.lane != right.key.lane" in SOURCE.read_text()
     assert "boundary.key.lane % lineage.slotCount" in SOURCE.read_text()
 
 

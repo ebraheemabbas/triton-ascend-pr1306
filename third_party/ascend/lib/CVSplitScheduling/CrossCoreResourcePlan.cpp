@@ -110,7 +110,9 @@ buildLineagePlan(const CrossCorePipelinePlan &pipelinePlan,
   llvm::sort(indices, [&](unsigned lhs, unsigned rhs) {
     const CrossCoreBoundary &left = pipelinePlan.boundaries[lhs];
     const CrossCoreBoundary &right = pipelinePlan.boundaries[rhs];
-    return left.lane != right.lane ? left.lane < right.lane : lhs < rhs;
+    return left.key.lane != right.key.lane
+               ? left.key.lane < right.key.lane
+               : lhs < rhs;
   });
 
   const CrossCoreBoundary &first = pipelinePlan.boundaries[indices.front()];

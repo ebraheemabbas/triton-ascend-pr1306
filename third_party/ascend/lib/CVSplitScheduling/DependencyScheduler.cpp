@@ -435,14 +435,14 @@ static void reorderForCrossScopeProducerPhases(
           transferAnchor = candidateAnchor;
           LLVM_DEBUG(llvm::dbgs()
                      << "[cv-split] early-publish origin="
-                     << earlyBoundary->originId << " lane="
-                     << earlyBoundary->lane << " publish@"
+                     << earlyBoundary->key.originId << " lane="
+                     << earlyBoundary->key.lane << " publish@"
                      << earlyBoundary->earliestPublishOrder
                      << " local-phase-end=" << phaseEnd->getName() << "\n");
         } else {
           LLVM_DEBUG(llvm::dbgs()
                      << "[cv-split] reject early-publish origin="
-                     << earlyBoundary->originId
+                     << earlyBoundary->key.originId
                      << ": analyzed anchor is not in the scheduled phase\n");
         }
       }

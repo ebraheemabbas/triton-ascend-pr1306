@@ -21,6 +21,7 @@ RESOURCE_HEADER = (
     ASCEND_ROOT / "include" / "CVSplitScheduling" / "CrossCoreResourcePlan.h"
 )
 RESOURCE_SOURCE = CVSPLIT_LIB / "CrossCoreResourcePlan.cpp"
+SCHEDULER_SOURCE = CVSPLIT_LIB / "DependencyScheduler.cpp"
 CMAKE = CVSPLIT_LIB / "CMakeLists.txt"
 
 
@@ -96,6 +97,13 @@ def test_unbound_anchors_are_explicitly_non_selectable() -> None:
     assert pending < selection
 
 
+def test_existing_scheduler_uses_the_stable_boundary_key() -> None:
+    text = SCHEDULER_SOURCE.read_text()
+    assert "earlyBoundary->key.originId" in text
+    assert "earlyBoundary->key.lane" in text
+    assert not re.search(r"earlyBoundary->(?:originId|lane|direction)", text)
+
+
 def test_shared_predicate_is_built() -> None:
     assert "VectorAccumulatorMatmul.cpp" in CMAKE.read_text()
 
@@ -105,5 +113,6 @@ if __name__ == "__main__":
     test_analysis_and_rewrite_share_one_structural_predicate()
     test_projection_is_lane_generic_and_does_not_mutate_ir()
     test_unbound_anchors_are_explicitly_non_selectable()
+    test_existing_scheduler_uses_the_stable_boundary_key()
     test_shared_predicate_is_built()
     print("Stage 5.2 projected-boundary source contract: PASS")
