@@ -1085,22 +1085,27 @@ private:
     // Stage 5.3a: bind the immutable logical boundaries to the real joins that
     // now exist and refresh order after scheduling. This remains diagnostic:
     // the qualified scheduler and transfer emitter do not consume either plan.
+    std::optional<cv_split::CrossCorePipelinePlan> materializedPlan;
+    std::optional<cv_split::CrossCoreResourcePlan> materializedResources;
     if (pipelinePlan && resourceLimits) {
-      FailureOr<cv_split::CrossCorePipelinePlan> materializedPlan =
+      FailureOr<cv_split::CrossCorePipelinePlan> materializedPlanResult =
           cv_split::bindCrossCorePipelinePlan(
               *pipelinePlan, *accumulatorJoins, body, classification);
-      if (succeeded(materializedPlan)) {
+      if (succeeded(materializedPlanResult)) {
+        materializedPlan.emplace(std::move(*materializedPlanResult));
         cv_split::logMaterializedCrossCorePipelinePlan(*materializedPlan);
-        FailureOr<cv_split::CrossCoreResourcePlan> materializedResources =
+        FailureOr<cv_split::CrossCoreResourcePlan> resourceResult =
             cv_split::buildCrossCoreResourcePlan(*materializedPlan,
                                                  *resourceLimits);
-        if (succeeded(materializedResources))
+        if (succeeded(resourceResult)) {
+          materializedResources.emplace(std::move(*resourceResult));
           cv_split::logMaterializedCrossCoreResourcePlan(
               *materializedResources);
-        else
+        } else {
           LLVM_DEBUG(llvm::dbgs()
                      << "[cv-split] bound resource-plan unavailable; "
                         "qualified emitter remains active\n");
+        }
       } else {
         LLVM_DEBUG(llvm::dbgs()
                    << "[cv-split] materialized pipeline-plan unavailable; "
@@ -1114,6 +1119,8 @@ private:
     FailureOr<cv_split::CrossScopeTransferInfo> transferInfo =
         cv_split::insertCrossScopeTransfers(
             loop, classification, transferPhaseEnds,
+            materializedPlan ? &*materializedPlan : nullptr,
+            materializedResources ? &*materializedResources : nullptr,
             static_cast<unsigned>(interCoreBufferDepth),
             privateBufferUbBudgetBytes < 0
                 ? std::numeric_limits<uint64_t>::max()

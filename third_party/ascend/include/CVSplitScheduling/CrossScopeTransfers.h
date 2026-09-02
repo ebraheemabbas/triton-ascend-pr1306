@@ -24,6 +24,7 @@
 #define TRITON_ASCEND_CV_SPLIT_SCHEDULING_CROSS_SCOPE_TRANSFERS_H
 
 #include "ascend/include/CVSplitScheduling/classifyAllOps.h"
+#include "ascend/include/CVSplitScheduling/CrossCoreResourcePlan.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
@@ -89,6 +90,8 @@ struct CrossScopeTransferInfo {
 FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
     scf::ForOp loop, const Classification &classification,
     const llvm::DenseMap<Operation *, Operation *> &transferPhaseEnds,
+    const CrossCorePipelinePlan *materializedPlan,
+    const CrossCoreResourcePlan *resourcePlan,
     unsigned interCoreBufferDepth, uint64_t privateBufferUbBudgetBytes = 0,
     bool promotePrivateBufferPools = false,
     unsigned vectorToCubeSlotOverride = 0, bool sinkScaleIntoFixpipe = true,

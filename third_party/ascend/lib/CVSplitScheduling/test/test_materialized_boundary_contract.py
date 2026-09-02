@@ -71,20 +71,20 @@ def test_binder_requires_real_consumers_and_refreshes_order() -> None:
     assert not present, f"binder mutates IR: {present}"
 
 
-def test_binding_runs_after_scheduler_and_before_unchanged_emitter() -> None:
+def test_binding_runs_after_scheduler_and_feeds_verified_emitter() -> None:
     text = PASS.read_text()
     scheduler = text.index("scheduler.run")
     rewrite = text.index("unfuseVectorAccumulatorMatmuls")
     binder = text.index("bindCrossCorePipelinePlan")
-    bound_resource = text.index("materializedResources")
+    bound_resource = text.index("resourceResult =", binder)
     transfer = text.index("cv_split::insertCrossScopeTransfers")
     assert scheduler < rewrite < binder < bound_resource < transfer
     scheduler_call = text[scheduler:text.index("return failure();", scheduler)]
     transfer_call = text[transfer:text.index("if (failed(transferInfo))", transfer)]
     assert "materializedPlan" not in scheduler_call
     assert "materializedResources" not in scheduler_call
-    assert "materializedPlan" not in transfer_call
-    assert "materializedResources" not in transfer_call
+    assert "materializedPlan" in transfer_call
+    assert "materializedResources" in transfer_call
 
 
 def test_unresolved_ownership_remains_non_selectable() -> None:
@@ -99,6 +99,6 @@ def test_unresolved_ownership_remains_non_selectable() -> None:
 if __name__ == "__main__":
     test_rewrite_returns_real_in_memory_bindings()
     test_binder_requires_real_consumers_and_refreshes_order()
-    test_binding_runs_after_scheduler_and_before_unchanged_emitter()
+    test_binding_runs_after_scheduler_and_feeds_verified_emitter()
     test_unresolved_ownership_remains_non_selectable()
     print("Stage 5.3a materialized-boundary source contract: PASS")
