@@ -518,6 +518,72 @@ static void reorderForCrossScopeProducerPhases(
     op->moveBefore(yield);
 }
 
+static LogicalResult
+validateForcedScheduleCandidate(const CrossCorePipelinePlan *pipelinePlan,
+                                const CrossCoreScheduleCandidate *candidate) {
+  if (!candidate)
+    return success();
+  if (!pipelinePlan || !candidate->diagnosticOnly ||
+      candidate->selectionEligible || candidate->logicalLaneCount == 0 ||
+      candidate->logicalLaneCount != pipelinePlan->laneCount ||
+      candidate->waveWidth != candidate->logicalLaneCount ||
+      candidate->prefetchLimit == 0 || candidate->prefetchLimit > 2)
+    return failure();
+
+  unsigned expectedMatrixLineages = 0;
+  for (const CrossCorePhaseLineage &lineage : pipelinePlan->lineages)
+    expectedMatrixLineages +=
+        lineage.direction == CrossCoreDirection::CubeToVector;
+  if (expectedMatrixLineages == 0 ||
+      candidate->matrixLineageLimits.size() != expectedMatrixLineages)
+    return failure();
+
+  DenseSet<unsigned> seenLineages;
+  DenseSet<int64_t> seenOrigins;
+  unsigned widenedMatrixLineages = 0;
+  bool sawDepthOne = false;
+  for (auto [expectedPhase, limit] :
+       llvm::enumerate(candidate->matrixLineageLimits)) {
+    if (limit.pipelineLineageIndex >= pipelinePlan->lineages.size() ||
+        limit.phaseOrdinal != expectedPhase || limit.inFlightLimit == 0 ||
+        limit.inFlightLimit > 2 || limit.transferSlotCount == 0 ||
+        limit.direction != CrossCoreDirection::CubeToVector ||
+        !seenLineages.insert(limit.pipelineLineageIndex).second ||
+        !seenOrigins.insert(limit.originId).second)
+      return failure();
+    const CrossCorePhaseLineage &lineage =
+        pipelinePlan->lineages[limit.pipelineLineageIndex];
+    if (lineage.originId != limit.originId ||
+        lineage.direction != limit.direction)
+      return failure();
+    if (limit.inFlightLimit == 2) {
+      if (sawDepthOne)
+        return failure();
+      ++widenedMatrixLineages;
+    } else {
+      sawDepthOne = true;
+    }
+  }
+
+  const unsigned expectedDepth = widenedMatrixLineages == 0 ? 1 : 2;
+  if (candidate->maximumLiveMatrixResultsPerLineage != expectedDepth ||
+      candidate->prefetchLimit != expectedDepth)
+    return failure();
+
+  LLVM_DEBUG(
+      llvm::dbgs()
+      << "[cv-split] forced schedule candidate matched candidate="
+      << candidate->candidateId << " lanes=" << candidate->logicalLaneCount
+      << " matrix-lineages=" << candidate->matrixLineageLimits.size()
+      << " widened-prefix=" << widenedMatrixLineages << " behavior="
+      << (widenedMatrixLineages == 0                        ? "generic"
+          : widenedMatrixLineages == 1                      ? "first-widened"
+          : widenedMatrixLineages == expectedMatrixLineages ? "all-widened"
+                                                            : "prefix-widened")
+      << "\n");
+  return success();
+}
+
 // ============================================================================
 // Dependency-level scheduler
 // ----------------------------------------------------------------------------
@@ -535,9 +601,17 @@ DependencyScheduler::run(Block *body, const Classification &classification,
                          DenseMap<Operation *, Operation *> &transferPhaseEnds,
                          unsigned pipelineDistance,
                          const CrossCorePipelinePlan *pipelinePlan,
+                         const CrossCoreScheduleCandidate *scheduleCandidate,
                          bool enablePlanDrivenEarlyPublish) {
   DenseMap<Operation *, SmallVector<Operation *>> predecessors;
   DenseMap<Operation *, int> levels;
+
+  if (failed(
+          validateForcedScheduleCandidate(pipelinePlan, scheduleCandidate))) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split] forced schedule candidate rejected\n");
+    return failure();
+  }
 
   buildDependencyGraph(body, predecessors);
 

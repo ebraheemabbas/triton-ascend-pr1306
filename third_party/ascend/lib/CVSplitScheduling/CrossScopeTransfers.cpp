@@ -426,11 +426,10 @@ static arith::MulFOp matchSinkableScale(const CrossScopeTransfer &xfer,
   return mul;
 }
 
-static void emitCubeToVectorTransfer(const TransferEmitContext &c,
-                                     CrossScopeTransfer &xfer,
-                                     RankedTensorType tensorType,
-                                     const TransferSyncPlan &plan,
-                                     BufferPool &bufferPool) {
+static CubeToVectorTransferChain
+emitCubeToVectorTransfer(const TransferEmitContext &c, CrossScopeTransfer &xfer,
+                         RankedTensorType tensorType,
+                         const TransferSyncPlan &plan, BufferPool &bufferPool) {
   const int flagId = plan.forwardFlagId;
   Type elemType = tensorType.getElementType();
   ArrayRef<int64_t> shape = tensorType.getShape();
@@ -525,6 +524,10 @@ static void emitCubeToVectorTransfer(const TransferEmitContext &c,
   LLVM_DEBUG(llvm::dbgs() << "[cv-split]   C→V transfer #" << flagId << ": "
                           << xfer.producer->getName() << " → " << ubShape[0]
                           << "x" << ubShape[1] << " UB buffer (ROW_SPLIT)\n");
+
+  return CubeToVectorTransferChain{syncWaitOp.getOperation(),
+                                   toTensorOp.getResult(), xfer.consumers,
+                                   xfer.originId, flagId};
 }
 
 // VECTOR -> CUBE: a softmax/cast result is NZ-packed and copied UB->L1 into a
@@ -821,6 +824,7 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
     const DenseMap<Operation *, Operation *> &transferPhaseEnds,
     const CrossCorePipelinePlan *materializedPlan,
     const CrossCoreResourcePlan *resourcePlan,
+    const CrossCoreScheduleCandidate *scheduleCandidate,
     unsigned interCoreBufferDepth, uint64_t privateBufferUbBudgetBytes,
     bool promotePrivateBufferPools, unsigned vectorToCubeSlotOverride,
     bool sinkScaleIntoFixpipe, unsigned l0cPipelineDistance) {
@@ -1422,6 +1426,21 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
   // The shared DCVP buffer-count policy controls the pool depth. Same-typed
   // buffers (all unrolled qk_ub, all pv_ub, all P L1) rotate over that many
   // physical allocations; absence of a frontend policy defaults to two.
+  DenseMap<int64_t, unsigned> candidateDrainLagByOrigin;
+  if (scheduleCandidate) {
+    if (l0cPipelineDistance != 0)
+      return failure();
+    for (const ScheduleMatrixLineageLimit &limit :
+         scheduleCandidate->matrixLineageLimits) {
+      if (limit.direction != CrossCoreDirection::CubeToVector ||
+          limit.inFlightLimit == 0 || limit.inFlightLimit > 2 ||
+          !candidateDrainLagByOrigin
+               .try_emplace(limit.originId, limit.inFlightLimit - 1)
+               .second)
+        return failure();
+    }
+  }
+
   // Software-pipeline the L0C drain. A matmul and the fixpipe that drains it
   // are different units, but emitting them adjacently keeps every accumulator's
   // live range disjoint from the next one's -- so the memory planner overlays
@@ -1429,25 +1448,40 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
   // makes the two units take turns. Moving each drain past the following matmul
   // makes consecutive live ranges overlap, which forces the planner to keep
   // them apart and lets the units run at the same time. Costs one extra live
-  // accumulator per pool, and delays that tile's arrival on VECTOR by one
-  // matmul -- so the first lane of each pool stays eager, keeping VECTOR's
-  // start time unchanged.
-  if (l0cPipelineDistance > 0) {
+  // accumulator per widened lineage and delays each nonterminal tile's arrival
+  // on VECTOR by one matmul. The final tile keeps its producer anchor so the
+  // finite unrolled pipeline drains completely.
+  if (scheduleCandidate || l0cPipelineDistance > 0) {
     llvm::MapVector<int64_t, SmallVector<CrossScopeTransfer *>> byOrigin;
     for (CrossScopeTransfer &xfer : transfers)
       if (xfer.direction == CrossScopeTransfer::CUBE_TO_VECTOR)
         byOrigin[xfer.originId].push_back(&xfer);
+    if (scheduleCandidate &&
+        byOrigin.size() != candidateDrainLagByOrigin.size())
+      return failure();
     for (auto &entry : byOrigin) {
       SmallVector<CrossScopeTransfer *> &lanes = entry.second;
+      const unsigned drainLag =
+          scheduleCandidate ? candidateDrainLagByOrigin.lookup(entry.first)
+                            : l0cPipelineDistance;
+      if (scheduleCandidate && !candidateDrainLagByOrigin.contains(entry.first))
+        return failure();
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[cv-split] forced schedule drain origin=" << entry.first
+                 << " in-flight=" << (drainLag + 1) << " lag=" << drainLag
+                 << " lanes=" << lanes.size() << "\n");
+      if (drainLag == 0)
+        continue;
       for (unsigned i = 0; i + 1 < lanes.size(); ++i) {
         const unsigned ahead =
-            std::min<unsigned>(i + l0cPipelineDistance, lanes.size() - 1);
+            std::min<unsigned>(i + drainLag, lanes.size() - 1);
         lanes[i]->fixpipeAnchor = lanes[ahead]->producer;
       }
     }
   }
 
   BufferPool bufferPool;
+  SmallVector<CubeToVectorTransferChain> cubeToVectorChains;
   SmallVector<VectorToCubeTransferChain> vectorToCubeChains;
   DenseMap<int64_t, unsigned> laneOrdinalByOrigin;
 
@@ -1477,7 +1511,8 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
         /*slotAllocType=*/unionTypeOfOrigin.lookup(xfer.originId)};
 
     if (xfer.direction == CrossScopeTransfer::CUBE_TO_VECTOR)
-      emitCubeToVectorTransfer(ec, xfer, tensorType, plan, bufferPool);
+      cubeToVectorChains.push_back(
+          emitCubeToVectorTransfer(ec, xfer, tensorType, plan, bufferPool));
     else
       vectorToCubeChains.push_back(
           emitVectorToCubeTransfer(ec, xfer, tensorType, plan, bufferPool));
@@ -1503,7 +1538,8 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
                           << " transfers across " << phaseCount
                           << " phase(s) using " << requiredFlags
                           << " sync flags\n");
-  return CrossScopeTransferInfo{*blockM, std::move(vectorToCubeChains)};
+  return CrossScopeTransferInfo{*blockM, std::move(cubeToVectorChains),
+                                std::move(vectorToCubeChains)};
 }
 
 } // namespace mlir::triton::cv_split

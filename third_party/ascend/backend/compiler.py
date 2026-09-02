@@ -293,9 +293,10 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                 sink_scale_into_fixpipe=metadata["cv_split_sink_scale_into_fixpipe"],
                 l0c_pipeline_distance=metadata["cv_split_l0c_pipeline_distance"],
                 regroup_softmax_max=metadata["cv_split_regroup_softmax_max"],
-                enable_plan_driven_early_publish=metadata[
-                    "cv_split_enable_plan_driven_early_publish"
-                ])
+                enable_plan_driven_early_publish=metadata["cv_split_enable_plan_driven_early_publish"],
+                schedule_candidate_id=metadata["cv_split_schedule_candidate_id"],
+                enable_pure_prerequisite_hoisting=metadata["cv_split_enable_pure_prerequisite_hoisting"],
+                pure_prerequisite_hoist_budget_bytes=metadata["cv_split_pure_prerequisite_hoist_budget_bytes"])
 
         if try_dynamic_cv:
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
@@ -1204,6 +1205,15 @@ class NPUOptions:
     # Plan-driven early-publication control. Keep off until the plan-driven publication
     # policy has passed compile, simulator, accuracy, and profiler qualification.
     cv_split_enable_plan_driven_early_publish: bool = False
+    # Structural schedule override. Negative diagnoses structural candidates
+    # without selecting one; nonnegative requests a deterministic candidate ID.
+    # The initial override accepts only structurally all-one behavior.
+    cv_split_schedule_candidate_id: int = -1
+    # Pure-prerequisite hoisting control. Move only memory-effect-free scalar/rank-1
+    # prerequisites that SSA proves independent of the crossed CUBE-to-VECTOR
+    # transfer. Disabled by default and bounded by additional live result bytes.
+    cv_split_enable_pure_prerequisite_hoisting: bool = False
+    cv_split_pure_prerequisite_hoist_budget_bytes: int = 0
     # Spare UB, in bytes, that cross-scope transfers may spend to stop reusing
     # buffers across unrolled lanes. It funds merging the two CUBE->VECTOR
     # roles onto one union slot per lane, which is what lets HEAD_DIM differ

@@ -44,6 +44,25 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
            "keeps storage, slot reuse, and arithmetic "
            "unchanged, and a missing/invalid analysis plan keeps the generic "
            "late-publish behavior.">,
+    Option<"scheduleCandidateId", "schedule-candidate-id",
+           "int", /*default*/"-1",
+           "developer override selecting one immutable structural "
+           "schedule candidate by deterministic ID. Negative diagnoses only. "
+           "the initial override accepts only the structurally all-one control and keeps "
+           "the qualified generic reorder unchanged.">,
+    Option<"enablePurePrerequisiteHoisting",
+           "enable-pure-prerequisite-hoisting",
+           "bool", /*default*/"false",
+           "move pure scalar/rank-1 VECTOR prerequisites before a "
+           "CUBE-to-VECTOR wait when SSA proves they do not depend on the "
+           "transferred value. Off by default; this optional transform "
+           "changes scheduling but not arithmetic or synchronization.">,
+    Option<"purePrerequisiteHoistBudgetBytes",
+           "pure-prerequisite-hoist-budget-bytes",
+           "int64_t", /*default*/"0",
+           "maximum additional static result bytes that prerequisite hoisting may keep "
+           "live across waits. Zero disables movement; unknown sizes are "
+           "rejected rather than estimated.">,
     Option<"promoteFullyUnrolled", "promote-fully-unrolled",
            "bool", /*default*/"true",
            "promote the scope loops left by a candidate whose unroll consumed "

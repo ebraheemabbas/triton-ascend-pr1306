@@ -23,8 +23,9 @@
 #ifndef TRITON_ASCEND_CV_SPLIT_SCHEDULING_CROSS_SCOPE_TRANSFERS_H
 #define TRITON_ASCEND_CV_SPLIT_SCHEDULING_CROSS_SCOPE_TRANSFERS_H
 
-#include "ascend/include/CVSplitScheduling/classifyAllOps.h"
 #include "ascend/include/CVSplitScheduling/CrossCoreResourcePlan.h"
+#include "ascend/include/CVSplitScheduling/CrossCoreScheduleCandidate.h"
+#include "ascend/include/CVSplitScheduling/classifyAllOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
@@ -53,6 +54,22 @@ std::optional<uint64_t>
 cubeToVectorUnionExtraBytes(Block *body, const Classification &classification,
                             unsigned interCoreBufferDepth, unsigned lanes);
 
+/// Describes the emitted consumer side of one CUBE-to-VECTOR transfer.
+/// These non-owning handles are valid until scope separation rewrites the
+/// mixed loop.
+struct CubeToVectorTransferChain {
+  /// VECTOR wait crossed only by independently proven prerequisites.
+  Operation *wait;
+  /// Tensor read from the shared UB slot after `wait`.
+  Value transferredValue;
+  /// Original VECTOR consumers after their operands were replaced.
+  llvm::SmallVector<Operation *> consumers;
+  /// Structural lineage identity retained for diagnostics only.
+  int64_t originId;
+  /// Forward synchronization flag retained for diagnostics only.
+  int forwardFlagId;
+};
+
 /// Describes the IR emitted for one VECTOR-to-CUBE transfer. The values and
 /// operation pointers are non-owning handles into the loop being transformed.
 struct VectorToCubeTransferChain {
@@ -72,6 +89,7 @@ struct CrossScopeTransferInfo {
   /// Full row count derived from the leading CUBE-to-VECTOR transfer
   /// dimension. Scope separation halves it to M/2 rows per vector core.
   int64_t blockM;
+  llvm::SmallVector<CubeToVectorTransferChain> cubeToVectorChains;
   llvm::SmallVector<VectorToCubeTransferChain> vectorToCubeChains;
 };
 
@@ -92,6 +110,7 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
     const llvm::DenseMap<Operation *, Operation *> &transferPhaseEnds,
     const CrossCorePipelinePlan *materializedPlan,
     const CrossCoreResourcePlan *resourcePlan,
+    const CrossCoreScheduleCandidate *scheduleCandidate,
     unsigned interCoreBufferDepth, uint64_t privateBufferUbBudgetBytes = 0,
     bool promotePrivateBufferPools = false,
     unsigned vectorToCubeSlotOverride = 0, bool sinkScaleIntoFixpipe = true,

@@ -21,12 +21,14 @@
  */
 
 #include "ascend/include/CVSplitScheduling/CVSplitScheduling.h"
+#include "ascend/include/CVSplitScheduling/Attributes.h"
 #include "ascend/include/CVSplitScheduling/CrossCorePipelinePlan.h"
 #include "ascend/include/CVSplitScheduling/CrossCoreResourcePlan.h"
-#include "ascend/include/CVSplitScheduling/Attributes.h"
+#include "ascend/include/CVSplitScheduling/CrossCoreScheduleCandidate.h"
 #include "ascend/include/CVSplitScheduling/CrossScopeTransfers.h"
 #include "ascend/include/CVSplitScheduling/DependencyScheduler.h"
 #include "ascend/include/CVSplitScheduling/PreCheck.h"
+#include "ascend/include/CVSplitScheduling/PurePrerequisiteHoisting.h"
 #include "ascend/include/CVSplitScheduling/ScopeSeparation.h"
 #include "ascend/include/CVSplitScheduling/SoftmaxRegroup.h"
 #include "ascend/include/CVSplitScheduling/UnfusePVMatmuls.h"
@@ -747,6 +749,11 @@ public:
     this->compileOn91095 = options.compileOn91095;
     this->unrollFactor = options.unrollFactor;
     this->enablePlanDrivenEarlyPublish = options.enablePlanDrivenEarlyPublish;
+    this->scheduleCandidateId = options.scheduleCandidateId;
+    this->enablePurePrerequisiteHoisting =
+        options.enablePurePrerequisiteHoisting;
+    this->purePrerequisiteHoistBudgetBytes =
+        options.purePrerequisiteHoistBudgetBytes;
     this->promoteFullyUnrolled = options.promoteFullyUnrolled;
     this->pipelineDistance = options.pipelineDistance;
     this->privateBufferUbBudgetBytes = options.privateBufferUbBudgetBytes;
@@ -1040,6 +1047,9 @@ private:
     // This version is diagnostic-only: unresolved ownership paths make it
     // ineligible for selection, and the scheduler/emitter continue to use
     // their qualified inputs unchanged.
+    std::optional<cv_split::CrossCoreScheduleCandidateSet> scheduleCandidateSet;
+    const cv_split::CrossCoreScheduleCandidate *forcedScheduleCandidate =
+        nullptr;
     std::optional<cv_split::CrossCoreResourceLimits> resourceLimits;
     if (pipelinePlan) {
       FlagIdManager resourceFlagManager(moduleOp, /*firstAvailableId=*/0);
@@ -1060,19 +1070,48 @@ private:
         FailureOr<cv_split::CrossCoreResourcePlan> resourcePlan =
             cv_split::buildCrossCoreResourcePlan(*pipelinePlan,
                                                  *resourceLimits);
-        if (succeeded(resourcePlan))
+        if (succeeded(resourcePlan)) {
           cv_split::logCrossCoreResourcePlan(*resourcePlan);
-        else
+          FailureOr<cv_split::CrossCoreScheduleCandidateSet> candidates =
+              cv_split::buildCrossCoreScheduleCandidates(*pipelinePlan,
+                                                         *resourcePlan);
+          if (succeeded(candidates)) {
+            scheduleCandidateSet.emplace(std::move(*candidates));
+            cv_split::logCrossCoreScheduleCandidates(*scheduleCandidateSet);
+            if (scheduleCandidateId >= 0) {
+              const unsigned requested =
+                  static_cast<unsigned>(scheduleCandidateId);
+              if (requested >= scheduleCandidateSet->candidates.size())
+                return failure();
+              forcedScheduleCandidate =
+                  &scheduleCandidateSet->candidates[requested];
+            }
+          } else {
+            LLVM_DEBUG(llvm::dbgs()
+                       << "[cv-split] schedule-candidates unavailable; "
+                          "qualified scheduler remains active\n");
+            if (scheduleCandidateId >= 0)
+              return failure();
+          }
+        } else
           LLVM_DEBUG(llvm::dbgs()
                      << "[cv-split] resource-plan unavailable; qualified "
                         "scheduler/emitter policy remains active\n");
       }
     }
 
+    if (scheduleCandidateId < -1 ||
+        (scheduleCandidateId >= 0 && !forcedScheduleCandidate)) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[cv-split] requested schedule candidate unavailable\n");
+      return failure();
+    }
+
     cv_split::DependencyScheduler scheduler;
     llvm::DenseMap<Operation *, Operation *> transferPhaseEnds;
     if (failed(scheduler.run(body, classification, transferPhaseEnds,
                              reorderDistance, pipelinePlan,
+                             forcedScheduleCandidate,
                              enablePlanDrivenEarlyPublish)))
       return failure();
 
@@ -1121,6 +1160,7 @@ private:
             loop, classification, transferPhaseEnds,
             materializedPlan ? &*materializedPlan : nullptr,
             materializedResources ? &*materializedResources : nullptr,
+            forcedScheduleCandidate,
             static_cast<unsigned>(interCoreBufferDepth),
             privateBufferUbBudgetBytes < 0
                 ? std::numeric_limits<uint64_t>::max()
@@ -1129,6 +1169,18 @@ private:
             static_cast<unsigned>(std::max<int>(0, l0cPipelineDistance)));
     if (failed(transferInfo)) {
       return failure();
+    }
+    if (enablePurePrerequisiteHoisting) {
+      if (purePrerequisiteHoistBudgetBytes <= 0) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[cv-split] prerequisite hoisting requires a "
+                      "positive byte budget\n");
+        return failure();
+      }
+      if (failed(cv_split::hoistPurePrerequisites(
+              body, classification, *transferInfo,
+              static_cast<uint64_t>(purePrerequisiteHoistBudgetBytes))))
+        return failure();
     }
     // Origin IDs are temporary unroll-lineage metadata. Transfer grouping is
     // their final consumer, so do not expose them to scope/backend passes.
