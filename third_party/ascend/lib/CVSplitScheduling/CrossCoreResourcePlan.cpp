@@ -21,6 +21,7 @@
  */
 
 #include "ascend/include/CVSplitScheduling/CrossCoreResourcePlan.h"
+#include "ascend/include/CVSplitScheduling/CrossCoreOwnershipProof.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -72,6 +73,8 @@ static llvm::StringRef statusName(ResourcePlanStatus status) {
 static llvm::StringRef
 orderingName(ResourceOwnershipOrdering ordering) {
   switch (ordering) {
+  case ResourceOwnershipOrdering::SameEngineOrder:
+    return "same-engine-order";
   case ResourceOwnershipOrdering::ExistingCrossCorePath:
     return "existing-cross-core-path";
   case ResourceOwnershipOrdering::ExplicitReleaseRequired:
@@ -402,6 +405,7 @@ buildCrossCoreResourcePlan(const CrossCorePipelinePlan &pipelinePlan,
             group.groupId, slot, from.boundaryIndex, to.boundaryIndex,
             fromBoundary.lastReader, toBoundary.producer, loopCarried,
             /*needsSeed=*/false,
+            /*usesCrossCorePath=*/false,
             explicitRelease
                 ? ResourceOwnershipOrdering::ExplicitReleaseRequired
                 : ResourceOwnershipOrdering::Unresolved});
@@ -413,10 +417,20 @@ buildCrossCoreResourcePlan(const CrossCorePipelinePlan &pipelinePlan,
     }
   }
 
-  plan.ownershipResolved =
-      llvm::none_of(plan.ownershipEdges, [](const ResourceOwnershipEdge &edge) {
-        return edge.ordering == ResourceOwnershipOrdering::Unresolved;
-      });
+  if (plan.anchorsComplete) {
+    SmallVector<int64_t> delayedReleaseGroups(mergedGroupIds.begin(),
+                                               mergedGroupIds.end());
+    llvm::sort(delayedReleaseGroups);
+    if (failed(proveCrossCoreResourceOwnership(
+            pipelinePlan, delayedReleaseGroups, plan)))
+      return failure();
+  } else {
+    plan.ownershipResolved =
+        llvm::none_of(plan.ownershipEdges,
+                      [](const ResourceOwnershipEdge &edge) {
+      return edge.ordering == ResourceOwnershipOrdering::Unresolved;
+    });
+  }
   const bool ubWithinBudget =
       !limits.extraUbBudgetBytes ||
       plan.incrementalUbBytes <= *limits.extraUbBudgetBytes;
@@ -489,6 +503,8 @@ static void logResourcePlan(const CrossCoreResourcePlan &plan,
                    << " to=" << edge.toBoundaryIndex
                    << " loop-carried=" << (edge.loopCarried ? "yes" : "no")
                    << " ordering=" << orderingName(edge.ordering)
+                   << " cross-core="
+                   << (edge.usesCrossCorePath ? "yes" : "no")
                    << " seed=" << (edge.needsSeed ? "yes" : "no") << "\n";
 
     llvm::dbgs() << "[cv-split] " << label << "-flags first="
@@ -507,6 +523,14 @@ static void logResourcePlan(const CrossCoreResourcePlan &plan,
                  << " UB-known=" << (plan.ubCapacityKnown ? "yes" : "no")
                  << " L1-known=" << (plan.l1CapacityKnown ? "yes" : "no")
                  << "\n";
+    llvm::dbgs() << "[cv-split] ownership-summary same-resource="
+                 << plan.sameEngineOwnershipEdges
+                 << " cross-core=" << plan.crossCoreOwnershipEdges
+                 << " explicit-release="
+                 << plan.explicitReleaseOwnershipEdges
+                 << " unresolved=" << plan.unresolvedOwnershipEdges
+                 << " loop-carried=" << plan.loopCarriedOwnershipEdges
+                 << " seeds=" << plan.seedRequirements << "\n";
   });
 }
 

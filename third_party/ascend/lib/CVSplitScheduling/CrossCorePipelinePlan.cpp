@@ -176,7 +176,9 @@ buildCrossCorePipelinePlan(Block *body,
     if (classIt == classification.end())
       return failure();
     plan.resourceUses.push_back(
-        {&op, inferPrincipalResource(&op, classIt->second)});
+        {&op, classIt->second,
+         inferPrincipalResource(&op, classIt->second),
+         operationOrder.lookup(&op)});
   }
 
   llvm::MapVector<int64_t, unsigned> lineageIndexByOrigin;
@@ -324,7 +326,9 @@ FailureOr<CrossCorePipelinePlan> bindCrossCorePipelinePlan(
       return failure();
     operationOrder[&op] = nextOrder++;
     materialized.resourceUses.push_back(
-        {&op, inferPrincipalResource(&op, classIt->second)});
+        {&op, classIt->second,
+         inferPrincipalResource(&op, classIt->second),
+         operationOrder.lookup(&op)});
   }
 
   DenseSet<Operation *> usedBindings;

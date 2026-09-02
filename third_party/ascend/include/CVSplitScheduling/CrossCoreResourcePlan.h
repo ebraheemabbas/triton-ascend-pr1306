@@ -43,6 +43,7 @@ enum class ResourcePlanStatus {
 };
 
 enum class ResourceOwnershipOrdering {
+  SameEngineOrder,
   ExistingCrossCorePath,
   ExplicitReleaseRequired,
   Unresolved
@@ -100,6 +101,7 @@ struct ResourceOwnershipEdge {
   Operation *nextWriter;
   bool loopCarried;
   bool needsSeed;
+  bool usesCrossCorePath;
   ResourceOwnershipOrdering ordering;
 };
 
@@ -121,6 +123,12 @@ struct CrossCoreResourcePlan {
   uint64_t allocatedL1Bytes = 0;
   uint64_t baselineUbBytes = 0;
   uint64_t incrementalUbBytes = 0;
+  unsigned sameEngineOwnershipEdges = 0;
+  unsigned crossCoreOwnershipEdges = 0;
+  unsigned explicitReleaseOwnershipEdges = 0;
+  unsigned unresolvedOwnershipEdges = 0;
+  unsigned loopCarriedOwnershipEdges = 0;
+  unsigned seedRequirements = 0;
   llvm::SmallVector<ResourceLineagePlan> lineages;
   llvm::SmallVector<ResourcePhysicalGroup> groups;
   llvm::SmallVector<ResourceSlotAssignment> assignments;

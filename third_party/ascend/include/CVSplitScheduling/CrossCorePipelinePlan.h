@@ -57,7 +57,9 @@ enum class PrincipalResource {
 /// One physical-resource annotation in the unrolled candidate body.
 struct PipelineResourceUse {
   Operation *operation;
+  EngineType engine;
   PrincipalResource resource;
+  unsigned order;
 };
 
 /// One value crossing between the two execution engines.
