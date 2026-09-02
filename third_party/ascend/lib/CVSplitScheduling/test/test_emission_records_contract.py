@@ -18,7 +18,10 @@ def test_flag_ids_are_deterministic_prefixes() -> None:
     source = SOURCE.read_text()
     required = (
         "unsigned nextFlag = plan.firstAvailableFlagId",
-        "lineageFlagBase.push_back(nextFlag)",
+        "buildEmissionLineageOrder(pipelinePlan)",
+        "boundary.producerOrder < *lastVectorToCubeOrder",
+        "llvm::stable_sort(boundaries",
+        "lineageFlagBase[lineageIndex] = nextFlag",
         "nextFlag += lineage.slotCount",
         "llvm::sort(delayedReleaseGroups)",
         "releaseFlagId = nextFlag++",

@@ -158,6 +158,59 @@ static uint64_t promotionCost(const ResourceLineagePlan &lineage) {
                             lineage.bytesPerSlot);
 }
 
+static FailureOr<SmallVector<unsigned>>
+buildEmissionLineageOrder(const CrossCorePipelinePlan &pipelinePlan) {
+  DenseMap<int64_t, unsigned> lineageIndexByOrigin;
+  for (auto [index, lineage] : llvm::enumerate(pipelinePlan.lineages))
+    if (!lineageIndexByOrigin
+             .try_emplace(lineage.originId, static_cast<unsigned>(index))
+             .second)
+      return failure();
+
+  std::optional<unsigned> lastVectorToCubeOrder;
+  for (const CrossCoreBoundary &boundary : pipelinePlan.boundaries)
+    if (boundary.key.direction == CrossCoreDirection::VectorToCube)
+      lastVectorToCubeOrder =
+          std::max(lastVectorToCubeOrder.value_or(0),
+                   boundary.producerOrder);
+
+  SmallVector<unsigned> boundaries(pipelinePlan.boundaries.size());
+  for (unsigned i = 0; i < boundaries.size(); ++i)
+    boundaries[i] = i;
+  llvm::sort(boundaries, [&](unsigned lhs, unsigned rhs) {
+    return pipelinePlan.boundaries[lhs].producerOrder <
+           pipelinePlan.boundaries[rhs].producerOrder;
+  });
+  llvm::stable_sort(boundaries, [&](unsigned lhs, unsigned rhs) {
+    auto phase = [&](unsigned boundaryIndex) {
+      const CrossCoreBoundary &boundary =
+          pipelinePlan.boundaries[boundaryIndex];
+      if (boundary.key.direction == CrossCoreDirection::VectorToCube)
+        return 1;
+      return lastVectorToCubeOrder &&
+                     boundary.producerOrder < *lastVectorToCubeOrder
+                 ? 0
+                 : 2;
+    };
+    return phase(lhs) < phase(rhs);
+  });
+
+  DenseSet<unsigned> seen;
+  SmallVector<unsigned> lineageOrder;
+  for (unsigned boundaryIndex : boundaries) {
+    const int64_t originId =
+        pipelinePlan.boundaries[boundaryIndex].key.originId;
+    auto lineageIt = lineageIndexByOrigin.find(originId);
+    if (lineageIt == lineageIndexByOrigin.end())
+      return failure();
+    if (seen.insert(lineageIt->second).second)
+      lineageOrder.push_back(lineageIt->second);
+  }
+  if (lineageOrder.size() != pipelinePlan.lineages.size())
+    return failure();
+  return lineageOrder;
+}
+
 } // namespace
 
 FailureOr<CrossCoreResourcePlan>
@@ -357,10 +410,15 @@ buildCrossCoreResourcePlan(const CrossCorePipelinePlan &pipelinePlan,
   plan.requiredFlags = plan.forwardFlags + plan.releaseFlags;
   plan.flagCapacityProven = hasFlagCapacity(limits, plan.requiredFlags);
 
-  SmallVector<unsigned> lineageFlagBase;
+  FailureOr<SmallVector<unsigned>> emissionLineageOrder =
+      buildEmissionLineageOrder(pipelinePlan);
+  if (failed(emissionLineageOrder))
+    return failure();
+  SmallVector<unsigned> lineageFlagBase(plan.lineages.size());
   unsigned nextFlag = plan.firstAvailableFlagId;
-  for (const ResourceLineagePlan &lineage : plan.lineages) {
-    lineageFlagBase.push_back(nextFlag);
+  for (unsigned lineageIndex : *emissionLineageOrder) {
+    lineageFlagBase[lineageIndex] = nextFlag;
+    const ResourceLineagePlan &lineage = plan.lineages[lineageIndex];
     nextFlag += lineage.slotCount;
   }
   SmallVector<int64_t> delayedReleaseGroups(mergedGroupIds.begin(),
