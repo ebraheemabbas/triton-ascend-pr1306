@@ -23,6 +23,7 @@
 #include "ascend/include/CVSplitScheduling/CVSplitScheduling.h"
 #include "ascend/include/CVSplitScheduling/CrossCorePipelinePlan.h"
 #include "ascend/include/CVSplitScheduling/CrossCoreResourcePlan.h"
+#include "ascend/include/CVSplitScheduling/CrossCoreScheduleCandidate.h"
 #include "ascend/include/CVSplitScheduling/Attributes.h"
 #include "ascend/include/CVSplitScheduling/CrossScopeTransfers.h"
 #include "ascend/include/CVSplitScheduling/DependencyScheduler.h"
@@ -1060,9 +1061,18 @@ private:
         FailureOr<cv_split::CrossCoreResourcePlan> resourcePlan =
             cv_split::buildCrossCoreResourcePlan(*pipelinePlan,
                                                  *resourceLimits);
-        if (succeeded(resourcePlan))
+        if (succeeded(resourcePlan)) {
           cv_split::logCrossCoreResourcePlan(*resourcePlan);
-        else
+          FailureOr<cv_split::CrossCoreScheduleCandidateSet>
+              scheduleCandidates = cv_split::buildCrossCoreScheduleCandidates(
+                  *pipelinePlan, *resourcePlan);
+          if (succeeded(scheduleCandidates))
+            cv_split::logCrossCoreScheduleCandidates(*scheduleCandidates);
+          else
+            LLVM_DEBUG(llvm::dbgs()
+                       << "[cv-split] schedule-candidates unavailable; "
+                          "qualified scheduler remains active\n");
+        } else
           LLVM_DEBUG(llvm::dbgs()
                      << "[cv-split] resource-plan unavailable; qualified "
                         "scheduler/emitter policy remains active\n");
