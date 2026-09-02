@@ -565,11 +565,6 @@ validateForcedScheduleCandidate(const CrossCorePipelinePlan *pipelinePlan,
     }
   }
 
-  // Stage 6.3 implements only the all-one control and a single widened prefix.
-  // A wider prefix remains rejected until it receives an independent runtime
-  // and resource qualification.
-  if (widenedMatrixLineages > 1)
-    return failure();
   const unsigned expectedDepth = widenedMatrixLineages == 0 ? 1 : 2;
   if (candidate->maximumLiveMatrixResultsPerLineage != expectedDepth ||
       candidate->prefetchLimit != expectedDepth)
@@ -581,7 +576,11 @@ validateForcedScheduleCandidate(const CrossCorePipelinePlan *pipelinePlan,
       << candidate->candidateId << " lanes=" << candidate->logicalLaneCount
       << " matrix-lineages=" << candidate->matrixLineageLimits.size()
       << " widened-prefix=" << widenedMatrixLineages << " behavior="
-      << (widenedMatrixLineages == 0 ? "generic" : "first-widened") << "\n");
+      << (widenedMatrixLineages == 0                        ? "generic"
+          : widenedMatrixLineages == 1                      ? "first-widened"
+          : widenedMatrixLineages == expectedMatrixLineages ? "all-widened"
+                                                            : "prefix-widened")
+      << "\n");
   return success();
 }
 

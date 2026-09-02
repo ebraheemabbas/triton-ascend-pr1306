@@ -66,11 +66,8 @@ def test_validation_precedes_unchanged_reorder() -> None:
     assert "scheduleCandidate" not in reorder_call
 
 
-def test_unavailable_or_multi_widened_candidate_rejects_transactionally() -> None:
-    source = SCHEDULER.read_text()
+def test_unavailable_candidate_rejects_transactionally() -> None:
     cpp = PASS.read_text()
-    assert "widenedMatrixLineages > 1" in source
-    assert "forced schedule candidate rejected" in source
     assert "requested schedule candidate unavailable" in cpp
     assert "return failure();" in cpp
 
@@ -93,6 +90,6 @@ if __name__ == "__main__":
     test_selected_candidate_reaches_scheduler()
     test_control_is_structural_not_candidate_numbered()
     test_validation_precedes_unchanged_reorder()
-    test_unavailable_or_multi_widened_candidate_rejects_transactionally()
+    test_unavailable_candidate_rejects_transactionally()
     test_policy_has_no_kernel_shape_or_lane_rule()
     print("Stage 6.2 forced schedule-control source contract: PASS")

@@ -10,14 +10,13 @@ TRANSFERS = LIB / "CrossScopeTransfers.cpp"
 PASS = LIB / "CVSplitScheduling.cpp"
 
 
-def test_scheduler_accepts_only_control_or_first_widened() -> None:
+def test_scheduler_accepts_control_and_monotone_widened_prefix() -> None:
     source = SCHEDULER.read_text()
     validator = source[source.index("validateForcedScheduleCandidate"):source.index("// Dependency-level scheduler")]
     for required in (
             "limit.inFlightLimit > 2",
             "sawDepthOne",
             "widenedMatrixLineages",
-            "widenedMatrixLineages > 1",
             "widenedMatrixLineages == 0 ? 1 : 2",
             '"first-widened"',
     ):
@@ -81,7 +80,7 @@ def test_policy_has_no_kernel_shape_lane_or_candidate_id_rule() -> None:
 
 
 if __name__ == "__main__":
-    test_scheduler_accepts_only_control_or_first_widened()
+    test_scheduler_accepts_control_and_monotone_widened_prefix()
     test_candidate_reaches_verified_transfer_emitter()
     test_drain_lag_is_derived_per_lineage()
     test_candidate_validation_precedes_transfer_mutation()
