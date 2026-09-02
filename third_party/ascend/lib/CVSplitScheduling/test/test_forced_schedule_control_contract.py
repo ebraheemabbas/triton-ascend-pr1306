@@ -38,18 +38,18 @@ def test_selected_candidate_reaches_scheduler() -> None:
 
 def test_control_is_structural_not_candidate_numbered() -> None:
     source = SCHEDULER.read_text()
-    validator = source[source.index("validateForcedAllOneScheduleCandidate"):source.
-                       index("// Dependency-level scheduler")]
+    validator = source[source.index("validateForcedScheduleCandidate"):source.index("// Dependency-level scheduler")]
     for required in (
             "candidate->logicalLaneCount != pipelinePlan->laneCount",
             "candidate->waveWidth != candidate->logicalLaneCount",
-            "candidate->maximumLiveMatrixResultsPerLineage != 1",
-            "candidate->prefetchLimit != 1",
-            "limit.inFlightLimit != 1",
+            "candidate->maximumLiveMatrixResultsPerLineage != expectedDepth",
+            "candidate->prefetchLimit != expectedDepth",
+            "limit.inFlightLimit == 0",
             "limit.direction != CrossCoreDirection::CubeToVector",
             "lineage.originId != limit.originId",
             "lineage.direction != limit.direction",
-            "behavior=generic",
+            '" behavior="',
+            '"generic"',
     ):
         assert required in validator
     assert not re.search(r"candidate(Id|->candidateId)\s*[!=]=\s*0", validator)
@@ -58,7 +58,7 @@ def test_control_is_structural_not_candidate_numbered() -> None:
 def test_validation_precedes_unchanged_reorder() -> None:
     source = SCHEDULER.read_text()
     run = source.index("DependencyScheduler::run")
-    validate = source.index("validateForcedAllOneScheduleCandidate", run)
+    validate = source.index("validateForcedScheduleCandidate", run)
     graph = source.index("buildDependencyGraph", run)
     reorder = source.index("reorderForCrossScopeProducerPhases", run)
     assert run < validate < graph < reorder
@@ -66,11 +66,11 @@ def test_validation_precedes_unchanged_reorder() -> None:
     assert "scheduleCandidate" not in reorder_call
 
 
-def test_deeper_or_unavailable_candidate_rejects_transactionally() -> None:
+def test_unavailable_or_multi_widened_candidate_rejects_transactionally() -> None:
     source = SCHEDULER.read_text()
     cpp = PASS.read_text()
-    assert "limit.inFlightLimit != 1" in source
-    assert "forced schedule control rejected" in source
+    assert "widenedMatrixLineages > 1" in source
+    assert "forced schedule candidate rejected" in source
     assert "requested schedule candidate unavailable" in cpp
     assert "return failure();" in cpp
 
@@ -93,6 +93,6 @@ if __name__ == "__main__":
     test_selected_candidate_reaches_scheduler()
     test_control_is_structural_not_candidate_numbered()
     test_validation_precedes_unchanged_reorder()
-    test_deeper_or_unavailable_candidate_rejects_transactionally()
+    test_unavailable_or_multi_widened_candidate_rejects_transactionally()
     test_policy_has_no_kernel_shape_or_lane_rule()
     print("Stage 6.2 forced schedule-control source contract: PASS")

@@ -1155,6 +1155,7 @@ private:
             loop, classification, transferPhaseEnds,
             materializedPlan ? &*materializedPlan : nullptr,
             materializedResources ? &*materializedResources : nullptr,
+            forcedScheduleCandidate,
             static_cast<unsigned>(interCoreBufferDepth),
             privateBufferUbBudgetBytes < 0
                 ? std::numeric_limits<uint64_t>::max()
