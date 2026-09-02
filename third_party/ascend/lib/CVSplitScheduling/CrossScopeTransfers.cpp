@@ -1354,19 +1354,32 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
       const ResourceLineagePlan &lineage =
           resourcePlan->lineages[assignment.lineageIndex];
       auto phaseIt = phaseFlagOffsetByOrigin.find(lineage.originId);
-      if (!boundary.producer || phaseIt == phaseFlagOffsetByOrigin.end() ||
-          boundary.key.originId != lineage.originId ||
+      if (!boundary.producer)
+        return rejectVerifiedPlan("assignment-producer");
+      if (phaseIt == phaseFlagOffsetByOrigin.end())
+        return rejectVerifiedPlan("assignment-phase");
+      if (boundary.key.originId != lineage.originId ||
           boundary.key.direction != lineage.direction ||
           boundary.key.lane != assignment.lane ||
-          assignment.physicalGroup != lineage.physicalGroup ||
-          assignment.slot != assignment.lane % lineage.slotCount ||
-          assignment.forwardFlagId !=
-              static_cast<unsigned>(flagBase) + phaseIt->second +
-                  assignment.slot ||
-          !verifiedAssignmentByProducer
+          assignment.physicalGroup != lineage.physicalGroup)
+        return rejectVerifiedPlan("assignment-key");
+      if (assignment.slot != assignment.lane % lineage.slotCount)
+        return rejectVerifiedPlan("assignment-slot");
+      const unsigned expectedFlag =
+          static_cast<unsigned>(flagBase) + phaseIt->second +
+          assignment.slot;
+      if (assignment.forwardFlagId != expectedFlag) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[cv-split] verified flag mismatch origin="
+                   << lineage.originId << " lane=" << assignment.lane
+                   << " planned=" << assignment.forwardFlagId
+                   << " shadow=" << expectedFlag << "\n");
+        return rejectVerifiedPlan("assignment-flag");
+      }
+      if (!verifiedAssignmentByProducer
                .try_emplace(boundary.producer, &assignment)
                .second)
-        return rejectVerifiedPlan("release");
+        return rejectVerifiedPlan("assignment-duplicate-producer");
     }
 
     for (const ResourcePhysicalGroup &group : resourcePlan->groups) {
@@ -1379,7 +1392,7 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
           !verifiedReleaseFlagByGroup
                .try_emplace(group.groupId, *group.releaseFlagId)
                .second)
-        return failure();
+        return rejectVerifiedPlan("release");
     }
     if (verifiedReleaseFlagByGroup.size() != mergedGroupKeys.size())
       return rejectVerifiedPlan("release-count");
