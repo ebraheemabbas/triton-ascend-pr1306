@@ -31,9 +31,10 @@
 namespace mlir::triton::cv_split {
 
 class DependencyScheduler {
-  public:
-    LogicalResult run(Block *body, const Classification &classification,
-                      llvm::DenseMap<Operation *, Operation *> &transferPhaseEnds);
+public:
+  LogicalResult
+  run(Block *body, const Classification &classification,
+      llvm::DenseMap<Operation *, Operation *> &transferPhaseEnds);
 };
 
 } // namespace mlir::triton::cv_split

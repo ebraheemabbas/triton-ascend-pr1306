@@ -204,8 +204,7 @@ def _select_cv_pipeline_policy(metadata, compile_on_910_95):
     unchanged.  Keeping this helper pure makes default/off/auto policy directly
     unit-testable without an NPU runtime.
     """
-    try_cv_split = bool(
-        metadata.get("enable_cv_split_scheduling") and compile_on_910_95)
+    try_cv_split = bool(metadata.get("enable_cv_split_scheduling") and compile_on_910_95)
     try_dynamic_cv = bool(metadata.get("enable_dynamic_cv_pipeline"))
     return try_cv_split, try_dynamic_cv
 
@@ -274,8 +273,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         # bishengir-opt, so the loss happens in code generation.
         if compile_on_910_95:
             ascend.passes.ttir.add_merge_concat_load_buffer(pm)
-        try_cv_split, try_dynamic_cv = _select_cv_pipeline_policy(
-            metadata, compile_on_910_95)
+        try_cv_split, try_dynamic_cv = _select_cv_pipeline_policy(metadata, compile_on_910_95)
 
         if try_dynamic_cv:
             ascend.passes.ttir.set_enable_cube_block_merge(metadata["enable_cube_block_merge"])
@@ -285,7 +283,6 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             # `ssbuffer.insertionOptimization` attribute (set here) at run time.
             # Keep the existing default-on buffer insertion behavior.
             ascend.passes.ttir.set_enable_buffer_insert_optimization(mod)
-
 
         if try_cv_split:
             ascend.passes.ttir.add_cv_split_scheduling(pm, compile_on_910_95, metadata["cv_split_unroll_factor"])
@@ -323,8 +320,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             print(f"[DEBUG] cmd list: {shlex.join(cmd)}")
 
         pm.run(mod, 'ttir_to_linalg')
-        cv_split_applied = _get_then_remove_rc(
-            mod, "triton_ascend.cv_split_scheduling.applied") == 1
+        cv_split_applied = _get_then_remove_rc(mod, "triton_ascend.cv_split_scheduling.applied") == 1
         if cv_split_applied:
             _configure_cv_split_metadata(metadata)
         elif try_dynamic_cv:
