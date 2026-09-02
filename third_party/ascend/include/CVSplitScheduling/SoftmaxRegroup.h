@@ -20,20 +20,32 @@
  * THE SOFTWARE.
  */
 
-#ifndef TRITON_CV_SPLIT_SCHEDULING_PRE_CHECK_H
-#define TRITON_CV_SPLIT_SCHEDULING_PRE_CHECK_H
+#ifndef TRITON_ASCEND_CV_SPLIT_SCHEDULING_SOFTMAX_REGROUP_H
+#define TRITON_ASCEND_CV_SPLIT_SCHEDULING_SOFTMAX_REGROUP_H
 
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Support/LogicalResult.h"
 
 namespace mlir::triton::cv_split {
 
-/// Checks the structural assumptions that must hold before CV split scheduling
-/// mutates `funcOp`. Returns the single supported candidate loop on success.
-FailureOr<scf::ForOp> preCheckCVSplitScheduling(func::FuncOp funcOp,
-                                                int unrollFactor);
+/// Gives the unrolled lanes of a streaming softmax one shared maximum.
+///
+/// The streaming form takes a running maximum after every block, so each lane
+/// carries its own rescale factor and each lane's product has to come back to
+/// VECTOR to be folded into the accumulator.  Taking the maximum over all
+/// `lanes` blocks first puts their P tiles on a common scale: the later lanes'
+/// rescale factors become one, the accumulator is rescaled once for the group,
+/// and the products accumulate into each other -- which is what lets them stay
+/// in L0C instead of being drained per lane.
+///
+/// Same arithmetic, different association.  The group maximum is at least every
+/// block maximum, so each exponent stays <= 0 and the numerics are no worse
+/// than the streaming form.
+///
+/// Leaves the body untouched and returns success when it does not have the
+/// expected shape, so a kernel that is not a streaming softmax is unaffected.
+LogicalResult regroupSoftmaxMax(scf::ForOp loop, unsigned lanes);
 
 } // namespace mlir::triton::cv_split
 
-#endif // TRITON_CV_SPLIT_SCHEDULING_PRE_CHECK_H
+#endif // TRITON_ASCEND_CV_SPLIT_SCHEDULING_SOFTMAX_REGROUP_H
