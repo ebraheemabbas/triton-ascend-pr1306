@@ -82,6 +82,7 @@ struct ResourcePhysicalGroup {
   uint64_t allocatedBytes;
   PipelineMemorySpace memorySpace;
   bool unionStorage;
+  std::optional<unsigned> releaseFlagId;
 };
 
 struct ResourceSlotAssignment {
@@ -90,6 +91,7 @@ struct ResourceSlotAssignment {
   unsigned lane;
   int64_t physicalGroup;
   unsigned slot;
+  unsigned forwardFlagId;
 };
 
 struct ResourceOwnershipEdge {

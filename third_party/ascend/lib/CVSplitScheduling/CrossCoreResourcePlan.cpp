@@ -325,7 +325,7 @@ buildCrossCoreResourcePlan(const CrossCorePipelinePlan &pipelinePlan,
       plan.groups.push_back(ResourcePhysicalGroup{
           lineage.physicalGroup, {static_cast<unsigned>(lineageIndex)},
           lineage.slotCount, lineage.bytesPerSlot, 0, lineage.memorySpace,
-          false});
+          false, std::nullopt});
       continue;
     }
     ResourcePhysicalGroup &group = plan.groups[groupIt->second];
@@ -357,6 +357,24 @@ buildCrossCoreResourcePlan(const CrossCorePipelinePlan &pipelinePlan,
   plan.requiredFlags = plan.forwardFlags + plan.releaseFlags;
   plan.flagCapacityProven = hasFlagCapacity(limits, plan.requiredFlags);
 
+  SmallVector<unsigned> lineageFlagBase;
+  unsigned nextFlag = plan.firstAvailableFlagId;
+  for (const ResourceLineagePlan &lineage : plan.lineages) {
+    lineageFlagBase.push_back(nextFlag);
+    nextFlag += lineage.slotCount;
+  }
+  SmallVector<int64_t> delayedReleaseGroups(mergedGroupIds.begin(),
+                                             mergedGroupIds.end());
+  llvm::sort(delayedReleaseGroups);
+  for (int64_t groupId : delayedReleaseGroups) {
+    auto groupIt = groupIndexById.find(groupId);
+    if (groupIt == groupIndexById.end())
+      return failure();
+    plan.groups[groupIt->second].releaseFlagId = nextFlag++;
+  }
+  if (nextFlag - plan.firstAvailableFlagId != plan.requiredFlags)
+    return failure();
+
   for (auto [lineageIndex, lineage] : llvm::enumerate(plan.lineages))
     for (unsigned boundaryIndex : lineage.boundaryIndices) {
       const CrossCoreBoundary &boundary =
@@ -364,7 +382,9 @@ buildCrossCoreResourcePlan(const CrossCorePipelinePlan &pipelinePlan,
       plan.assignments.push_back(ResourceSlotAssignment{
           boundaryIndex, static_cast<unsigned>(lineageIndex),
           boundary.key.lane, lineage.physicalGroup,
-          boundary.key.lane % lineage.slotCount});
+          boundary.key.lane % lineage.slotCount,
+          lineageFlagBase[lineageIndex] +
+              boundary.key.lane % lineage.slotCount});
     }
 
   for (const ResourcePhysicalGroup &group : plan.groups) {
@@ -418,9 +438,6 @@ buildCrossCoreResourcePlan(const CrossCorePipelinePlan &pipelinePlan,
   }
 
   if (plan.anchorsComplete) {
-    SmallVector<int64_t> delayedReleaseGroups(mergedGroupIds.begin(),
-                                               mergedGroupIds.end());
-    llvm::sort(delayedReleaseGroups);
     if (failed(proveCrossCoreResourceOwnership(
             pipelinePlan, delayedReleaseGroups, plan)))
       return failure();
@@ -485,7 +502,7 @@ static void logResourcePlan(const CrossCoreResourcePlan &plan,
                    << " private=" << (lineage.lanePrivate ? "yes" : "no")
                    << "\n";
 
-    for (const ResourcePhysicalGroup &group : plan.groups)
+    for (const ResourcePhysicalGroup &group : plan.groups) {
       llvm::dbgs() << "[cv-split] " << label << "-group id="
                    << group.groupId
                    << " roles=" << group.lineageIndices.size()
@@ -494,7 +511,13 @@ static void logResourcePlan(const CrossCoreResourcePlan &plan,
                    << " allocated=" << group.allocatedBytes
                    << " memory=" << memoryName(group.memorySpace)
                    << " union=" << (group.unionStorage ? "yes" : "no")
-                   << "\n";
+                   << " release-flag=";
+      if (group.releaseFlagId)
+        llvm::dbgs() << *group.releaseFlagId;
+      else
+        llvm::dbgs() << "none";
+      llvm::dbgs() << "\n";
+    }
 
     for (const ResourceOwnershipEdge &edge : plan.ownershipEdges)
       llvm::dbgs() << "[cv-split] " << label << "-edge group="
