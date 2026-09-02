@@ -748,6 +748,7 @@ public:
     this->compileOn91095 = options.compileOn91095;
     this->unrollFactor = options.unrollFactor;
     this->enablePlanDrivenEarlyPublish = options.enablePlanDrivenEarlyPublish;
+    this->scheduleCandidateId = options.scheduleCandidateId;
     this->promoteFullyUnrolled = options.promoteFullyUnrolled;
     this->pipelineDistance = options.pipelineDistance;
     this->privateBufferUbBudgetBytes = options.privateBufferUbBudgetBytes;
@@ -1041,6 +1042,9 @@ private:
     // This version is diagnostic-only: unresolved ownership paths make it
     // ineligible for selection, and the scheduler/emitter continue to use
     // their qualified inputs unchanged.
+    std::optional<cv_split::CrossCoreScheduleCandidateSet> scheduleCandidateSet;
+    const cv_split::CrossCoreScheduleCandidate *forcedScheduleCandidate =
+        nullptr;
     std::optional<cv_split::CrossCoreResourceLimits> resourceLimits;
     if (pipelinePlan) {
       FlagIdManager resourceFlagManager(moduleOp, /*firstAvailableId=*/0);
@@ -1063,15 +1067,27 @@ private:
                                                  *resourceLimits);
         if (succeeded(resourcePlan)) {
           cv_split::logCrossCoreResourcePlan(*resourcePlan);
-          FailureOr<cv_split::CrossCoreScheduleCandidateSet>
-              scheduleCandidates = cv_split::buildCrossCoreScheduleCandidates(
-                  *pipelinePlan, *resourcePlan);
-          if (succeeded(scheduleCandidates))
-            cv_split::logCrossCoreScheduleCandidates(*scheduleCandidates);
-          else
+          FailureOr<cv_split::CrossCoreScheduleCandidateSet> candidates =
+              cv_split::buildCrossCoreScheduleCandidates(*pipelinePlan,
+                                                         *resourcePlan);
+          if (succeeded(candidates)) {
+            scheduleCandidateSet.emplace(std::move(*candidates));
+            cv_split::logCrossCoreScheduleCandidates(*scheduleCandidateSet);
+            if (scheduleCandidateId >= 0) {
+              const unsigned requested =
+                  static_cast<unsigned>(scheduleCandidateId);
+              if (requested >= scheduleCandidateSet->candidates.size())
+                return failure();
+              forcedScheduleCandidate =
+                  &scheduleCandidateSet->candidates[requested];
+            }
+          } else {
             LLVM_DEBUG(llvm::dbgs()
                        << "[cv-split] schedule-candidates unavailable; "
                           "qualified scheduler remains active\n");
+            if (scheduleCandidateId >= 0)
+              return failure();
+          }
         } else
           LLVM_DEBUG(llvm::dbgs()
                      << "[cv-split] resource-plan unavailable; qualified "
@@ -1079,10 +1095,18 @@ private:
       }
     }
 
+    if (scheduleCandidateId < -1 ||
+        (scheduleCandidateId >= 0 && !forcedScheduleCandidate)) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[cv-split] requested schedule candidate unavailable\n");
+      return failure();
+    }
+
     cv_split::DependencyScheduler scheduler;
     llvm::DenseMap<Operation *, Operation *> transferPhaseEnds;
     if (failed(scheduler.run(body, classification, transferPhaseEnds,
                              reorderDistance, pipelinePlan,
+                             forcedScheduleCandidate,
                              enablePlanDrivenEarlyPublish)))
       return failure();
 

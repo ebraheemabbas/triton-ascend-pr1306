@@ -293,9 +293,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                 sink_scale_into_fixpipe=metadata["cv_split_sink_scale_into_fixpipe"],
                 l0c_pipeline_distance=metadata["cv_split_l0c_pipeline_distance"],
                 regroup_softmax_max=metadata["cv_split_regroup_softmax_max"],
-                enable_plan_driven_early_publish=metadata[
-                    "cv_split_enable_plan_driven_early_publish"
-                ])
+                enable_plan_driven_early_publish=metadata["cv_split_enable_plan_driven_early_publish"],
+                schedule_candidate_id=metadata["cv_split_schedule_candidate_id"])
 
         if try_dynamic_cv:
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
@@ -1204,6 +1203,10 @@ class NPUOptions:
     # Stage 4 development control. Keep off until the plan-driven publication
     # policy has passed compile, simulator, accuracy, and profiler qualification.
     cv_split_enable_plan_driven_early_publish: bool = False
+    # Stage 6 development control. Negative diagnoses structural candidates
+    # without selecting one; nonnegative requests a deterministic candidate ID.
+    # Stage 6.2 implements only the structurally all-one control behavior.
+    cv_split_schedule_candidate_id: int = -1
     # Spare UB, in bytes, that cross-scope transfers may spend to stop reusing
     # buffers across unrolled lanes. It funds merging the two CUBE->VECTOR
     # roles onto one union slot per lane, which is what lets HEAD_DIM differ

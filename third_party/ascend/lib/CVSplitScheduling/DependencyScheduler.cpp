@@ -518,6 +518,54 @@ static void reorderForCrossScopeProducerPhases(
     op->moveBefore(yield);
 }
 
+static LogicalResult validateForcedAllOneScheduleCandidate(
+    const CrossCorePipelinePlan *pipelinePlan,
+    const CrossCoreScheduleCandidate *candidate) {
+  if (!candidate)
+    return success();
+  if (!pipelinePlan || !candidate->diagnosticOnly ||
+      candidate->selectionEligible || candidate->logicalLaneCount == 0 ||
+      candidate->logicalLaneCount != pipelinePlan->laneCount ||
+      candidate->waveWidth != candidate->logicalLaneCount ||
+      candidate->maximumLiveMatrixResultsPerLineage != 1 ||
+      candidate->prefetchLimit != 1)
+    return failure();
+
+  unsigned expectedMatrixLineages = 0;
+  for (const CrossCorePhaseLineage &lineage : pipelinePlan->lineages)
+    expectedMatrixLineages +=
+        lineage.direction == CrossCoreDirection::CubeToVector;
+  if (expectedMatrixLineages == 0 ||
+      candidate->matrixLineageLimits.size() != expectedMatrixLineages)
+    return failure();
+
+  DenseSet<unsigned> seenLineages;
+  DenseSet<int64_t> seenOrigins;
+  for (auto [expectedPhase, limit] :
+       llvm::enumerate(candidate->matrixLineageLimits)) {
+    if (limit.pipelineLineageIndex >= pipelinePlan->lineages.size() ||
+        limit.phaseOrdinal != expectedPhase || limit.inFlightLimit != 1 ||
+        limit.transferSlotCount == 0 ||
+        limit.direction != CrossCoreDirection::CubeToVector ||
+        !seenLineages.insert(limit.pipelineLineageIndex).second ||
+        !seenOrigins.insert(limit.originId).second)
+      return failure();
+    const CrossCorePhaseLineage &lineage =
+        pipelinePlan->lineages[limit.pipelineLineageIndex];
+    if (lineage.originId != limit.originId ||
+        lineage.direction != limit.direction)
+      return failure();
+  }
+
+  LLVM_DEBUG(
+      llvm::dbgs() << "[cv-split] forced schedule control matched candidate="
+                   << candidate->candidateId << " lanes="
+                   << candidate->logicalLaneCount << " matrix-lineages="
+                   << candidate->matrixLineageLimits.size()
+                   << " behavior=generic\n");
+  return success();
+}
+
 // ============================================================================
 // Dependency-level scheduler
 // ----------------------------------------------------------------------------
@@ -535,9 +583,16 @@ DependencyScheduler::run(Block *body, const Classification &classification,
                          DenseMap<Operation *, Operation *> &transferPhaseEnds,
                          unsigned pipelineDistance,
                          const CrossCorePipelinePlan *pipelinePlan,
+                         const CrossCoreScheduleCandidate *scheduleCandidate,
                          bool enablePlanDrivenEarlyPublish) {
   DenseMap<Operation *, SmallVector<Operation *>> predecessors;
   DenseMap<Operation *, int> levels;
+
+  if (failed(validateForcedAllOneScheduleCandidate(pipelinePlan,
+                                                   scheduleCandidate))) {
+    LLVM_DEBUG(llvm::dbgs() << "[cv-split] forced schedule control rejected\n");
+    return failure();
+  }
 
   buildDependencyGraph(body, predecessors);
 

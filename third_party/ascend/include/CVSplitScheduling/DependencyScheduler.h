@@ -24,6 +24,7 @@
 #define TRITON_ASCEND_CV_SPLIT_SCHEDULING_DEPENDENCY_SCHEDULER_H
 
 #include "ascend/include/CVSplitScheduling/CrossCorePipelinePlan.h"
+#include "ascend/include/CVSplitScheduling/CrossCoreScheduleCandidate.h"
 #include "ascend/include/CVSplitScheduling/classifyAllOps.h"
 #include "mlir/IR/Block.h"
 #include "mlir/Support/LogicalResult.h"
@@ -52,6 +53,7 @@ public:
                     llvm::DenseMap<Operation *, Operation *> &transferPhaseEnds,
                     unsigned pipelineDistance,
                     const CrossCorePipelinePlan *pipelinePlan,
+                    const CrossCoreScheduleCandidate *scheduleCandidate,
                     bool enablePlanDrivenEarlyPublish);
 };
 

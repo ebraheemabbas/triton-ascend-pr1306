@@ -44,6 +44,12 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
            "4 experiment: storage, slot reuse, and arithmetic remain "
            "unchanged, and a missing/invalid analysis plan keeps the generic "
            "late-publish behavior.">,
+    Option<"scheduleCandidateId", "schedule-candidate-id",
+           "int", /*default*/"-1",
+           "Stage 6 development control selecting one immutable structural "
+           "schedule candidate by deterministic ID. Negative diagnoses only. "
+           "Stage 6.2 accepts only the structurally all-one control and keeps "
+           "the qualified generic reorder unchanged.">,
     Option<"promoteFullyUnrolled", "promote-fully-unrolled",
            "bool", /*default*/"true",
            "promote the scope loops left by a candidate whose unroll consumed "
