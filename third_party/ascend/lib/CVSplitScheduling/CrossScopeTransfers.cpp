@@ -1311,6 +1311,12 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
   DenseMap<int64_t, unsigned> verifiedReleaseFlagByGroup;
 
   if (useVerifiedPlan) {
+    auto rejectVerifiedPlan = [&](llvm::StringRef reason) -> LogicalResult {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[cv-split] verified emission plan rejected: " << reason
+                 << "\n");
+      return failure();
+    };
     const bool validStatus =
         resourcePlan->status == ResourcePlanStatus::ValidKnownCapacity ||
         resourcePlan->status == ResourcePlanStatus::ValidUnknownCapacity;
@@ -1323,7 +1329,7 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
             static_cast<unsigned>(flagBase) ||
         resourcePlan->requiredFlags != requiredFlags ||
         resourcePlan->assignments.size() != transfers.size())
-      return failure();
+      return rejectVerifiedPlan("envelope");
 
     for (const ResourceLineagePlan &lineage : resourcePlan->lineages) {
       auto slotIt = slotCountByOrigin.find(lineage.originId);
@@ -1335,14 +1341,14 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
           !verifiedGroupByOrigin
                .try_emplace(lineage.originId, lineage.physicalGroup)
                .second)
-        return failure();
+        return rejectVerifiedPlan("lineage");
     }
 
     for (const ResourceSlotAssignment &assignment :
          resourcePlan->assignments) {
       if (assignment.boundaryIndex >= materializedPlan->boundaries.size() ||
           assignment.lineageIndex >= resourcePlan->lineages.size())
-        return failure();
+        return rejectVerifiedPlan("assignment");
       const CrossCoreBoundary &boundary =
           materializedPlan->boundaries[assignment.boundaryIndex];
       const ResourceLineagePlan &lineage =
@@ -1360,7 +1366,7 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
           !verifiedAssignmentByProducer
                .try_emplace(boundary.producer, &assignment)
                .second)
-        return failure();
+        return rejectVerifiedPlan("release");
     }
 
     for (const ResourcePhysicalGroup &group : resourcePlan->groups) {
@@ -1376,12 +1382,12 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
         return failure();
     }
     if (verifiedReleaseFlagByGroup.size() != mergedGroupKeys.size())
-      return failure();
+      return rejectVerifiedPlan("release-count");
 
     for (const CrossScopeTransfer &xfer : transfers) {
       auto assignmentIt = verifiedAssignmentByProducer.find(xfer.producer);
       if (assignmentIt == verifiedAssignmentByProducer.end())
-        return failure();
+        return rejectVerifiedPlan("transfer-assignment");
       const ResourceSlotAssignment &assignment = *assignmentIt->second;
       const ResourceLineagePlan &lineage =
           resourcePlan->lineages[assignment.lineageIndex];
@@ -1391,7 +1397,7 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
               : CrossCoreDirection::VectorToCube;
       if (lineage.originId != xfer.originId ||
           lineage.direction != direction)
-        return failure();
+        return rejectVerifiedPlan("transfer-lineage");
     }
     LLVM_DEBUG(llvm::dbgs()
                << "[cv-split] verified emission plan matched "
