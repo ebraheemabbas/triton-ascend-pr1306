@@ -54,6 +54,22 @@ std::optional<uint64_t>
 cubeToVectorUnionExtraBytes(Block *body, const Classification &classification,
                             unsigned interCoreBufferDepth, unsigned lanes);
 
+/// Describes the emitted consumer side of one CUBE-to-VECTOR transfer.
+/// These non-owning handles are valid until scope separation rewrites the
+/// mixed loop.
+struct CubeToVectorTransferChain {
+  /// VECTOR wait crossed only by independently proven prerequisites.
+  Operation *wait;
+  /// Tensor read from the shared UB slot after `wait`.
+  Value transferredValue;
+  /// Original VECTOR consumers after their operands were replaced.
+  llvm::SmallVector<Operation *> consumers;
+  /// Structural lineage identity retained for diagnostics only.
+  int64_t originId;
+  /// Forward synchronization flag retained for diagnostics only.
+  int forwardFlagId;
+};
+
 /// Describes the IR emitted for one VECTOR-to-CUBE transfer. The values and
 /// operation pointers are non-owning handles into the loop being transformed.
 struct VectorToCubeTransferChain {
@@ -73,6 +89,7 @@ struct CrossScopeTransferInfo {
   /// Full row count derived from the leading CUBE-to-VECTOR transfer
   /// dimension. Scope separation halves it to M/2 rows per vector core.
   int64_t blockM;
+  llvm::SmallVector<CubeToVectorTransferChain> cubeToVectorChains;
   llvm::SmallVector<VectorToCubeTransferChain> vectorToCubeChains;
 };
 

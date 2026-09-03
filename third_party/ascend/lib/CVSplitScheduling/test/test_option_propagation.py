@@ -20,7 +20,7 @@ def test_programmatic_constructor_copies_every_declared_option():
         1,
     )[1].split("  void runOnOperation() override", 1)[0]
     assignments = re.findall(
-        r"this->([A-Za-z0-9_]+) *= *options[.]([A-Za-z0-9_]+);",
+        r"this->([A-Za-z0-9_]+)\s*=\s*options[.]([A-Za-z0-9_]+);",
         constructor,
     )
 

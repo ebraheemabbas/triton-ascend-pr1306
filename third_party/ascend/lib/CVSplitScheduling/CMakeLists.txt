@@ -8,6 +8,7 @@ add_triton_library(CVSplitScheduling
   classifyAllOps.cpp
   DependencyScheduler.cpp
   PreCheck.cpp
+  PurePrerequisiteHoisting.cpp
   ScopeSeparation.cpp
   SoftmaxRegroup.cpp
   UnfusePVMatmuls.cpp

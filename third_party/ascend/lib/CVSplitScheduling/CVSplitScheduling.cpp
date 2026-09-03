@@ -21,13 +21,14 @@
  */
 
 #include "ascend/include/CVSplitScheduling/CVSplitScheduling.h"
+#include "ascend/include/CVSplitScheduling/Attributes.h"
 #include "ascend/include/CVSplitScheduling/CrossCorePipelinePlan.h"
 #include "ascend/include/CVSplitScheduling/CrossCoreResourcePlan.h"
 #include "ascend/include/CVSplitScheduling/CrossCoreScheduleCandidate.h"
-#include "ascend/include/CVSplitScheduling/Attributes.h"
 #include "ascend/include/CVSplitScheduling/CrossScopeTransfers.h"
 #include "ascend/include/CVSplitScheduling/DependencyScheduler.h"
 #include "ascend/include/CVSplitScheduling/PreCheck.h"
+#include "ascend/include/CVSplitScheduling/PurePrerequisiteHoisting.h"
 #include "ascend/include/CVSplitScheduling/ScopeSeparation.h"
 #include "ascend/include/CVSplitScheduling/SoftmaxRegroup.h"
 #include "ascend/include/CVSplitScheduling/UnfusePVMatmuls.h"
@@ -749,6 +750,10 @@ public:
     this->unrollFactor = options.unrollFactor;
     this->enablePlanDrivenEarlyPublish = options.enablePlanDrivenEarlyPublish;
     this->scheduleCandidateId = options.scheduleCandidateId;
+    this->enablePurePrerequisiteHoisting =
+        options.enablePurePrerequisiteHoisting;
+    this->purePrerequisiteHoistBudgetBytes =
+        options.purePrerequisiteHoistBudgetBytes;
     this->promoteFullyUnrolled = options.promoteFullyUnrolled;
     this->pipelineDistance = options.pipelineDistance;
     this->privateBufferUbBudgetBytes = options.privateBufferUbBudgetBytes;
@@ -1164,6 +1169,18 @@ private:
             static_cast<unsigned>(std::max<int>(0, l0cPipelineDistance)));
     if (failed(transferInfo)) {
       return failure();
+    }
+    if (enablePurePrerequisiteHoisting) {
+      if (purePrerequisiteHoistBudgetBytes <= 0) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[cv-split] prerequisite hoisting requires a "
+                      "positive byte budget\n");
+        return failure();
+      }
+      if (failed(cv_split::hoistPurePrerequisites(
+              body, classification, *transferInfo,
+              static_cast<uint64_t>(purePrerequisiteHoistBudgetBytes))))
+        return failure();
     }
     // Origin IDs are temporary unroll-lineage metadata. Transfer grouping is
     // their final consumer, so do not expose them to scope/backend passes.

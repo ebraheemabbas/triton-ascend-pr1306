@@ -426,11 +426,10 @@ static arith::MulFOp matchSinkableScale(const CrossScopeTransfer &xfer,
   return mul;
 }
 
-static void emitCubeToVectorTransfer(const TransferEmitContext &c,
-                                     CrossScopeTransfer &xfer,
-                                     RankedTensorType tensorType,
-                                     const TransferSyncPlan &plan,
-                                     BufferPool &bufferPool) {
+static CubeToVectorTransferChain
+emitCubeToVectorTransfer(const TransferEmitContext &c, CrossScopeTransfer &xfer,
+                         RankedTensorType tensorType,
+                         const TransferSyncPlan &plan, BufferPool &bufferPool) {
   const int flagId = plan.forwardFlagId;
   Type elemType = tensorType.getElementType();
   ArrayRef<int64_t> shape = tensorType.getShape();
@@ -525,6 +524,10 @@ static void emitCubeToVectorTransfer(const TransferEmitContext &c,
   LLVM_DEBUG(llvm::dbgs() << "[cv-split]   C→V transfer #" << flagId << ": "
                           << xfer.producer->getName() << " → " << ubShape[0]
                           << "x" << ubShape[1] << " UB buffer (ROW_SPLIT)\n");
+
+  return CubeToVectorTransferChain{syncWaitOp.getOperation(),
+                                   toTensorOp.getResult(), xfer.consumers,
+                                   xfer.originId, flagId};
 }
 
 // VECTOR -> CUBE: a softmax/cast result is NZ-packed and copied UB->L1 into a
@@ -1478,6 +1481,7 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
   }
 
   BufferPool bufferPool;
+  SmallVector<CubeToVectorTransferChain> cubeToVectorChains;
   SmallVector<VectorToCubeTransferChain> vectorToCubeChains;
   DenseMap<int64_t, unsigned> laneOrdinalByOrigin;
 
@@ -1507,7 +1511,8 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
         /*slotAllocType=*/unionTypeOfOrigin.lookup(xfer.originId)};
 
     if (xfer.direction == CrossScopeTransfer::CUBE_TO_VECTOR)
-      emitCubeToVectorTransfer(ec, xfer, tensorType, plan, bufferPool);
+      cubeToVectorChains.push_back(
+          emitCubeToVectorTransfer(ec, xfer, tensorType, plan, bufferPool));
     else
       vectorToCubeChains.push_back(
           emitVectorToCubeTransfer(ec, xfer, tensorType, plan, bufferPool));
@@ -1533,7 +1538,8 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
                           << " transfers across " << phaseCount
                           << " phase(s) using " << requiredFlags
                           << " sync flags\n");
-  return CrossScopeTransferInfo{*blockM, std::move(vectorToCubeChains)};
+  return CrossScopeTransferInfo{*blockM, std::move(cubeToVectorChains),
+                                std::move(vectorToCubeChains)};
 }
 
 } // namespace mlir::triton::cv_split
