@@ -75,6 +75,9 @@ def test_stage71_rejects_effects_rank2_and_unavailable_operands():
     assert "!selected.contains(def)" in cpp
     assert "budget-rejected" in cpp
     assert "budgetBytes == 0" in cpp
+    assert "std::numeric_limits<uint64_t>::max()" in cpp
+    assert "MulOverflow" not in cpp
+    assert "AddOverflow" not in cpp
 
 
 def test_stage71_runs_after_transfer_emission_before_scope_split():

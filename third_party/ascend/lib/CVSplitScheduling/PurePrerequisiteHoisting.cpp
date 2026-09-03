@@ -27,10 +27,10 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <limits>
 
 using namespace mlir;
 
@@ -90,16 +90,16 @@ static FailureOr<uint64_t> getStaticScalarOrRankOneBytes(Type type) {
     return failure();
 
   const uint64_t bytesPerElement = (static_cast<uint64_t>(bitWidth) + 7) / 8;
-  uint64_t bytes = 0;
-  if (llvm::MulOverflow(elements, bytesPerElement, bytes))
+  if (bytesPerElement != 0 &&
+      elements > std::numeric_limits<uint64_t>::max() / bytesPerElement)
     return failure();
-  return bytes;
+  return elements * bytesPerElement;
 }
 
-static bool isMovablePrerequisite(
-    Operation *op, const Classification &classification,
-    const DenseSet<Operation *> &consumerSlice,
-    const DenseSet<Operation *> &transferredDescendants) {
+static bool
+isMovablePrerequisite(Operation *op, const Classification &classification,
+                      const DenseSet<Operation *> &consumerSlice,
+                      const DenseSet<Operation *> &transferredDescendants) {
   auto classIt = classification.find(op);
   if (classIt == classification.end() ||
       classIt->second != EngineType::VECTOR || !consumerSlice.contains(op) ||
@@ -142,15 +142,18 @@ getAdditionalLiveBytes(const DenseSet<Operation *> &selected) {
   uint64_t total = 0;
   for (Operation *op : selected) {
     for (Value result : op->getResults()) {
-      const bool escapes = llvm::any_of(result.getUsers(), [&](Operation *user) {
-        return !selected.contains(user);
-      });
+      const bool escapes =
+          llvm::any_of(result.getUsers(), [&](Operation *user) {
+            return !selected.contains(user);
+          });
       if (!escapes)
         continue;
       FailureOr<uint64_t> bytes =
           getStaticScalarOrRankOneBytes(result.getType());
-      if (failed(bytes) || llvm::AddOverflow(total, *bytes, total))
+      if (failed(bytes) ||
+          *bytes > std::numeric_limits<uint64_t>::max() - total)
         return failure();
+      total += *bytes;
     }
   }
   return total;
@@ -170,15 +173,15 @@ static Operation *findFirstConsumer(const CubeToVectorTransferChain &chain,
 
 } // namespace
 
-LogicalResult hoistPurePrerequisites(
-    Block *body, const Classification &classification,
-    const CrossScopeTransferInfo &transferInfo, uint64_t budgetBytes) {
+LogicalResult hoistPurePrerequisites(Block *body,
+                                     const Classification &classification,
+                                     const CrossScopeTransferInfo &transferInfo,
+                                     uint64_t budgetBytes) {
   if (!body || budgetBytes == 0)
     return failure();
 
   SmallVector<const CubeToVectorTransferChain *> chains;
-  for (const CubeToVectorTransferChain &chain :
-       transferInfo.cubeToVectorChains)
+  for (const CubeToVectorTransferChain &chain : transferInfo.cubeToVectorChains)
     chains.push_back(&chain);
   llvm::stable_sort(chains, [](const CubeToVectorTransferChain *lhs,
                                const CubeToVectorTransferChain *rhs) {
@@ -191,10 +194,12 @@ LogicalResult hoistPurePrerequisites(
   for (const CubeToVectorTransferChain *chain : chains) {
     Operation *wait = chain->wait;
     Operation *firstConsumer = findFirstConsumer(*chain, body);
+    Operation *transferredDef = chain->transferredValue
+                                    ? chain->transferredValue.getDefiningOp()
+                                    : nullptr;
     if (!wait || wait->getBlock() != body || !firstConsumer ||
-        !wait->isBeforeInBlock(firstConsumer) ||
-        !chain->transferredValue ||
-        chain->transferredValue.getParentBlock() != body)
+        !wait->isBeforeInBlock(firstConsumer) || !chain->transferredValue ||
+        !transferredDef || transferredDef->getBlock() != body)
       return failure();
     ++analyzedWaits;
 
@@ -212,9 +217,8 @@ LogicalResult hoistPurePrerequisites(
       }
       if (&op == firstConsumer)
         break;
-      if (afterWait && isMovablePrerequisite(&op, classification,
-                                              consumerSlice,
-                                              transferredDescendants))
+      if (afterWait && isMovablePrerequisite(&op, classification, consumerSlice,
+                                             transferredDescendants))
         selected.insert(&op);
     }
     closeMovableOperands(wait, body, selected);
@@ -231,9 +235,8 @@ LogicalResult hoistPurePrerequisites(
     if (!fits) {
       LLVM_DEBUG(llvm::dbgs()
                  << "[cv-split] prerequisite-hoist origin=" << chain->originId
-                 << " flag=" << chain->forwardFlagId
-                 << " considered=" << ordered.size()
-                 << " moved=0 live-bytes=" << *liveBytes
+                 << " flag=" << chain->forwardFlagId << " considered="
+                 << ordered.size() << " moved=0 live-bytes=" << *liveBytes
                  << " status=budget-rejected\n");
       continue;
     }
@@ -251,11 +254,10 @@ LogicalResult hoistPurePrerequisites(
                << "\n");
   }
 
-  LLVM_DEBUG(llvm::dbgs()
-             << "[cv-split] prerequisite-hoist-summary waits="
-             << analyzedWaits << " moved=" << movedOperations
-             << " live-bytes=" << cumulativeLiveBytes
-             << " budget=" << budgetBytes << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "[cv-split] prerequisite-hoist-summary waits="
+                          << analyzedWaits << " moved=" << movedOperations
+                          << " live-bytes=" << cumulativeLiveBytes
+                          << " budget=" << budgetBytes << "\n");
   return success();
 }
 
