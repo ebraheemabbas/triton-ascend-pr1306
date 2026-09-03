@@ -5,9 +5,9 @@
 // requires a new calibration ID and versioned evidence.
 constexpr uint32_t kExperimentalA5ProductId = 9579;
 constexpr uint32_t kExperimentalA5Revision = 0;
-constexpr uint32_t kExperimentalCalibrationSchemaVersion = 2;
+constexpr uint32_t kExperimentalCalibrationSchemaVersion = 3;
 constexpr CVSplitCalibrationId kExperimentalCalibrationId{
-    0xA500000000000803ULL};
+    0xA500000000000805ULL};
 
 constexpr uint32_t kMaximumCalibratedMatrixDimension = 4096;
 constexpr uint64_t kMaximumCalibratedBytes = 1ULL << 30;
@@ -34,6 +34,7 @@ constexpr uint64_t kVectorCastElementsPerCycle = 256;
 constexpr uint64_t kVectorPermuteElementsPerCycle = 128;
 constexpr uint64_t kVectorCopyElementsPerCycle = 128;
 constexpr uint64_t kVectorUbBytesPerCycle = 512;
+constexpr uint64_t kVectorParallelSubBlocks = 2;
 
 constexpr uint64_t kTransferCopyStartupCycles = 8;
 constexpr uint64_t kTransferConversionStartupCycles = 14;

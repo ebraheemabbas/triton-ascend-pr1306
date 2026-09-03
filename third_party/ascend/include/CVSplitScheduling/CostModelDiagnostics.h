@@ -10,6 +10,8 @@
 
 #include "mlir/Support/LogicalResult.h"
 
+#include <optional>
+
 namespace mlir::triton::cv_split {
 
 /// Queries and logs every extracted primitive without estimating schedules or
@@ -18,7 +20,8 @@ LogicalResult
 logPrimitiveCostEstimates(const CVSplitCostModelRequestSet &requests);
 
 LogicalResult
-logCandidateScheduleEstimates(const CVSplitCostModelRequestSet &requests);
+logCandidateScheduleEstimates(const CVSplitCostModelRequestSet &requests,
+                              std::optional<unsigned> fallbackCandidateId);
 
 } // namespace mlir::triton::cv_split
 

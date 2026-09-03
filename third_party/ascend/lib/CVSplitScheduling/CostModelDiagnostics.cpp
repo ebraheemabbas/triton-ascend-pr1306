@@ -5,6 +5,7 @@
 
 #include "ascend/include/CVSplitScheduling/CostModelDiagnostics.h"
 #include "ascend/include/CVSplitScheduling/CVSplitCostModel.h"
+#include "ascend/include/CVSplitScheduling/CostModelCandidateRanking.h"
 #include "ascend/include/CVSplitScheduling/CostModelCandidateGraph.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -13,6 +14,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <memory>
+#include <optional>
 #include <utility>
 
 namespace mlir::triton::cv_split {
@@ -55,6 +57,23 @@ static llvm::StringRef resourceName(PrincipalResource resource) {
     return "mte3";
   case PrincipalResource::ScalarControl:
     return "scalar";
+  }
+  return "unknown";
+}
+
+static llvm::StringRef
+rankingStatusName(CVSplitCandidateRankingStatus status) {
+  switch (status) {
+  case CVSplitCandidateRankingStatus::Success:
+    return "success";
+  case CVSplitCandidateRankingStatus::InvalidInput:
+    return "invalid-input";
+  case CVSplitCandidateRankingStatus::Unscoreable:
+    return "unscoreable";
+  case CVSplitCandidateRankingStatus::ArithmeticOverflow:
+    return "arithmetic-overflow";
+  case CVSplitCandidateRankingStatus::Ambiguous:
+    return "ambiguous";
   }
   return "unknown";
 }
@@ -103,7 +122,7 @@ logPrimitiveCostEstimates(const CVSplitCostModelRequestSet &requests) {
                           << " calibration=" << info.calibrationId.value
                           << " product=" << info.target.productId
                           << " revision=" << info.target.revision
-                          << " mode=experimental-primitive-only\n");
+                          << " mode=experimental-ranking-v1\n");
 
   LogicalResult result = success();
   for (auto [index, request] : llvm::enumerate(requests.cubeRequests))
@@ -135,7 +154,8 @@ logPrimitiveCostEstimates(const CVSplitCostModelRequestSet &requests) {
 }
 
 LogicalResult
-logCandidateScheduleEstimates(const CVSplitCostModelRequestSet &requests) {
+logCandidateScheduleEstimates(const CVSplitCostModelRequestSet &requests,
+                              std::optional<unsigned> fallbackCandidateId) {
   auto modelOrError =
       CVSplitPrimitiveCostModel::createForTarget(requests.target);
   if (!modelOrError) {
@@ -147,6 +167,7 @@ logCandidateScheduleEstimates(const CVSplitCostModelRequestSet &requests) {
   if (failed(graphs))
     return failure();
   LogicalResult result = success();
+  llvm::SmallVector<CVSplitScheduleEstimate> estimates;
   for (const CVSplitOwnedScheduleRequest &graph : *graphs) {
     CVSplitScheduleEstimate estimate =
         model->estimateSchedule(graph.getRequest());
@@ -167,13 +188,73 @@ logCandidateScheduleEstimates(const CVSplitCostModelRequestSet &requests) {
                    << " exposed-wait=" << estimate.exposedWaitCycles
                    << " uncertainty-bp=" << estimate.uncertaintyBasisPoints
                    << "\n";
+      for (const CVSplitResourceSummary &resource : estimate.resources)
+        llvm::dbgs() << "[cv-split] cost-model-resource candidate="
+                     << estimate.candidateId
+                     << " resource=" << resourceName(resource.resource)
+                     << " busy=" << resource.busyCycles
+                     << " blocked=" << resource.blockedCycles
+                     << " idle=" << resource.idleCycles
+                     << " first=" << resource.firstUseCycle
+                     << " last=" << resource.lastUseCycle << "\n";
     });
     if (estimate.status != CVSplitCandidateStatus::Success)
       result = failure();
+    estimates.push_back(std::move(estimate));
   }
+
+  CVSplitCandidateRanking ranking = rankCostModelCandidates(
+      *graphs, estimates,
+      fallbackCandidateId
+          ? std::optional<uint32_t>(
+                static_cast<uint32_t>(*fallbackCandidateId))
+          : std::nullopt);
+  LLVM_DEBUG({
+    for (const CVSplitCandidateRankEntry &entry : ranking.entries) {
+      llvm::dbgs() << "[cv-split] cost-model-rank candidate="
+                   << entry.candidateId
+                   << " raw-ii=" << entry.rawInitiationIntervalCycles
+                   << " pressure=" << entry.liveResultPressureCycles
+                   << " score=" << entry.policyScoreCycles
+                   << " uncertainty-bp=" << entry.uncertaintyBasisPoints
+                   << " lineage-depths=";
+      for (auto [index, depth] :
+           llvm::enumerate(entry.matrixLineageInFlightLimits)) {
+        if (index != 0)
+          llvm::dbgs() << ',';
+        llvm::dbgs() << depth;
+      }
+      llvm::dbgs() << "\n";
+    }
+    llvm::dbgs() << "[cv-split] cost-model-ranking-summary status="
+                 << rankingStatusName(ranking.status) << " predicted=";
+    if (ranking.predictedCandidateId)
+      llvm::dbgs() << *ranking.predictedCandidateId;
+    else
+      llvm::dbgs() << "none";
+    llvm::dbgs() << " runner-up=";
+    if (ranking.runnerUpCandidateId)
+      llvm::dbgs() << *ranking.runnerUpCandidateId;
+    else
+      llvm::dbgs() << "none";
+    llvm::dbgs() << " fallback=";
+    if (ranking.fallbackCandidateId)
+      llvm::dbgs() << *ranking.fallbackCandidateId;
+    else
+      llvm::dbgs() << "none";
+    llvm::dbgs() << " margin=" << ranking.marginCycles
+                 << " margin-bp=" << ranking.marginBasisPoints
+                 << " required-bp=" << ranking.requiredMarginBasisPoints
+                 << " clears-uncertainty="
+                 << (ranking.clearsUncertainty ? "yes" : "no")
+                 << " selection-changed=no\n";
+  });
+  if (ranking.status != CVSplitCandidateRankingStatus::Success)
+    result = failure();
   LLVM_DEBUG(llvm::dbgs() << "[cv-split] cost-model-schedule-summary status="
                           << (succeeded(result) ? "success" : "partial")
                           << " candidates=" << graphs->size()
+                          << " ranked=" << ranking.entries.size()
                           << " selection-changed=no\n");
   return result;
 }

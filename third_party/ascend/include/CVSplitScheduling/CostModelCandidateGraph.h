@@ -13,6 +13,8 @@ struct CVSplitOwnedScheduleRequest {
   uint32_t candidateId = 0;
   llvm::SmallVector<CVSplitCostedNode> nodes;
   llvm::SmallVector<CVSplitCostedEdge> edges;
+  llvm::SmallVector<uint32_t> matrixLineageInFlightLimits;
+  llvm::SmallVector<uint64_t> matrixLineageResultBytes;
   uint32_t logicalUnrollFactor = 0;
   uint32_t modeledIterations = 0;
 

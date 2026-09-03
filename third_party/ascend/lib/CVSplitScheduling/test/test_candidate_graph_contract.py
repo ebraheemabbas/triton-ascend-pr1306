@@ -14,7 +14,8 @@ def read(path):
 def test_owned_graph_and_generic_edges():
     header = read(INCLUDE / "CostModelCandidateGraph.h")
     source = read(LIB / "CostModelCandidateGraph.cpp")
-    for token in ("CVSplitOwnedScheduleRequest", "CVSplitCostedNode", "CVSplitCostedEdge", "getRequest() const"):
+    for token in ("CVSplitOwnedScheduleRequest", "CVSplitCostedNode", "CVSplitCostedEdge", "getRequest() const",
+                  "matrixLineageInFlightLimits", "matrixLineageResultBytes"):
         assert token in header
     for token in ("candidate.logicalLaneCount", "lineage.phaseOrdinal", "lineage.inFlightLimit", "c2vPhases",
                   "EventGenerateWait", "CrossCoreAvailability", "ResourceSerialization", "StorageReuse", "LoopCarried"):

@@ -119,6 +119,8 @@ buildOneGraph(const CVSplitCostModelRequestSet &requests,
   graph.candidateId = candidate.candidateId;
   graph.logicalUnrollFactor = lanes;
   graph.modeledIterations = kModeledOuterIterations;
+  graph.matrixLineageInFlightLimits.resize(c2vPhases.size());
+  graph.matrixLineageResultBytes.resize(c2vPhases.size());
   std::vector<std::vector<PhaseNodes>> phaseNodes(
       lineageCount, std::vector<PhaseNodes>(lanes));
   auto addNode = [&](CVSplitPrimitiveKind kind,
@@ -194,6 +196,16 @@ buildOneGraph(const CVSplitCostModelRequestSet &requests,
         lineage.inFlightLimit == 0 || lineage.inFlightLimit > lanes ||
         !seenOrdinals.insert(lineage.phaseOrdinal).second)
       return failure();
+    unsigned cubeBase = lineage.phaseOrdinal * lanes;
+    uint64_t resultBytes = requests.cubeRequests[cubeBase].resultBytes;
+    if (resultBytes == 0)
+      return failure();
+    for (unsigned lane = 1; lane < lanes; ++lane)
+      if (requests.cubeRequests[cubeBase + lane].resultBytes != resultBytes)
+        return failure();
+    graph.matrixLineageInFlightLimits[lineage.phaseOrdinal] =
+        lineage.inFlightLimit;
+    graph.matrixLineageResultBytes[lineage.phaseOrdinal] = resultBytes;
     unsigned phase = c2vPhases[lineage.phaseOrdinal];
     for (unsigned lane = 0; lane < lanes; ++lane) {
       unsigned target = lane + lineage.inFlightLimit;

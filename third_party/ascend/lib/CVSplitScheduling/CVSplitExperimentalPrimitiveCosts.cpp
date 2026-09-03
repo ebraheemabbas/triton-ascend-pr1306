@@ -324,6 +324,11 @@ estimateExperimentalVectorRegion(CVSplitTargetIdentity modelTarget,
     return makeFailure(CVSplitPrimitiveStatus::ArithmeticOverflow,
                        calibrationId);
 
+  uint64_t vectorExecutionCycles;
+  if (!checkedCeilDiv(vectorCycles, kVectorParallelSubBlocks,
+                      vectorExecutionCycles))
+    return makeFailure(CVSplitPrimitiveStatus::ArithmeticOverflow,
+                       calibrationId);
   uint64_t readTraffic, writeTraffic, readCycles, writeCycles, temporaryCycles;
   if (!checkedAdd(request.externalBytesRead, request.temporaryUbBytes,
                   readTraffic) ||
@@ -340,13 +345,14 @@ estimateExperimentalVectorRegion(CVSplitTargetIdentity modelTarget,
   CVSplitPrimitiveEstimate estimate{};
   estimate.status = CVSplitPrimitiveStatus::Success;
   estimate.resultReadyCycles =
-      std::max(vectorCycles, std::max(readCycles, writeCycles));
-  estimate.initiationIntervalCycles = vectorCycles;
+      std::max(vectorExecutionCycles, std::max(readCycles, writeCycles));
+  estimate.initiationIntervalCycles = vectorExecutionCycles;
   estimate.bytesRead = readTraffic;
   estimate.bytesWritten = writeTraffic;
   estimate.uncertaintyBasisPoints = kVectorUncertaintyBasisPoints;
   estimate.calibrationId = calibrationId;
-  if (!addOccupancy(estimate, PrincipalResource::Vector, 0, vectorCycles) ||
+  if (!addOccupancy(estimate, PrincipalResource::Vector, 0,
+                    vectorExecutionCycles) ||
       !addOccupancy(estimate, PrincipalResource::Mte2, 0, readCycles) ||
       !addOccupancy(estimate, PrincipalResource::Mte3, 0, writeCycles))
     return makeFailure(CVSplitPrimitiveStatus::ArithmeticOverflow,
