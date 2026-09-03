@@ -3,6 +3,7 @@ add_triton_library(CVSplitScheduling
   CVSplitCostModel.cpp
   CVSplitExperimentalPrimitiveCosts.cpp
   CVSplitScheduleEstimator.cpp
+  CostModelCandidateGraph.cpp
   CostModelDiagnostics.cpp
   CostModelRequestExtraction.cpp
   CrossCoreOwnershipProof.cpp

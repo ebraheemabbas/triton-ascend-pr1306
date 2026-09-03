@@ -17,6 +17,9 @@ namespace mlir::triton::cv_split {
 LogicalResult
 logPrimitiveCostEstimates(const CVSplitCostModelRequestSet &requests);
 
+LogicalResult
+logCandidateScheduleEstimates(const CVSplitCostModelRequestSet &requests);
+
 } // namespace mlir::triton::cv_split
 
 #endif // TRITON_ASCEND_CV_SPLIT_SCHEDULING_COST_MODEL_DIAGNOSTICS_H

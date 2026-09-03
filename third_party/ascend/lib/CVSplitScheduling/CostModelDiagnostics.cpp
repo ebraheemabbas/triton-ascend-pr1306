@@ -5,6 +5,7 @@
 
 #include "ascend/include/CVSplitScheduling/CostModelDiagnostics.h"
 #include "ascend/include/CVSplitScheduling/CVSplitCostModel.h"
+#include "ascend/include/CVSplitScheduling/CostModelCandidateGraph.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
@@ -130,6 +131,50 @@ logPrimitiveCostEstimates(const CVSplitCostModelRequestSet &requests) {
                           << " syncs="
                           << requests.synchronizationRequests.size()
                           << " schedule-queried=no selection-changed=no\n");
+  return result;
+}
+
+LogicalResult
+logCandidateScheduleEstimates(const CVSplitCostModelRequestSet &requests) {
+  auto modelOrError =
+      CVSplitPrimitiveCostModel::createForTarget(requests.target);
+  if (!modelOrError) {
+    llvm::consumeError(modelOrError.takeError());
+    return failure();
+  }
+  std::unique_ptr<CVSplitPrimitiveCostModel> model = std::move(*modelOrError);
+  auto graphs = buildCostModelCandidateGraphs(requests, *model);
+  if (failed(graphs))
+    return failure();
+  LogicalResult result = success();
+  for (const CVSplitOwnedScheduleRequest &graph : *graphs) {
+    CVSplitScheduleEstimate estimate =
+        model->estimateSchedule(graph.getRequest());
+    LLVM_DEBUG({
+      llvm::dbgs() << "[cv-split] cost-model-graph candidate="
+                   << graph.candidateId << " nodes=" << graph.nodes.size()
+                   << " edges=" << graph.edges.size()
+                   << " iterations=" << graph.modeledIterations << "\n";
+      llvm::dbgs() << "[cv-split] cost-model-schedule candidate="
+                   << estimate.candidateId << " status="
+                   << (estimate.status == CVSplitCandidateStatus::Success
+                           ? "success"
+                           : "failed")
+                   << " prologue=" << estimate.prologueCycles
+                   << " ii=" << estimate.steadyStateInitiationIntervalCycles
+                   << " epilogue=" << estimate.epilogueCycles
+                   << " critical=" << estimate.criticalPathCycles
+                   << " exposed-wait=" << estimate.exposedWaitCycles
+                   << " uncertainty-bp=" << estimate.uncertaintyBasisPoints
+                   << "\n";
+    });
+    if (estimate.status != CVSplitCandidateStatus::Success)
+      result = failure();
+  }
+  LLVM_DEBUG(llvm::dbgs() << "[cv-split] cost-model-schedule-summary status="
+                          << (succeeded(result) ? "success" : "partial")
+                          << " candidates=" << graphs->size()
+                          << " selection-changed=no\n");
   return result;
 }
 

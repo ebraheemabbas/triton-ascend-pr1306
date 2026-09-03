@@ -84,7 +84,7 @@ def test_provisional_body_is_checked_generic_and_has_statuses() -> None:
         assert token not in lowered
 
 
-def test_stage83_diagnostics_query_primitives_but_not_schedules() -> None:
+def test_stage83_primitive_diagnostics_remain_present() -> None:
     header = read(INCLUDE / "CostModelDiagnostics.h")
     source = read(LIB / "CostModelDiagnostics.cpp")
     pass_source = read(LIB / "CVSplitScheduling.cpp")
@@ -98,8 +98,7 @@ def test_stage83_diagnostics_query_primitives_but_not_schedules() -> None:
             "estimateSynchronization",
     ):
         assert query in source
-    assert "estimateSchedule" not in source
-    assert "schedule-queried=no selection-changed=no" in source
+    assert "cost-model-primitive-summary" in source
     assert "logPrimitiveCostEstimates" in pass_source
     assert "qualified scheduler/emitter remains active" not in source
     assert "qualified scheduler/emitter remains active" not in pass_source.split("logPrimitiveCostEstimates", 1)[0]
@@ -115,6 +114,6 @@ if __name__ == "__main__":
     test_calibration_is_isolated_versioned_and_experimental()
     test_every_v4_primitive_query_has_a_replaceable_body()
     test_provisional_body_is_checked_generic_and_has_statuses()
-    test_stage83_diagnostics_query_primitives_but_not_schedules()
+    test_stage83_primitive_diagnostics_remain_present()
     test_stage83_build_owns_new_sources()
     print("Stage 8.3 provisional primitive cost source contract: PASS")

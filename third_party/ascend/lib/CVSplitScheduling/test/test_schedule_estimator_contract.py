@@ -11,13 +11,11 @@ def read(path: Path) -> str:
     return path.read_text()
 
 
-def test_schedule_estimator_is_owned_and_reached_only_by_facade() -> None:
+def test_schedule_estimator_is_owned_and_reached_by_facade() -> None:
     cmake = read(LIB / "CMakeLists.txt")
     facade = read(LIB / "CVSplitCostModel.cpp")
-    diagnostics = read(LIB / "CostModelDiagnostics.cpp")
     assert "CVSplitScheduleEstimator.cpp" in cmake
     assert "estimateDeterministicSchedule" in facade
-    assert "estimateSchedule" not in diagnostics
 
 
 def test_schedule_estimator_validates_the_v4_graph() -> None:
@@ -103,7 +101,7 @@ def test_stage84a_is_mlir_independent_and_policy_free() -> None:
 
 
 if __name__ == "__main__":
-    test_schedule_estimator_is_owned_and_reached_only_by_facade()
+    test_schedule_estimator_is_owned_and_reached_by_facade()
     test_schedule_estimator_validates_the_v4_graph()
     test_schedule_estimator_expands_and_schedules_deterministically()
     test_schedule_estimator_reports_all_v4_outputs()

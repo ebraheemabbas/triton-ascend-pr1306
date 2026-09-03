@@ -1175,6 +1175,10 @@ private:
             LLVM_DEBUG(llvm::dbgs()
                        << "[cv-split] cost-model-primitives incomplete; "
                           "qualified scheduler/emitter remains active\n");
+          if (failed(cv_split::logCandidateScheduleEstimates(*requests)))
+            LLVM_DEBUG(llvm::dbgs()
+                       << "[cv-split] cost-model-schedules incomplete; "
+                          "qualified scheduler/emitter remains active\n");
         } else
           LLVM_DEBUG(llvm::dbgs()
                      << "[cv-split] cost-model-inputs unavailable; qualified "
