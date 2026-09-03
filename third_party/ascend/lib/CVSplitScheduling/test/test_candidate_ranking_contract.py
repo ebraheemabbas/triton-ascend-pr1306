@@ -50,10 +50,12 @@ def test_generic_ranker_contract() -> None:
             "flash_attention",
             "native_0316",
             "head_dim",
-            "candidateid ==",
             "logicalunrollfactor == 4",
     ):
         assert forbidden not in lowered
+    for candidate_id in range(3):
+        assert f"candidateid == {candidate_id}" not in lowered
+        assert f"candidateid != {candidate_id}" not in lowered
 
 
 def test_provisional_policy_orders_measured_family() -> None:
