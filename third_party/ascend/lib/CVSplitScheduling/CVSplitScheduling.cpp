@@ -22,6 +22,8 @@
 
 #include "ascend/include/CVSplitScheduling/CVSplitScheduling.h"
 #include "ascend/include/CVSplitScheduling/Attributes.h"
+#include "ascend/include/CVSplitScheduling/CostModelDiagnostics.h"
+#include "ascend/include/CVSplitScheduling/CostModelRequestExtraction.h"
 #include "ascend/include/CVSplitScheduling/CrossCorePipelinePlan.h"
 #include "ascend/include/CVSplitScheduling/CrossCoreResourcePlan.h"
 #include "ascend/include/CVSplitScheduling/CrossCoreScheduleCandidate.h"
@@ -754,6 +756,7 @@ public:
         options.enablePurePrerequisiteHoisting;
     this->purePrerequisiteHoistBudgetBytes =
         options.purePrerequisiteHoistBudgetBytes;
+    this->enableCostModelDiagnostics = options.enableCostModelDiagnostics;
     this->promoteFullyUnrolled = options.promoteFullyUnrolled;
     this->pipelineDistance = options.pipelineDistance;
     this->privateBufferUbBudgetBytes = options.privateBufferUbBudgetBytes;
@@ -1149,6 +1152,41 @@ private:
         LLVM_DEBUG(llvm::dbgs()
                    << "[cv-split] materialized pipeline-plan unavailable; "
                       "qualified emitter remains active\n");
+      }
+    }
+
+    // Cost-request extraction phase: convert the verified materialized plan into stable numeric
+    // v4 request facts. This is read-only and diagnostic-only; incomplete
+    // extraction never changes the qualified scheduling/emission path.
+    if (enableCostModelDiagnostics) {
+      if (!materializedPlan || !materializedResources ||
+          !scheduleCandidateSet) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[cv-split] cost-model-inputs unavailable; qualified "
+                      "scheduler/emitter remains active\n");
+      } else {
+        FailureOr<cv_split::CVSplitCostModelRequestSet> requests =
+            cv_split::extractCostModelRequests(
+                body, classification, *materializedPlan,
+                *materializedResources, *scheduleCandidateSet);
+        if (succeeded(requests)) {
+          cv_split::logCostModelRequests(*requests);
+          if (failed(cv_split::logPrimitiveCostEstimates(*requests)))
+            LLVM_DEBUG(llvm::dbgs()
+                       << "[cv-split] cost-model-primitives incomplete; "
+                          "qualified scheduler/emitter remains active\n");
+          std::optional<unsigned> fallbackCandidateId;
+          if (forcedScheduleCandidate)
+            fallbackCandidateId = forcedScheduleCandidate->candidateId;
+          if (failed(cv_split::logCandidateScheduleEstimates(
+                  *requests, fallbackCandidateId)))
+            LLVM_DEBUG(llvm::dbgs()
+                       << "[cv-split] cost-model-schedules incomplete; "
+                          "qualified scheduler/emitter remains active\n");
+        } else
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[cv-split] cost-model-inputs unavailable; qualified "
+                        "scheduler/emitter remains active\n");
       }
     }
 

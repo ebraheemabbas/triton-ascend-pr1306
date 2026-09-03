@@ -23,6 +23,7 @@
 #ifndef TRITON_ASCEND_CV_SPLIT_SCHEDULING_CROSS_CORE_PIPELINE_PLAN_H
 #define TRITON_ASCEND_CV_SPLIT_SCHEDULING_CROSS_CORE_PIPELINE_PLAN_H
 
+#include "ascend/include/CVSplitScheduling/CVSplitTypes.h"
 #include "ascend/include/CVSplitScheduling/classifyAllOps.h"
 
 #include "mlir/IR/Operation.h"
@@ -43,16 +44,6 @@ enum class CrossCoreDirection { CubeToVector, VectorToCube };
 enum class BoundaryMaterialization { Observed, PostUnfuseDpsJoin };
 
 enum class PipelineMemorySpace { UB, L1 };
-
-enum class PrincipalResource {
-  Matrix,
-  Fixpipe,
-  Vector,
-  Mte1,
-  Mte2,
-  Mte3,
-  ScalarControl
-};
 
 /// One physical-resource annotation in the unrolled candidate body.
 struct PipelineResourceUse {

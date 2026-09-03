@@ -296,7 +296,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                 enable_plan_driven_early_publish=metadata["cv_split_enable_plan_driven_early_publish"],
                 schedule_candidate_id=metadata["cv_split_schedule_candidate_id"],
                 enable_pure_prerequisite_hoisting=metadata["cv_split_enable_pure_prerequisite_hoisting"],
-                pure_prerequisite_hoist_budget_bytes=metadata["cv_split_pure_prerequisite_hoist_budget_bytes"])
+                pure_prerequisite_hoist_budget_bytes=metadata["cv_split_pure_prerequisite_hoist_budget_bytes"],
+                enable_cost_model_diagnostics=metadata["cv_split_enable_cost_model_diagnostics"])
 
         if try_dynamic_cv:
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
@@ -1214,6 +1215,9 @@ class NPUOptions:
     # transfer. Disabled by default and bounded by additional live result bytes.
     cv_split_enable_pure_prerequisite_hoisting: bool = False
     cv_split_pure_prerequisite_hoist_budget_bytes: int = 0
+    # Cost-model request diagnostic control. Extract and log typed cost-model inputs
+    # without querying the model, selecting a candidate, or mutating IR.
+    cv_split_enable_cost_model_diagnostics: bool = False
     # Spare UB, in bytes, that cross-scope transfers may spend to stop reusing
     # buffers across unrolled lanes. It funds merging the two CUBE->VECTOR
     # roles onto one union slot per lane, which is what lets HEAD_DIM differ
