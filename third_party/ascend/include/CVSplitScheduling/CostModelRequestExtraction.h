@@ -34,6 +34,7 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include <cstdint>
+#include <string>
 
 namespace mlir::triton::cv_split {
 
@@ -72,6 +73,10 @@ struct CVSplitExtractedCandidateSummary {
   unsigned prefetchLimit = 0;
   llvm::SmallVector<CVSplitExtractedLineageSummary> matrixLineages;
 };
+struct CVSplitUnsupportedVectorOperation {
+  std::string operationName;
+  unsigned occurrenceCount = 0;
+};
 
 /// Owned, read-only compiler facts ready for the v4 primitive estimator.
 struct CVSplitCostModelRequestSet {
@@ -84,6 +89,8 @@ struct CVSplitCostModelRequestSet {
   llvm::SmallVector<CVSplitSynchronizationRequest> synchronizationRequests;
   llvm::SmallVector<CVSplitExtractedCandidateSummary> candidates;
   unsigned unsupportedVectorOperations = 0;
+  llvm::SmallVector<CVSplitUnsupportedVectorOperation>
+      unsupportedVectorOperationClasses;
 };
 
 /// Returns the exact provisional target identity used by the Stage 8 adapter.

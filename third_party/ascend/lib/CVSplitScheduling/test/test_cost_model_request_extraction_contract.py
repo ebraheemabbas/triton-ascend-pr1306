@@ -41,6 +41,7 @@ def test_stage82_owns_array_backing_and_exact_typed_requests() -> None:
             "CVSplitTransferRequest",
             "CVSplitSynchronizationRequest",
             "CVSplitExtractedCandidateSummary",
+            "CVSplitUnsupportedVectorOperation",
             "CVSplitCostModelRequestSet",
             "getRequest() const",
     ):
@@ -116,6 +117,7 @@ def test_stage82_build_and_diagnostics_are_owned() -> None:
             "cost-model-sync",
             "cost-model-candidate",
             "cost-model-lineage",
+            "cost-model-unsupported-vector",
     ):
         assert token in source
 

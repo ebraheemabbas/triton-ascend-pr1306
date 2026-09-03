@@ -388,6 +388,22 @@ extractCandidateSummaries(const CrossCoreScheduleCandidateSet &candidateSet,
     result.candidates.push_back(std::move(summary));
   }
 }
+static void
+recordUnsupportedVectorOperation(Operation *operation,
+                                 CVSplitCostModelRequestSet &result) {
+  std::string operationName = operation->getName().getStringRef().str();
+  auto existing =
+      llvm::find_if(result.unsupportedVectorOperationClasses,
+                    [&](const CVSplitUnsupportedVectorOperation &unsupported) {
+                      return unsupported.operationName == operationName;
+                    });
+  if (existing == result.unsupportedVectorOperationClasses.end())
+    result.unsupportedVectorOperationClasses.push_back(
+        {std::move(operationName), 1});
+  else
+    ++existing->occurrenceCount;
+  ++result.unsupportedVectorOperations;
+}
 
 static LogicalResult extractVectorRegions(Block *body,
                                           const Classification &classification,
@@ -443,7 +459,7 @@ static LogicalResult extractVectorRegions(Block *body,
       std::optional<CVSplitElementType> output =
           getResultElementType(operation);
       if (!operationClass || failed(input) || !output) {
-        ++result.unsupportedVectorOperations;
+        recordUnsupportedVectorOperation(operation, result);
         continue;
       }
 
@@ -673,6 +689,11 @@ void logCostModelRequests(const CVSplitCostModelRequestSet &requests) {
                  << " transfers=" << requests.transferRequests.size()
                  << " syncs=" << requests.synchronizationRequests.size()
                  << " candidates=" << requests.candidates.size() << "\n";
+    for (const CVSplitUnsupportedVectorOperation &unsupported :
+         requests.unsupportedVectorOperationClasses)
+      llvm::dbgs() << "[cv-split] cost-model-unsupported-vector name="
+                   << unsupported.operationName
+                   << " occurrences=" << unsupported.occurrenceCount << "\n";
 
     for (auto [index, cube] : llvm::enumerate(requests.cubeRequests))
       llvm::dbgs() << "[cv-split] cost-model-cube index=" << index
