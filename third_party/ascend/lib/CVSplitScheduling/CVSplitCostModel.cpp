@@ -21,36 +21,13 @@
  */
 
 #include "ascend/include/CVSplitScheduling/CVSplitCostModel.h"
+#include "CVSplitExperimentalPrimitiveCosts.h"
 
 #include "llvm/Support/Error.h"
 
 #include <utility>
 
 namespace mlir::triton::cv_split {
-namespace {
-
-constexpr uint32_t kExperimentalA5ProductId = 9579;
-constexpr uint32_t kExperimentalA5Revision = 0;
-constexpr uint32_t kExperimentalCalibrationSchemaVersion = 1;
-constexpr CVSplitCalibrationId kExperimentalCalibrationId{
-    0xA500000000000801ULL};
-
-static bool sameTarget(CVSplitTargetIdentity lhs, CVSplitTargetIdentity rhs) {
-  return lhs.archFamily == rhs.archFamily && lhs.productId == rhs.productId &&
-         lhs.revision == rhs.revision;
-}
-
-static CVSplitPrimitiveEstimate
-makePrimitiveFailure(CVSplitPrimitiveStatus status,
-                     CVSplitCalibrationId calibrationId) {
-  CVSplitPrimitiveEstimate estimate{};
-  estimate.status = status;
-  estimate.uncertaintyBasisPoints = 10000;
-  estimate.calibrationId = calibrationId;
-  return estimate;
-}
-
-} // namespace
 
 struct CVSplitPrimitiveCostModel::Impl {
   explicit Impl(CVSplitCostModelInfo modelInfo) : info(modelInfo) {}
@@ -60,9 +37,7 @@ struct CVSplitPrimitiveCostModel::Impl {
 
 llvm::Expected<std::unique_ptr<CVSplitPrimitiveCostModel>>
 CVSplitPrimitiveCostModel::createForTarget(CVSplitTargetIdentity target) {
-  if (target.archFamily != CVSplitArchFamily::A5 ||
-      target.productId != kExperimentalA5ProductId ||
-      target.revision != kExperimentalA5Revision) {
+  if (!detail::isExperimentalA5Target(target)) {
     return llvm::createStringError(
         llvm::inconvertibleErrorCode(),
         "unsupported CVSplit cost-model target: arch=%u product=%u "
@@ -71,9 +46,7 @@ CVSplitPrimitiveCostModel::createForTarget(CVSplitTargetIdentity target) {
         target.revision);
   }
 
-  CVSplitCostModelInfo info{kCVSplitCostModelApiVersion,
-                            kExperimentalCalibrationSchemaVersion,
-                            kExperimentalCalibrationId, target};
+  CVSplitCostModelInfo info = detail::getExperimentalA5ModelInfo(target);
   auto implementation = std::make_unique<Impl>(info);
   return std::unique_ptr<CVSplitPrimitiveCostModel>(
       new CVSplitPrimitiveCostModel(std::move(implementation)));
@@ -91,34 +64,26 @@ CVSplitCostModelInfo CVSplitPrimitiveCostModel::getInfo() const {
 
 CVSplitPrimitiveEstimate CVSplitPrimitiveCostModel::estimateCube(
     const CVSplitCubeRequest &request) const {
-  return makePrimitiveFailure(sameTarget(request.target, impl_->info.target)
-                                  ? CVSplitPrimitiveStatus::MissingCalibration
-                                  : CVSplitPrimitiveStatus::TargetUnsupported,
-                              impl_->info.calibrationId);
+  return detail::estimateExperimentalCube(impl_->info.target,
+                                          impl_->info.calibrationId, request);
 }
 
 CVSplitPrimitiveEstimate CVSplitPrimitiveCostModel::estimateVectorRegion(
     const CVSplitVectorRegionRequest &request) const {
-  return makePrimitiveFailure(sameTarget(request.target, impl_->info.target)
-                                  ? CVSplitPrimitiveStatus::MissingCalibration
-                                  : CVSplitPrimitiveStatus::TargetUnsupported,
-                              impl_->info.calibrationId);
+  return detail::estimateExperimentalVectorRegion(
+      impl_->info.target, impl_->info.calibrationId, request);
 }
 
 CVSplitPrimitiveEstimate CVSplitPrimitiveCostModel::estimateTransfer(
     const CVSplitTransferRequest &request) const {
-  return makePrimitiveFailure(sameTarget(request.target, impl_->info.target)
-                                  ? CVSplitPrimitiveStatus::MissingCalibration
-                                  : CVSplitPrimitiveStatus::TargetUnsupported,
-                              impl_->info.calibrationId);
+  return detail::estimateExperimentalTransfer(
+      impl_->info.target, impl_->info.calibrationId, request);
 }
 
 CVSplitPrimitiveEstimate CVSplitPrimitiveCostModel::estimateSynchronization(
     const CVSplitSynchronizationRequest &request) const {
-  return makePrimitiveFailure(sameTarget(request.target, impl_->info.target)
-                                  ? CVSplitPrimitiveStatus::MissingCalibration
-                                  : CVSplitPrimitiveStatus::TargetUnsupported,
-                              impl_->info.calibrationId);
+  return detail::estimateExperimentalSynchronization(
+      impl_->info.target, impl_->info.calibrationId, request);
 }
 
 CVSplitScheduleEstimate CVSplitPrimitiveCostModel::estimateSchedule(

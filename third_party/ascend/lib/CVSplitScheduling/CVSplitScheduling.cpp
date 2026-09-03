@@ -22,6 +22,7 @@
 
 #include "ascend/include/CVSplitScheduling/CVSplitScheduling.h"
 #include "ascend/include/CVSplitScheduling/Attributes.h"
+#include "ascend/include/CVSplitScheduling/CostModelDiagnostics.h"
 #include "ascend/include/CVSplitScheduling/CostModelRequestExtraction.h"
 #include "ascend/include/CVSplitScheduling/CrossCorePipelinePlan.h"
 #include "ascend/include/CVSplitScheduling/CrossCoreResourcePlan.h"
@@ -1168,9 +1169,13 @@ private:
             cv_split::extractCostModelRequests(
                 body, classification, *materializedPlan,
                 *materializedResources, *scheduleCandidateSet);
-        if (succeeded(requests))
+        if (succeeded(requests)) {
           cv_split::logCostModelRequests(*requests);
-        else
+          if (failed(cv_split::logPrimitiveCostEstimates(*requests)))
+            LLVM_DEBUG(llvm::dbgs()
+                       << "[cv-split] cost-model-primitives incomplete; "
+                          "qualified scheduler/emitter remains active\n");
+        } else
           LLVM_DEBUG(llvm::dbgs()
                      << "[cv-split] cost-model-inputs unavailable; qualified "
                         "scheduler/emitter remains active\n");
