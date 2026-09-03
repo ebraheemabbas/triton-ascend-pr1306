@@ -1,6 +1,7 @@
 add_triton_library(CVSplitScheduling
   CVSplitScheduling.cpp
   CVSplitCostModel.cpp
+  CostModelRequestExtraction.cpp
   CrossCoreOwnershipProof.cpp
   CrossCorePipelinePlan.cpp
   CrossCoreScheduleCandidate.cpp

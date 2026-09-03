@@ -63,6 +63,13 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
            "maximum additional static result bytes that Stage 7.1 may keep "
            "live across waits. Zero disables movement; unknown sizes are "
            "rejected rather than estimated.">,
+    Option<"enableCostModelDiagnostics",
+           "enable-cost-model-diagnostics",
+           "bool", /*default*/"false",
+           "extract typed Stage 8 cost-model requests from materialized "
+           "pipeline/resource/candidate facts and emit deterministic debug "
+           "diagnostics. This option does not query the model, select a "
+           "candidate, or mutate IR.">,
     Option<"promoteFullyUnrolled", "promote-fully-unrolled",
            "bool", /*default*/"true",
            "promote the scope loops left by a candidate whose unroll consumed "

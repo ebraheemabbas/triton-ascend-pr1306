@@ -106,11 +106,10 @@ def test_stage81_has_no_mlir_or_kernel_policy_dependency() -> None:
     assert "CVSplitPrimitiveCostModel" not in pass_source
 
 
-def test_stage81_build_owns_only_the_facade_source() -> None:
+def test_stage81_build_owns_the_facade_without_the_schedule_estimator() -> None:
     cmake = read(LIB / "CMakeLists.txt")
     assert "CVSplitCostModel.cpp" in cmake
     assert "CVSplitScheduleEstimator.cpp" not in cmake
-    assert "CostModelRequestExtraction.cpp" not in cmake
 
 
 def test_api_surface_does_not_expose_mutation() -> None:
@@ -124,6 +123,6 @@ if __name__ == "__main__":
     test_v4_core_types_and_queries_are_declared()
     test_skeleton_is_explicitly_unscoreable_and_replaceable()
     test_stage81_has_no_mlir_or_kernel_policy_dependency()
-    test_stage81_build_owns_only_the_facade_source()
+    test_stage81_build_owns_the_facade_without_the_schedule_estimator()
     test_api_surface_does_not_expose_mutation()
     print("Stage 8.1 cost-model API skeleton source contract: PASS")
