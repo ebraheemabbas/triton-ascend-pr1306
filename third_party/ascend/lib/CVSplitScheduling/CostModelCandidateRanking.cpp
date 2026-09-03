@@ -110,9 +110,14 @@ CVSplitCandidateRanking rankCostModelCandidates(
                         pressureCycles))
       return makeFailure(CVSplitCandidateRankingStatus::ArithmeticOverflow,
                          fallbackCandidateId);
+    uint64_t exposedWaitScore;
     uint64_t policyScore;
-    if (!checkedAdd(estimate.steadyStateInitiationIntervalCycles,
-                    pressureCycles, policyScore))
+    if (!checkedCeilDiv(estimate.exposedWaitCycles,
+                        kExperimentalExposedWaitNormalization,
+                        exposedWaitScore) ||
+        !checkedAdd(estimate.steadyStateInitiationIntervalCycles,
+                    pressureCycles, policyScore) ||
+        !checkedAdd(policyScore, exposedWaitScore, policyScore))
       return makeFailure(CVSplitCandidateRankingStatus::ArithmeticOverflow,
                          fallbackCandidateId);
 
@@ -121,6 +126,7 @@ CVSplitCandidateRanking rankCostModelCandidates(
     entry.rawInitiationIntervalCycles =
         estimate.steadyStateInitiationIntervalCycles;
     entry.liveResultPressureCycles = pressureCycles;
+    entry.exposedWaitScoreCycles = exposedWaitScore;
     entry.policyScoreCycles = policyScore;
     entry.uncertaintyBasisPoints = estimate.uncertaintyBasisPoints;
     entry.matrixLineageInFlightLimits = graph.matrixLineageInFlightLimits;

@@ -5,9 +5,9 @@
 // requires a new calibration ID and versioned evidence.
 constexpr uint32_t kExperimentalA5ProductId = 9579;
 constexpr uint32_t kExperimentalA5Revision = 0;
-constexpr uint32_t kExperimentalCalibrationSchemaVersion = 3;
+constexpr uint32_t kExperimentalCalibrationSchemaVersion = 4;
 constexpr CVSplitCalibrationId kExperimentalCalibrationId{
-    0xA500000000000805ULL};
+    0xA500000000000806ULL};
 
 constexpr uint32_t kMaximumCalibratedMatrixDimension = 4096;
 constexpr uint64_t kMaximumCalibratedBytes = 1ULL << 30;

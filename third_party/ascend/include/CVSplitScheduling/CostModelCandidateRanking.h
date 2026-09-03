@@ -24,6 +24,7 @@ struct CVSplitCandidateRankEntry {
   uint32_t candidateId = 0;
   uint64_t rawInitiationIntervalCycles = 0;
   uint64_t liveResultPressureCycles = 0;
+  uint64_t exposedWaitScoreCycles = 0;
   uint64_t policyScoreCycles = 0;
   uint32_t uncertaintyBasisPoints = 0;
   llvm::SmallVector<uint32_t> matrixLineageInFlightLimits;

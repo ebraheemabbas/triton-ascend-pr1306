@@ -14,8 +14,8 @@ def read(path: Path) -> str:
 
 def test_calibration_is_isolated_versioned_and_experimental() -> None:
     calibration = read(LIB / "CVSplitCalibrationA5Experimental.inc")
-    assert "kExperimentalCalibrationSchemaVersion = 3" in calibration
-    assert "0xA500000000000805ULL" in calibration
+    assert "kExperimentalCalibrationSchemaVersion = 4" in calibration
+    assert "0xA500000000000806ULL" in calibration
     assert "kVectorParallelSubBlocks = 2" in calibration
     assert "kExperimentalA5ProductId = 9579" in calibration
     assert "not qualified absolute hardware timings" in calibration

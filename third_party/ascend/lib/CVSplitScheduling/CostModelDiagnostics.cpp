@@ -215,6 +215,7 @@ logCandidateScheduleEstimates(const CVSplitCostModelRequestSet &requests,
                    << entry.candidateId
                    << " raw-ii=" << entry.rawInitiationIntervalCycles
                    << " pressure=" << entry.liveResultPressureCycles
+                   << " wait-score=" << entry.exposedWaitScoreCycles
                    << " score=" << entry.policyScoreCycles
                    << " uncertainty-bp=" << entry.uncertaintyBasisPoints
                    << " lineage-depths=";
