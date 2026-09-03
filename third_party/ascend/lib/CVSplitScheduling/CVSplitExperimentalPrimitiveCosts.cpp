@@ -206,12 +206,10 @@ estimateExperimentalCube(CVSplitTargetIdentity modelTarget,
   if (!sameTarget(modelTarget, request.target))
     return makeFailure(CVSplitPrimitiveStatus::TargetUnsupported,
                        calibrationId);
+  if (request.kind != CVSplitMatrixKind::Matmul || request.transposeLhs ||
+      request.transposeRhs)
+    return makeFailure(CVSplitPrimitiveStatus::OutOfCalibration, calibrationId);
   if (request.m == 0 || request.n == 0 || request.k == 0 ||
-          if (request.kind != CVSplitMatrixKind::Matmul ||
-              request.transposeLhs ||
-              request.transposeRhs) return makeFailure(CVSplitPrimitiveStatus::
-                                                           OutOfCalibration,
-                                                       calibrationId);
       request.m > kMaximumCalibratedMatrixDimension ||
       request.n > kMaximumCalibratedMatrixDimension ||
       request.k > kMaximumCalibratedMatrixDimension || request.lhsBytes == 0 ||
@@ -399,10 +397,10 @@ estimateExperimentalTransfer(CVSplitTargetIdentity modelTarget,
     startup = kTransferCopyStartupCycles;
     rate = kTransferMteBytesPerCycle;
     break;
+  default:
+    return makeFailure(CVSplitPrimitiveStatus::InvalidRequest, calibrationId);
   }
 
-default:
-  return makeFailure(CVSplitPrimitiveStatus::InvalidRequest, calibrationId);
   uint64_t payload, cycles;
   if (!checkedCeilDiv(request.bytes, rate, payload) ||
       !checkedAdd(startup, payload, cycles))
@@ -458,10 +456,10 @@ CVSplitPrimitiveEstimate estimateExperimentalSynchronization(
   case CVSplitSyncKind::LoopSeed:
     cycles = kLoopSeedCycles;
     break;
+  default:
+    return makeFailure(CVSplitPrimitiveStatus::InvalidRequest, calibrationId);
   }
   if ((request.crossCore &&
-           default : return makeFailure(CVSplitPrimitiveStatus::InvalidRequest,
-                                        calibrationId);
        !checkedAdd(cycles, kCrossCoreSyncCycles, cycles)) ||
       (request.loopCarried &&
        !checkedAdd(cycles, kLoopCarriedSyncCycles, cycles)))
