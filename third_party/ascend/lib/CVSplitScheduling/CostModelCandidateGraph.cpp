@@ -239,10 +239,10 @@ CVSplitScheduleEstimateRequest CVSplitOwnedScheduleRequest::getRequest() const {
   return {candidateId, nodes, edges, logicalUnrollFactor, modeledIterations};
 }
 
-FailureOr<llvm::SmallVector<CVSplitOwnedScheduleRequest>>
+FailureOr<llvm::SmallVector<CVSplitOwnedScheduleRequest, 0>>
 buildCostModelCandidateGraphs(const CVSplitCostModelRequestSet &requests,
                               const CVSplitPrimitiveCostModel &model) {
-  llvm::SmallVector<CVSplitOwnedScheduleRequest> graphs;
+  llvm::SmallVector<CVSplitOwnedScheduleRequest, 0> graphs;
   for (const CVSplitExtractedCandidateSummary &candidate :
        requests.candidates) {
     auto graph = buildOneGraph(requests, model, candidate);

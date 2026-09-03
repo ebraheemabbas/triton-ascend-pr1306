@@ -21,7 +21,7 @@ struct CVSplitOwnedScheduleRequest {
   CVSplitScheduleEstimateRequest getRequest() const;
 };
 
-FailureOr<llvm::SmallVector<CVSplitOwnedScheduleRequest>>
+FailureOr<llvm::SmallVector<CVSplitOwnedScheduleRequest, 0>>
 buildCostModelCandidateGraphs(const CVSplitCostModelRequestSet &requests,
                               const CVSplitPrimitiveCostModel &model);
 
