@@ -41,7 +41,12 @@ def test_stage71_uses_transfer_and_ssa_facts_only():
     assert "Value transferredValue" in transfers
     assert "collectSameBlockPredecessors" in cpp
     assert "collectSameBlockDescendants" in cpp
+    assert "futureConsumerSlice" in cpp
+    assert "collectSameBlockPredecessors(firstConsumer" not in cpp
+    assert "futureIndex = chainIndex" in cpp
+    assert "chains[futureIndex]->consumers" in cpp
     assert "isMemoryEffectFree" in cpp
+    assert "closeMovableOperands" in cpp
     assert "EngineType::VECTOR" in cpp
     assert "getStaticScalarOrRankOneBytes" in cpp
     assert "getAdditionalLiveBytes" in cpp
@@ -71,7 +76,6 @@ def test_stage71_rejects_effects_rank2_and_unavailable_operands():
     assert "op->getNumResults() == 0" in cpp
     assert "tensorType.getRank() > 1" in cpp
     assert "!isMemoryEffectFree(op)" in cpp
-    assert "closeMovableOperands" in cpp
     assert "!selected.contains(def)" in cpp
     assert "budget-rejected" in cpp
     assert "budgetBytes == 0" in cpp

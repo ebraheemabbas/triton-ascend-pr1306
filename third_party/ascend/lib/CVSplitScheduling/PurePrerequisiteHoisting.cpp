@@ -98,11 +98,12 @@ static FailureOr<uint64_t> getStaticScalarOrRankOneBytes(Type type) {
 
 static bool
 isMovablePrerequisite(Operation *op, const Classification &classification,
-                      const DenseSet<Operation *> &consumerSlice,
+                      const DenseSet<Operation *> &futureConsumerSlice,
                       const DenseSet<Operation *> &transferredDescendants) {
   auto classIt = classification.find(op);
   if (classIt == classification.end() ||
-      classIt->second != EngineType::VECTOR || !consumerSlice.contains(op) ||
+      classIt->second != EngineType::VECTOR ||
+      !futureConsumerSlice.contains(op) ||
       transferredDescendants.contains(op) || op->getNumRegions() != 0 ||
       op->getNumResults() == 0 || !isMemoryEffectFree(op))
     return false;
@@ -191,7 +192,7 @@ LogicalResult hoistPurePrerequisites(Block *body,
   uint64_t cumulativeLiveBytes = 0;
   unsigned movedOperations = 0;
   unsigned analyzedWaits = 0;
-  for (const CubeToVectorTransferChain *chain : chains) {
+  for (auto [chainIndex, chain] : llvm::enumerate(chains)) {
     Operation *wait = chain->wait;
     Operation *firstConsumer = findFirstConsumer(*chain, body);
     Operation *transferredDef = chain->transferredValue
@@ -203,8 +204,15 @@ LogicalResult hoistPurePrerequisites(Block *body,
       return failure();
     ++analyzedWaits;
 
-    DenseSet<Operation *> consumerSlice;
-    collectSameBlockPredecessors(firstConsumer, body, consumerSlice);
+    // A prerequisite may feed a later guarded consumer rather than the value
+    // consumed immediately after this wait. Include every remaining guarded
+    // consumer, then rely on operand closure below to prove that the selected
+    // operation is already computable at this wait.
+    DenseSet<Operation *> futureConsumerSlice;
+    for (unsigned futureIndex = chainIndex; futureIndex < chains.size();
+         ++futureIndex)
+      for (Operation *consumer : chains[futureIndex]->consumers)
+        collectSameBlockPredecessors(consumer, body, futureConsumerSlice);
     DenseSet<Operation *> transferredDescendants =
         collectSameBlockDescendants(chain->transferredValue, body);
 
@@ -217,8 +225,9 @@ LogicalResult hoistPurePrerequisites(Block *body,
       }
       if (&op == firstConsumer)
         break;
-      if (afterWait && isMovablePrerequisite(&op, classification, consumerSlice,
-                                             transferredDescendants))
+      if (afterWait &&
+          isMovablePrerequisite(&op, classification, futureConsumerSlice,
+                                transferredDescendants))
         selected.insert(&op);
     }
     closeMovableOperands(wait, body, selected);
