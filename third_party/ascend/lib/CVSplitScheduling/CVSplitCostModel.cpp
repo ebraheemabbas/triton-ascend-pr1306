@@ -22,6 +22,7 @@
 
 #include "ascend/include/CVSplitScheduling/CVSplitCostModel.h"
 #include "CVSplitExperimentalPrimitiveCosts.h"
+#include "CVSplitScheduleEstimator.h"
 
 #include "llvm/Support/Error.h"
 
@@ -88,11 +89,8 @@ CVSplitPrimitiveEstimate CVSplitPrimitiveCostModel::estimateSynchronization(
 
 CVSplitScheduleEstimate CVSplitPrimitiveCostModel::estimateSchedule(
     const CVSplitScheduleEstimateRequest &request) const {
-  CVSplitScheduleEstimate estimate{};
-  estimate.candidateId = request.candidateId;
-  estimate.status = CVSplitCandidateStatus::PrimitiveUnscoreable;
-  estimate.uncertaintyBasisPoints = 10000;
-  return estimate;
+  return detail::estimateDeterministicSchedule(impl_->info.calibrationId,
+                                               request);
 }
 
 } // namespace mlir::triton::cv_split

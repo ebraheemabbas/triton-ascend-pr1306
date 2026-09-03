@@ -63,14 +63,12 @@ def test_v4_core_types_and_queries_are_declared() -> None:
     assert "CVSplitPrimitiveCostModel(CVSplitPrimitiveCostModel &&) = delete" in api
 
 
-def test_facade_remains_replaceable_and_schedule_is_unscoreable() -> None:
+def test_facade_remains_replaceable() -> None:
     source = read(LIB / "CVSplitCostModel.cpp")
 
     assert "CVSplitExperimentalPrimitiveCosts.h" in source
     assert "detail::isExperimentalA5Target" in source
     assert "detail::getExperimentalA5ModelInfo" in source
-    assert "CVSplitCandidateStatus::PrimitiveUnscoreable" in source
-    assert "uncertaintyBasisPoints = 10000" in source
     assert "createStringError" in source
     assert "~CVSplitPrimitiveCostModel() = default" in source
 
@@ -104,10 +102,9 @@ def test_stage81_has_no_mlir_or_kernel_policy_dependency() -> None:
     assert "CVSplitPrimitiveCostModel" not in pass_source
 
 
-def test_stage81_build_owns_the_facade_without_the_schedule_estimator() -> None:
+def test_stage81_build_owns_the_facade() -> None:
     cmake = read(LIB / "CMakeLists.txt")
     assert "CVSplitCostModel.cpp" in cmake
-    assert "CVSplitScheduleEstimator.cpp" not in cmake
 
 
 def test_api_surface_does_not_expose_mutation() -> None:
@@ -119,8 +116,8 @@ def test_api_surface_does_not_expose_mutation() -> None:
 if __name__ == "__main__":
     test_principal_resource_has_one_mlir_independent_owner()
     test_v4_core_types_and_queries_are_declared()
-    test_facade_remains_replaceable_and_schedule_is_unscoreable()
+    test_facade_remains_replaceable()
     test_stage81_has_no_mlir_or_kernel_policy_dependency()
-    test_stage81_build_owns_the_facade_without_the_schedule_estimator()
+    test_stage81_build_owns_the_facade()
     test_api_surface_does_not_expose_mutation()
     print("Stage 8.1 cost-model API skeleton source contract: PASS")

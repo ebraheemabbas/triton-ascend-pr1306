@@ -109,7 +109,6 @@ def test_stage83_build_owns_new_sources() -> None:
     cmake = read(LIB / "CMakeLists.txt")
     assert "CVSplitExperimentalPrimitiveCosts.cpp" in cmake
     assert "CostModelDiagnostics.cpp" in cmake
-    assert "CVSplitScheduleEstimator.cpp" not in cmake
 
 
 if __name__ == "__main__":
