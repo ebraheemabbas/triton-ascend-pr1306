@@ -62,6 +62,8 @@ def test_stage82_owns_array_backing_and_exact_typed_requests() -> None:
             "CVSplitSyncKind::OwnershipRelease",
             "CVSplitSyncKind::LoopSeed",
             "PartialVectorCoverage",
+            "op->getResultTypes()",
+            "isa<IndexType>",
     ):
         assert token in source
 

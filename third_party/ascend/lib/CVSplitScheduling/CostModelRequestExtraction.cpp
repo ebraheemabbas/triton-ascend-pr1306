@@ -162,6 +162,10 @@ static std::optional<CVSplitElementType> getResultElementType(Operation *op) {
 
 static bool isBookkeeping(Operation *op) {
   llvm::StringRef name = op->getName().getStringRef();
+  if (op->getNumResults() != 0 &&
+      llvm::all_of(op->getResultTypes(),
+                   [](Type type) { return isa<IndexType>(type); }))
+    return true;
   return name == "arith.constant" || name == "tensor.empty" ||
          name == "tensor.extract" || name == "tensor.extract_slice" ||
          name == "tensor.expand_shape" || name == "tensor.collapse_shape" ||
