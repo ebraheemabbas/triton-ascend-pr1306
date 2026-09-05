@@ -1273,6 +1273,16 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
         sumReduce && alpha && newDenominator)
       break;
   }
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-softmax-match lane=" << lane
+             << " scaled=" << (scaledScore ? "yes" : "no")
+             << " max-reduce=" << (maxReduce ? "yes" : "no")
+             << " maximum=" << (newMaximum ? "yes" : "no")
+             << " probability-exp=" << (probabilityExp ? "yes" : "no")
+             << " sum-reduce=" << (sumReduce ? "yes" : "no")
+             << " alpha=" << (alpha ? "yes" : "no")
+             << " denominator=" << (newDenominator ? "yes" : "no")
+             << "\n");
   if (!scaledScore || !maxReduce || !newMaximum || !probabilityExp ||
       !sumReduce || !alpha || !newDenominator ||
       probabilityProducer != pack.pSrc.getDefiningOp())
@@ -1295,6 +1305,9 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
       else if (mul.getRhs() == alpha.getResult())
         oldDenominator = mul.getLhs();
     }
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-softmax-denominator lane=" << lane
+             << " old=" << (oldDenominator ? "yes" : "no") << "\n");
   if (!oldDenominator)
     return failure();
 
