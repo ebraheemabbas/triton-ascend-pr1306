@@ -866,6 +866,11 @@ outlineStage94VectorRegion(VectorToCubePack &pack, unsigned lane) {
     if (cursor->hasTrait<OpTrait::IsTerminator>() ||
         isa<hivm::SyncBlockWaitOp, hivm::SyncBlockSetOp>(cursor))
       return failure();
+    bool hasShapedResult = llvm::any_of(cursor->getResultTypes(), [](Type type) {
+      return isa<ShapedType>(type);
+    });
+    if (!hasShapedResult)
+      continue;
     operations.push_back(cursor);
     operationSet.insert(cursor);
     containsProbabilityProducer |= cursor == probabilityProducer;
