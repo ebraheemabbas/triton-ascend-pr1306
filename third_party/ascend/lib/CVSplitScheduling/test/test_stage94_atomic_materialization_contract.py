@@ -95,7 +95,13 @@ def test_loop_carried_storage_is_created_before_the_simd_scope() -> None:
     source = read(LIB / "ScopeSeparation.cpp")
     online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
     scope = online.index("builder.create<scope::ScopeOp>")
-    for token in ("maxRowsInit", "sumRowsInit", "scaledRowsInit", "packedRowsInit"):
+    for token in (
+            "maxRowsInit",
+            "sumRowsInit",
+            "scaledRowsInit",
+            "packedRowsInit",
+            "maximumInit",
+    ):
         assert online.index(token) < scope
     assert 'createLoopStorage(builder, maximumType, "stage94.max-rows")' in online
     assert 'createLoopStorage(builder, maximumType, "stage94.sum-rows")' in online
@@ -106,6 +112,7 @@ def test_loop_carried_storage_is_created_before_the_simd_scope() -> None:
             '"stage94.sum-rows"',
             '"stage94.scaled-rows"',
             '"stage94.packed-rows"',
+            '"stage94.maximum"',
     ):
         assert token in online
     loop_storage = online.split("auto createLoopStorage", 1)[1].split("};", 1)[0]
@@ -125,6 +132,17 @@ def test_online_softmax_marks_the_inter_loop_vector_dependency() -> None:
     assert marker in online
     assert online.index("Value maximum =") < online.index(marker)
     assert online.index(marker) < online.index("auto expLoop =")
+
+
+def test_final_maximum_has_an_explicit_destination() -> None:
+    source = read(LIB / "ScopeSeparation.cpp")
+    online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
+    assert 'createLoopStorage(builder, maximumType, "stage94.maximum")' in online
+    assert "b.create<linalg::MapOp>" in online
+    assert "ValueRange{oldMaximum, maxLoop.getResult(0)}, maximumInit" in online
+    assert "nestedBuilder.create<arith::MaximumFOp>" in online
+    assert "nestedBuilder.create<linalg::YieldOp>" in online
+    assert "Value maximum = maximumOp.getResult(0);" in online
 
 
 def test_direct_nz_pack_reshapes_f32_before_truncation() -> None:
@@ -169,6 +187,7 @@ if __name__ == "__main__":
     test_row_reduction_identities_are_materialized_inside_simd_scope()
     test_loop_carried_storage_is_created_before_the_simd_scope()
     test_online_softmax_marks_the_inter_loop_vector_dependency()
+    test_final_maximum_has_an_explicit_destination()
     test_direct_nz_pack_reshapes_f32_before_truncation()
     test_lane_scope_returns_only_maximum_sum_and_packed_probability()
     print("Stage 9.4b/c atomic materialization source contract: PASS")

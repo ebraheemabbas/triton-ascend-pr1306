@@ -1408,6 +1408,8 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
       createLoopStorage(builder, scaledType, "stage94.scaled-rows");
   Value packedRowsInit =
       createLoopStorage(builder, packedType, "stage94.packed-rows");
+  Value maximumInit =
+      createLoopStorage(builder, maximumType, "stage94.maximum");
   SmallVector<Type> scopeResults{maximumType, maximumType, packedType};
   auto simdScope = builder.create<scope::ScopeOp>(loc, scopeResults);
   simdScope.getBodyRegion().emplaceBlock();
@@ -1539,8 +1541,15 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=max-loop-created\n");
 
-  Value maximum =
-      b.create<arith::MaximumFOp>(loc, oldMaximum, maxLoop.getResult(0));
+  auto maximumOp = b.create<linalg::MapOp>(
+      loc, ValueRange{oldMaximum, maxLoop.getResult(0)}, maximumInit,
+      [&](OpBuilder &nestedBuilder, Location nestedLoc,
+          ValueRange regionArgs) {
+        Value elementMaximum = nestedBuilder.create<arith::MaximumFOp>(
+            nestedLoc, regionArgs[0], regionArgs[1]);
+        nestedBuilder.create<linalg::YieldOp>(nestedLoc, elementMaximum);
+      });
+  Value maximum = maximumOp.getResult(0);
   auto syncToken = b.create<arith::ConstantIntOp>(loc, 0, 64);
   auto syncMark = b.create<annotation::MarkOp>(loc, syncToken.getResult());
   syncMark->setAttr("SYNC_IN_VF", StringAttr::get(context, "VST_VLD"));
