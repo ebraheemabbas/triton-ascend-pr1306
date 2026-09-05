@@ -78,9 +78,19 @@ def test_generated_row_loops_handle_empty_scf_bodies() -> None:
     assert "if (!expBody->empty())\n    expBody->back().erase();" in online
 
 
+def test_row_reduction_identities_are_materialized_inside_simd_scope() -> None:
+    source = read(LIB / "ScopeSeparation.cpp")
+    online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
+    assert "createRowReductionInit" in online
+    assert "getDefiningOp<linalg::FillOp>()" in online
+    assert "createRowReductionInit(mb, maxReduce)" in online
+    assert "createRowReductionInit(eb, sumReduce)" in online
+
+
 if __name__ == "__main__":
     test_forced_option_is_default_off_and_atomic()
     test_materializer_outlines_all_probability_regions()
     test_no_textual_or_shape_identity_policy()
     test_generated_row_loops_handle_empty_scf_bodies()
+    test_row_reduction_identities_are_materialized_inside_simd_scope()
     print("Stage 9.4b/c atomic materialization source contract: PASS")

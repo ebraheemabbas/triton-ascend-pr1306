@@ -1362,6 +1362,20 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   auto packedType =
       RankedTensorType::get({n16, rows, kNzTileSize}, pElement);
 
+  auto createRowReductionInit =
+      [&](OpBuilder &rowBuilder,
+          linalg::ReduceOp reduction) -> FailureOr<Value> {
+    auto fill = reduction.getDpsInits()[0].getDefiningOp<linalg::FillOp>();
+    if (!fill || fill.getInputs().size() != 1)
+      return failure();
+    Value empty = rowBuilder.create<tensor::EmptyOp>(
+        loc, rowScalarType.getShape(), rowScalarType.getElementType(),
+        rowScalarType.getEncoding());
+    return rowBuilder
+        .create<linalg::FillOp>(loc, fill.getInputs(), ValueRange{empty})
+        .getResult(0);
+  };
+
   OpBuilder builder(operations.front());
   SmallVector<Type> scopeResults{maximumType, maximumType, packedType,
                                  maximumType};
@@ -1475,15 +1489,15 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   SmallVector<OpFoldResult> scalarOffset{row};
   SmallVector<OpFoldResult> scalarSize{mb.getIndexAttr(1)};
   SmallVector<OpFoldResult> scalarStride{mb.getIndexAttr(1)};
-  Value maxInit = mb.create<tensor::ExtractSliceOp>(
-      loc, rowScalarType, maxReduce.getDpsInits()[0], scalarOffset,
-      scalarSize, scalarStride);
+  FailureOr<Value> maxInit = createRowReductionInit(mb, maxReduce);
+  if (failed(maxInit))
+    return failure();
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-build-progress lane=" << lane
-             << " checkpoint=max-init-extracted\n");
+             << " checkpoint=max-init-materialized\n");
   IRMapping maxMapping;
   maxMapping.map(maxReduce.getDpsInputs()[0], combinedMaximum);
-  maxMapping.map(maxReduce.getDpsInits()[0], maxInit);
+  maxMapping.map(maxReduce.getDpsInits()[0], *maxInit);
   Operation *maxClone = mb.clone(*maxReduce, maxMapping);
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-build-progress lane=" << lane
@@ -1552,12 +1566,12 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
     packedRows = eb.create<tensor::InsertSliceOp>(
         loc, packedChunk, packedRows, offsets, sizes, strides);
   }
-  Value sumInit = eb.create<tensor::ExtractSliceOp>(
-      loc, rowScalarType, sumReduce.getDpsInits()[0],
-      SmallVector<OpFoldResult>{row}, scalarSize, scalarStride);
+  FailureOr<Value> sumInit = createRowReductionInit(eb, sumReduce);
+  if (failed(sumInit))
+    return failure();
   IRMapping sumMapping;
   sumMapping.map(sumReduce.getDpsInputs()[0], sumChunks);
-  sumMapping.map(sumReduce.getDpsInits()[0], sumInit);
+  sumMapping.map(sumReduce.getDpsInits()[0], *sumInit);
   Operation *sumClone = eb.clone(*sumReduce, sumMapping);
   sumClone->getResult(0).setType(rowScalarType);
   Value sumRows = eb.create<tensor::InsertSliceOp>(
