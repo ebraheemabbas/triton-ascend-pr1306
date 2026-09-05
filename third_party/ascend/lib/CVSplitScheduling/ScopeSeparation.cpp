@@ -1083,6 +1083,48 @@ materializeStage94RowwiseRegion(VectorToCubePack &pack, unsigned lane) {
           rowBuilder.create<annotation::MarkOp>(loc, token.getResult());
       mark->setAttr("SYNC_IN_VF", StringAttr::get(context, "VST_VLD"));
     }
+    if (isa<linalg::ReduceOp>(operation) &&
+        operation->getNumOperands() == 2 &&
+        operation->getNumResults() == 1) {
+      Value input = mapping.lookupOrDefault(operation->getOperand(0));
+      Value accumulator =
+          mapping.lookupOrDefault(operation->getOperand(1));
+      auto inputType = dyn_cast<RankedTensorType>(input.getType());
+      constexpr int64_t chunkWidth = 4 * kNzTileSize;
+      if (inputType && inputType.getRank() == 2 &&
+          inputType.getDimSize(0) == 1 &&
+          inputType.getDimSize(1) > chunkWidth &&
+          inputType.getDimSize(1) % chunkWidth == 0) {
+        for (int64_t chunk = 0; chunk < inputType.getDimSize(1);
+             chunk += chunkWidth) {
+          auto chunkType = RankedTensorType::get(
+              {1, chunkWidth}, inputType.getElementType(),
+              inputType.getEncoding());
+          SmallVector<OpFoldResult> offsets{
+              rowBuilder.getIndexAttr(0), rowBuilder.getIndexAttr(chunk)};
+          SmallVector<OpFoldResult> sizes{
+              rowBuilder.getIndexAttr(1),
+              rowBuilder.getIndexAttr(chunkWidth)};
+          SmallVector<OpFoldResult> strides{
+              rowBuilder.getIndexAttr(1), rowBuilder.getIndexAttr(1)};
+          Value slice = rowBuilder
+                            .create<tensor::ExtractSliceOp>(
+                                loc, chunkType, input, offsets, sizes, strides)
+                            .getResult();
+          IRMapping reductionMapping;
+          reductionMapping.map(operation->getOperand(0), slice);
+          reductionMapping.map(operation->getOperand(1), accumulator);
+          Operation *clone = rowBuilder.clone(*operation, reductionMapping);
+          Value reduced = clone->getResult(0);
+          auto originalType =
+              cast<RankedTensorType>(operation->getResult(0).getType());
+          reduced.setType(stage94RowType(originalType, rows));
+          accumulator = reduced;
+        }
+        mapping.map(operation->getResult(0), accumulator);
+        continue;
+      }
+    }
     Operation *clone = rowBuilder.clone(*operation, mapping);
     for (auto [original, cloned] :
          llvm::zip_equal(operation->getResults(), clone->getResults())) {
