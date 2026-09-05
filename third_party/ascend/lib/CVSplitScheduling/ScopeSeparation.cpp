@@ -1409,7 +1409,8 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=max-loop-body-ready\n");
-  maxBody->back().erase();
+  if (!maxBody->empty())
+    maxBody->back().erase();
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=max-loop-default-yield-erased\n");
@@ -1508,7 +1509,8 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
       loc, lower, upper, step,
       ValueRange{emptySum.getResult(), emptyPacked.getResult()});
   Block *expBody = expLoop.getBody();
-  expBody->back().erase();
+  if (!expBody->empty())
+    expBody->back().erase();
   OpBuilder eb = OpBuilder::atBlockEnd(expBody);
   row = expLoop.getInductionVar();
   Value maximumRow = eb.create<tensor::ExtractSliceOp>(

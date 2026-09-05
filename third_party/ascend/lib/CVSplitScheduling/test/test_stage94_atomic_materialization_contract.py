@@ -71,8 +71,16 @@ def test_no_textual_or_shape_identity_policy() -> None:
         assert forbidden not in combined
 
 
+def test_generated_row_loops_handle_empty_scf_bodies() -> None:
+    source = read(LIB / "ScopeSeparation.cpp")
+    online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
+    assert "if (!maxBody->empty())\n    maxBody->back().erase();" in online
+    assert "if (!expBody->empty())\n    expBody->back().erase();" in online
+
+
 if __name__ == "__main__":
     test_forced_option_is_default_off_and_atomic()
     test_materializer_outlines_all_probability_regions()
     test_no_textual_or_shape_identity_policy()
+    test_generated_row_loops_handle_empty_scf_bodies()
     print("Stage 9.4b/c atomic materialization source contract: PASS")
