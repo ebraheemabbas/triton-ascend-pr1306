@@ -83,8 +83,8 @@ def test_row_reduction_identities_are_materialized_inside_simd_scope() -> None:
     online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
     assert "createReductionInit" in online
     assert "getDefiningOp<linalg::FillOp>()" in online
-    assert "createReductionInit(mb, maxReduce, rowScalarType, false)" in online
-    assert "createReductionInit(eb, sumReduce, rowScalarType, false)" in online
+    assert 'createReductionInit(mb, maxReduce, rowScalarType, false, "")' in online
+    assert 'createReductionInit(eb, sumReduce, rowScalarType, false, "")' in online
 
 
 def test_loop_carried_storage_is_created_before_the_simd_scope() -> None:
@@ -100,6 +100,10 @@ def test_loop_carried_storage_is_created_before_the_simd_scope() -> None:
             'mark->setAttr("effects"',
             "memref::MemorySpaceCastOp",
             "bufferization::ToTensorOp",
+            '"stage94.max-rows"',
+            '"stage94.sum-rows"',
+            '"stage94.scaled-rows"',
+            '"stage94.packed-rows"',
     ):
         assert token in online
 
