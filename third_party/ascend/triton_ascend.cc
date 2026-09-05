@@ -151,7 +151,8 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
          bool enablePlanDrivenEarlyPublish, int scheduleCandidateId,
          bool enablePurePrerequisiteHoisting,
          int64_t purePrerequisiteHoistBudgetBytes,
-         bool enableCostModelDiagnostics) {
+         bool enableCostModelDiagnostics,
+         bool enableStage9SchedulePlanDiagnostics) {
         CVSplitSchedulingOptions opts;
         opts.compileOn91095 = compileOn91095;
         opts.unrollFactor = unrollFactor;
@@ -161,6 +162,8 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
         opts.purePrerequisiteHoistBudgetBytes =
             purePrerequisiteHoistBudgetBytes;
         opts.enableCostModelDiagnostics = enableCostModelDiagnostics;
+        opts.enableStage9SchedulePlanDiagnostics =
+            enableStage9SchedulePlanDiagnostics;
         opts.promoteFullyUnrolled = promoteFullyUnrolled;
         opts.privateBufferUbBudgetBytes = privateBufferUbBudgetBytes;
         opts.promotePrivateBufferPools = promotePrivateBufferPools;
@@ -180,7 +183,8 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       py::arg("schedule_candidate_id") = -1,
       py::arg("enable_pure_prerequisite_hoisting") = false,
       py::arg("pure_prerequisite_hoist_budget_bytes") = 0,
-      py::arg("enable_cost_model_diagnostics") = false);
+      py::arg("enable_cost_model_diagnostics") = false,
+      py::arg("enable_stage9_schedule_plan_diagnostics") = false);
 
   m.def(
       "add_graph_optimize",

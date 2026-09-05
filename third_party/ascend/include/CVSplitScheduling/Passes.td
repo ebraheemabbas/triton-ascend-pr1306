@@ -70,6 +70,13 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
            "pipeline/resource/candidate facts and emit deterministic debug "
            "diagnostics. This option does not query the model, select a "
            "candidate, or mutate IR.">,
+    Option<"enableStage9SchedulePlanDiagnostics",
+           "enable-stage9-schedule-plan-diagnostics",
+           "bool", /*default*/"false",
+           "build and verify the parameterized Stage 9 post-CVSplit schedule "
+           "plan from typed materialized facts. Requires cost-model request "
+           "extraction, emits diagnostics only, and never mutates IR or emits "
+           "the backend-preservation attribute.">,
     Option<"promoteFullyUnrolled", "promote-fully-unrolled",
            "bool", /*default*/"true",
            "promote the scope loops left by a candidate whose unroll consumed "

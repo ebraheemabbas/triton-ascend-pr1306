@@ -31,6 +31,7 @@
 #include "ascend/include/CVSplitScheduling/DependencyScheduler.h"
 #include "ascend/include/CVSplitScheduling/PreCheck.h"
 #include "ascend/include/CVSplitScheduling/PurePrerequisiteHoisting.h"
+#include "ascend/include/CVSplitScheduling/PostCVSplitSchedulePlan.h"
 #include "ascend/include/CVSplitScheduling/ScopeSeparation.h"
 #include "ascend/include/CVSplitScheduling/SoftmaxRegroup.h"
 #include "ascend/include/CVSplitScheduling/UnfusePVMatmuls.h"
@@ -757,6 +758,8 @@ public:
     this->purePrerequisiteHoistBudgetBytes =
         options.purePrerequisiteHoistBudgetBytes;
     this->enableCostModelDiagnostics = options.enableCostModelDiagnostics;
+    this->enableStage9SchedulePlanDiagnostics =
+        options.enableStage9SchedulePlanDiagnostics;
     this->promoteFullyUnrolled = options.promoteFullyUnrolled;
     this->pipelineDistance = options.pipelineDistance;
     this->privateBufferUbBudgetBytes = options.privateBufferUbBudgetBytes;
@@ -1183,12 +1186,23 @@ private:
             LLVM_DEBUG(llvm::dbgs()
                        << "[cv-split] cost-model-schedules incomplete; "
                           "qualified scheduler/emitter remains active\n");
+          if (enableStage9SchedulePlanDiagnostics) {
+            cv_split::PostCVSplitSchedulePlan stage9Plan =
+                cv_split::buildPostCVSplitSchedulePlan(
+                    *requests, *materializedResources, *resourceLimits);
+            cv_split::logPostCVSplitSchedulePlan(stage9Plan);
+          }
         } else
           LLVM_DEBUG(llvm::dbgs()
                      << "[cv-split] cost-model-inputs unavailable; qualified "
                         "scheduler/emitter remains active\n");
       }
     }
+
+    if (enableStage9SchedulePlanDiagnostics && !enableCostModelDiagnostics)
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[cv-split] stage9-plan unavailable reason="
+                    "cost-input-diagnostics-disabled mutation=no\n");
 
     // Stage 8: Insert cross-scope transfers (BEFORE scope separation)
     LLVM_DEBUG(llvm::dbgs()
