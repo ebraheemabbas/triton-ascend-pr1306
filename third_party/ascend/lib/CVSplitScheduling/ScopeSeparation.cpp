@@ -24,6 +24,7 @@
 #include "ascend/include/CVSplitScheduling/HardwareConstants.h"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
+#include "bishengir/Dialect/HFusion/IR/HFusion.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/Scope/IR/Scope.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -1541,14 +1542,12 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=max-loop-created\n");
 
-  auto maximumOp = b.create<linalg::MapOp>(
-      loc, ValueRange{oldMaximum, maxLoop.getResult(0)}, maximumInit,
-      [&](OpBuilder &nestedBuilder, Location nestedLoc,
-          ValueRange regionArgs) {
-        Value elementMaximum = nestedBuilder.create<arith::MaximumFOp>(
-            nestedLoc, regionArgs[0], regionArgs[1]);
-        nestedBuilder.create<linalg::YieldOp>(nestedLoc, elementMaximum);
-      });
+  auto maximumFunction = b.getAttr<hfusion::BinaryFnAttr>(
+      hfusion::BinaryFn::maxf);
+  auto maximumOp = b.create<hfusion::ElemwiseBinaryOp>(
+      loc, ValueRange{oldMaximum, maxLoop.getResult(0)},
+      ValueRange{maximumInit},
+      ArrayRef<NamedAttribute>{b.getNamedAttr("fun", maximumFunction)});
   Value maximum = maximumOp->getResult(0);
   auto syncToken = b.create<arith::ConstantIntOp>(loc, 0, 64);
   auto syncMark = b.create<annotation::MarkOp>(loc, syncToken.getResult());

@@ -138,10 +138,11 @@ def test_final_maximum_has_an_explicit_destination() -> None:
     source = read(LIB / "ScopeSeparation.cpp")
     online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
     assert 'createLoopStorage(builder, maximumType, "stage94.maximum")' in online
-    assert "b.create<linalg::MapOp>" in online
-    assert "ValueRange{oldMaximum, maxLoop.getResult(0)}, maximumInit" in online
-    assert "nestedBuilder.create<arith::MaximumFOp>" in online
-    assert "nestedBuilder.create<linalg::YieldOp>" in online
+    assert "hfusion::BinaryFn::maxf" in online
+    assert "b.create<hfusion::ElemwiseBinaryOp>" in online
+    assert "ValueRange{oldMaximum, maxLoop.getResult(0)}" in online
+    assert "ValueRange{maximumInit}" in online
+    assert 'b.getNamedAttr("fun", maximumFunction)' in online
     assert "Value maximum = maximumOp->getResult(0);" in online
 
 
