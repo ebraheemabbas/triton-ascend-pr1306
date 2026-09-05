@@ -1371,6 +1371,9 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   simdScope->setAttr("outline", BoolAttr::get(context, true));
   simdScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
   setOpEngineTypeAttr(simdScope, EngineType::VECTOR);
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-build-progress lane=" << lane
+             << " checkpoint=scope-created\n");
   Block *scopeBlock = &simdScope.getBodyRegion().front();
   OpBuilder b = OpBuilder::atBlockEnd(scopeBlock);
 
@@ -1438,6 +1441,9 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
       loc, maxClone->getResult(0), maxLoop.getRegionIterArgs()[0],
       scalarOffset, scalarSize, scalarStride);
   mb.create<scf::YieldOp>(loc, ValueRange{maxRows, scaledRows});
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-build-progress lane=" << lane
+             << " checkpoint=max-loop-created\n");
 
   Value maximum =
       b.create<arith::MaximumFOp>(loc, oldMaximum, maxLoop.getResult(0));
@@ -1502,6 +1508,9 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
       loc, sumClone->getResult(0), expLoop.getRegionIterArgs()[0],
       SmallVector<OpFoldResult>{row}, scalarSize, scalarStride);
   eb.create<scf::YieldOp>(loc, ValueRange{sumRows, packedRows});
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-build-progress lane=" << lane
+             << " checkpoint=exp-pack-loop-created\n");
 
   Value alphaValue = b.create<math::ExpOp>(
       loc, b.create<arith::SubFOp>(loc, oldMaximum, maximum));
@@ -1510,6 +1519,9 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
       expLoop.getResult(0));
   b.create<scope::ReturnOp>(
       loc, ValueRange{maximum, denominator, expLoop.getResult(1), alphaValue});
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-build-progress lane=" << lane
+             << " checkpoint=scope-return-created\n");
 
   SmallVector<std::pair<Value, Value>> replacements{
       {newMaximum.getResult(), simdScope->getResult(0)},
