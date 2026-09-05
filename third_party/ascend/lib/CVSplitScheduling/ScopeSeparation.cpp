@@ -1389,8 +1389,7 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   };
   auto createReductionInit =
       [&](OpBuilder &initBuilder, linalg::ReduceOp reduction,
-          RankedTensorType initType, bool ubBacked,
-          StringRef storageRole) -> FailureOr<Value> {
+          RankedTensorType initType) -> FailureOr<Value> {
     auto fill = reduction.getDpsInits()[0].getDefiningOp<linalg::FillOp>();
     if (!fill || fill.getInputs().size() != 1)
       return failure();
@@ -1402,30 +1401,21 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
         return failure();
       fillInput = initBuilder.clone(*definition)->getResult(0);
     }
-    Value empty;
-    if (ubBacked) {
-      empty = createUbBackedTensor(initBuilder, initType, storageRole);
-    } else {
-      empty = initBuilder
-                  .create<tensor::EmptyOp>(
-                      loc, initType.getShape(), initType.getElementType(),
-                      initType.getEncoding())
-                  .getResult();
-    }
+    Value empty = initBuilder
+                      .create<tensor::EmptyOp>(
+                          loc, initType.getShape(), initType.getElementType(),
+                          initType.getEncoding())
+                      .getResult();
     return initBuilder
         .create<linalg::FillOp>(loc, ValueRange{fillInput}, ValueRange{empty})
         .getResult(0);
   };
 
   OpBuilder builder(insertionAnchor);
-  FailureOr<Value> maxRowsInit =
-      createReductionInit(builder, maxReduce, maximumType, true,
-                          "stage94.max-rows");
-  FailureOr<Value> sumRowsInit =
-      createReductionInit(builder, sumReduce, maximumType, true,
-                          "stage94.sum-rows");
-  if (failed(maxRowsInit) || failed(sumRowsInit))
-    return failure();
+  Value maxRowsInit =
+      createUbBackedTensor(builder, maximumType, "stage94.max-rows");
+  Value sumRowsInit =
+      createUbBackedTensor(builder, maximumType, "stage94.sum-rows");
   Value scaledRowsInit =
       createUbBackedTensor(builder, scaledType, "stage94.scaled-rows");
   Value packedRowsInit =
@@ -1461,7 +1451,7 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
              << " checkpoint=max-loop-create-begin\n");
   auto maxLoop = b.create<scf::ForOp>(
       loc, lower, upper, step,
-      ValueRange{*maxRowsInit, scaledRowsInit});
+      ValueRange{maxRowsInit, scaledRowsInit});
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=max-loop-create-end\n");
@@ -1535,8 +1525,7 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   SmallVector<OpFoldResult> scalarOffset{row};
   SmallVector<OpFoldResult> scalarSize{mb.getIndexAttr(1)};
   SmallVector<OpFoldResult> scalarStride{mb.getIndexAttr(1)};
-  FailureOr<Value> maxInit =
-      createReductionInit(mb, maxReduce, rowScalarType, false, "");
+  FailureOr<Value> maxInit = createReductionInit(mb, maxReduce, rowScalarType);
   if (failed(maxInit))
     return failure();
   LLVM_DEBUG(llvm::dbgs()
@@ -1568,7 +1557,7 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   syncMark->setAttr("SYNC_IN_VF", StringAttr::get(context, "VST_VLD"));
   auto expLoop = b.create<scf::ForOp>(
       loc, lower, upper, step,
-      ValueRange{*sumRowsInit, packedRowsInit});
+      ValueRange{sumRowsInit, packedRowsInit});
   Block *expBody = expLoop.getBody();
   if (!expBody->empty())
     expBody->back().erase();
@@ -1613,8 +1602,7 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
     packedRows = eb.create<tensor::InsertSliceOp>(
         loc, packedChunk, packedRows, offsets, sizes, strides);
   }
-  FailureOr<Value> sumInit =
-      createReductionInit(eb, sumReduce, rowScalarType, false, "");
+  FailureOr<Value> sumInit = createReductionInit(eb, sumReduce, rowScalarType);
   if (failed(sumInit))
     return failure();
   IRMapping sumMapping;
