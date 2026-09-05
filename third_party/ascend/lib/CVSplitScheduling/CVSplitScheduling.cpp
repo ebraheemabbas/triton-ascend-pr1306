@@ -902,8 +902,14 @@ private:
     bool transformedAnyCandidate = false;
     for (CandidateState &candidate : candidates) {
       FunctionBackup &state = *candidate.functionBackup;
-      if (failed(processFunction(state.function, candidate.loop)) ||
-          failed(verify(state.function))) {
+      LogicalResult processResult =
+          processFunction(state.function, candidate.loop);
+      LLVM_DEBUG(if (succeeded(processResult) && enableStage94AtomicRewrite) {
+        llvm::dbgs() << "[cv-split] stage94-preverify-ir-begin\n";
+        state.function.print(llvm::dbgs());
+        llvm::dbgs() << "\n[cv-split] stage94-preverify-ir-end\n";
+      });
+      if (failed(processResult) || failed(verify(state.function))) {
         LLVM_DEBUG(llvm::dbgs()
                    << "[cv-split] Candidate failed; restoring function and "
                       "trying next function\n");
