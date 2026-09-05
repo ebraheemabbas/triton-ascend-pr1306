@@ -1391,6 +1391,9 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   maxBody->back().erase();
   OpBuilder mb = OpBuilder::atBlockEnd(maxBody);
   Value row = maxLoop.getInductionVar();
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-build-progress lane=" << lane
+             << " checkpoint=max-loop-shell-created\n");
 
   auto extractRowChunk = [&](OpBuilder &rb, Value tensorValue, int64_t chunk,
                              Type elementType) {
@@ -1417,14 +1420,32 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   Value combinedMaximum;
   for (int64_t chunk = 0; chunk < width; chunk += chunkWidth) {
     Value scoreChunk = extractRowChunk(mb, score, chunk, f32);
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split] stage94-build-progress lane=" << lane
+               << " checkpoint=max-score-chunk-extracted chunk=" << chunk
+               << "\n");
     Value scaleChunk = extractRowChunk(mb, scale, chunk, f32);
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split] stage94-build-progress lane=" << lane
+               << " checkpoint=max-scale-chunk-extracted chunk=" << chunk
+               << "\n");
     Value scaled = mb.create<arith::MulFOp>(loc, scoreChunk, scaleChunk);
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split] stage94-build-progress lane=" << lane
+               << " checkpoint=max-chunk-scaled chunk=" << chunk << "\n");
     scaledRows = insertRowChunk(mb, scaled, scaledRows, chunk);
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split] stage94-build-progress lane=" << lane
+               << " checkpoint=max-scaled-chunk-inserted chunk=" << chunk
+               << "\n");
     combinedMaximum = combinedMaximum
                           ? mb.create<arith::MaximumFOp>(loc, combinedMaximum,
                                                         scaled)
                                 .getResult()
                           : scaled;
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split] stage94-build-progress lane=" << lane
+               << " checkpoint=max-chunks-combined chunk=" << chunk << "\n");
   }
   SmallVector<OpFoldResult> scalarOffset{row};
   SmallVector<OpFoldResult> scalarSize{mb.getIndexAttr(1)};
@@ -1432,14 +1453,23 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   Value maxInit = mb.create<tensor::ExtractSliceOp>(
       loc, rowScalarType, maxReduce.getDpsInits()[0], scalarOffset,
       scalarSize, scalarStride);
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-build-progress lane=" << lane
+             << " checkpoint=max-init-extracted\n");
   IRMapping maxMapping;
   maxMapping.map(maxReduce.getDpsInputs()[0], combinedMaximum);
   maxMapping.map(maxReduce.getDpsInits()[0], maxInit);
   Operation *maxClone = mb.clone(*maxReduce, maxMapping);
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-build-progress lane=" << lane
+             << " checkpoint=max-reduce-cloned\n");
   maxClone->getResult(0).setType(rowScalarType);
   Value maxRows = mb.create<tensor::InsertSliceOp>(
       loc, maxClone->getResult(0), maxLoop.getRegionIterArgs()[0],
       scalarOffset, scalarSize, scalarStride);
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-build-progress lane=" << lane
+             << " checkpoint=max-result-inserted\n");
   mb.create<scf::YieldOp>(loc, ValueRange{maxRows, scaledRows});
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-build-progress lane=" << lane
