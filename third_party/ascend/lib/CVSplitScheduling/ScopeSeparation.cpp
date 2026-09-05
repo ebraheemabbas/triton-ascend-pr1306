@@ -1402,8 +1402,9 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
       scalarStride);
   auto broadcastInit =
       eb.create<tensor::EmptyOp>(loc, rowVectorType.getShape(), f32);
-  Value maximumBroadcast = eb.create<linalg::BroadcastOp>(
+  auto maximumBroadcastOp = eb.create<linalg::BroadcastOp>(
       loc, maximumRow, broadcastInit, ArrayRef<int64_t>{1});
+  Value maximumBroadcast = maximumBroadcastOp->getResult(0);
   Value sumChunks;
   Value packedRows = expLoop.getRegionIterArgs()[1];
   for (int64_t chunk = 0; chunk < width; chunk += chunkWidth) {
