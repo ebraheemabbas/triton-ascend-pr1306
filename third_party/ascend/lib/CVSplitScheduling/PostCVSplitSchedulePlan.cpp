@@ -53,9 +53,16 @@ static bool sameCubeRequest(const CVSplitCubeRequest &lhs,
          lhs.accumulatorType == rhs.accumulatorType &&
          lhs.lhsLayout == rhs.lhsLayout && lhs.rhsLayout == rhs.rhsLayout &&
          lhs.outputLayout == rhs.outputLayout &&
+         lhs.transposeLhs == rhs.transposeLhs &&
+         lhs.transposeRhs == rhs.transposeRhs &&
          lhs.lhsBytes == rhs.lhsBytes && lhs.rhsBytes == rhs.rhsBytes &&
          lhs.resultBytes == rhs.resultBytes && lhs.lhsPath == rhs.lhsPath &&
-         lhs.rhsPath == rhs.rhsPath;
+         lhs.rhsPath == rhs.rhsPath && lhs.drainKind == rhs.drainKind;
+}
+
+static bool pathStartsInUb(CVSplitMemoryPath path) {
+  return path == CVSplitMemoryPath::UBToL1ToL0A ||
+         path == CVSplitMemoryPath::UBToL1ToL0B;
 }
 
 static bool sameTransferRequest(const CVSplitTransferRequest &lhs,
@@ -209,28 +216,53 @@ PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
         return plan;
       }
     }
-  for (unsigned lineage = 0; lineage < 2; ++lineage)
-    for (unsigned lane = 1; lane < lanes; ++lane)
-      if (!sameCubeRequest(requests.cubeRequests[lineage * lanes],
-                           requests.cubeRequests[lineage * lanes + lane])) {
-        plan.status = PostCVSplitSchedulePlanStatus::UnsupportedRecurrence;
-        return plan;
-      }
 
-  const CVSplitCubeRequest &scoreCube = requests.cubeRequests.front();
-  const CVSplitCubeRequest &productCube = requests.cubeRequests[lanes];
+  llvm::SmallVector<std::pair<const CVSplitCubeRequest *, unsigned>, 2>
+      cubeLineages;
+  for (const CVSplitCubeRequest &request : requests.cubeRequests) {
+    auto lineage = llvm::find_if(cubeLineages, [&](const auto &candidate) {
+      return sameCubeRequest(*candidate.first, request);
+    });
+    if (lineage == cubeLineages.end())
+      cubeLineages.push_back({&request, 1});
+    else
+      ++lineage->second;
+  }
+  if (cubeLineages.size() != 2 ||
+      llvm::any_of(cubeLineages,
+                   [&](const auto &lineage) { return lineage.second != lanes; })) {
+    plan.status = PostCVSplitSchedulePlanStatus::UnsupportedRecurrence;
+    return plan;
+  }
+  const CVSplitCubeRequest *scoreCube = nullptr;
+  const CVSplitCubeRequest *productCube = nullptr;
+  for (const auto &lineage : cubeLineages) {
+    const bool consumesUb = pathStartsInUb(lineage.first->lhsPath) ||
+                            pathStartsInUb(lineage.first->rhsPath);
+    const CVSplitCubeRequest **role = consumesUb ? &productCube : &scoreCube;
+    if (*role) {
+      plan.status = PostCVSplitSchedulePlanStatus::UnsupportedRecurrence;
+      return plan;
+    }
+    *role = lineage.first;
+  }
+  if (!scoreCube || !productCube) {
+    plan.status = PostCVSplitSchedulePlanStatus::UnsupportedRecurrence;
+    return plan;
+  }
+
   const CVSplitTransferRequest &scoreTransfer = requests.transferRequests[0];
   const CVSplitTransferRequest &probabilityTransfer =
       requests.transferRequests[1];
   const CVSplitTransferRequest &productTransfer = requests.transferRequests[2];
-  if (scoreCube.kind != CVSplitMatrixKind::Matmul ||
-      productCube.kind != CVSplitMatrixKind::Matmul ||
-      !isFloatingInput(scoreCube.lhsType) ||
-      !isFloatingInput(scoreCube.rhsType) ||
-      !isFloatingInput(productCube.lhsType) ||
-      !isFloatingInput(productCube.rhsType) ||
-      scoreCube.accumulatorType != CVSplitElementType::F32 ||
-      productCube.accumulatorType != CVSplitElementType::F32 ||
+  if (scoreCube->kind != CVSplitMatrixKind::Matmul ||
+      productCube->kind != CVSplitMatrixKind::Matmul ||
+      !isFloatingInput(scoreCube->lhsType) ||
+      !isFloatingInput(scoreCube->rhsType) ||
+      !isFloatingInput(productCube->lhsType) ||
+      !isFloatingInput(productCube->rhsType) ||
+      scoreCube->accumulatorType != CVSplitElementType::F32 ||
+      productCube->accumulatorType != CVSplitElementType::F32 ||
       scoreTransfer.source != CVSplitMemorySpace::L0C ||
       scoreTransfer.destination != CVSplitMemorySpace::UB ||
       productTransfer.source != CVSplitMemorySpace::L0C ||
@@ -264,7 +296,7 @@ PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
   plan.recurrence.transferLineageCount = expectedKinds.size();
   plan.recurrence.vectorRows = scoreTransfer.rows;
   plan.recurrence.scoreWidth = scoreTransfer.columns;
-  plan.recurrence.headDimension = productCube.n;
+  plan.recurrence.headDimension = productCube->n;
   plan.recurrence.hasMaximum = has(CVSplitVectorOpClass::Maximum);
   plan.recurrence.hasRowReduceMax = has(CVSplitVectorOpClass::RowReduceMax);
   plan.recurrence.hasExp = has(CVSplitVectorOpClass::Exp);
@@ -279,14 +311,14 @@ PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
       !plan.recurrence.hasRowReduceMax || !plan.recurrence.hasExp ||
       !plan.recurrence.hasRowReduceSum ||
       !plan.recurrence.hasNormalizationArithmetic ||
-      !plan.recurrence.hasCast || !plan.recurrence.hasPermute) {
+      !plan.recurrence.hasCast) {
     plan.status = PostCVSplitSchedulePlanStatus::UnsupportedRecurrence;
     return plan;
   }
 
   if (scoreTransfer.rows == 0 || scoreTransfer.columns == 0 ||
       scoreTransfer.columns % kStage9VectorChunkElements != 0 ||
-      productCube.n == 0 || productTransfer.columns != productCube.n) {
+      productCube->n == 0 || productTransfer.columns != productCube->n) {
     plan.status = PostCVSplitSchedulePlanStatus::UnsupportedGeometry;
     return plan;
   }

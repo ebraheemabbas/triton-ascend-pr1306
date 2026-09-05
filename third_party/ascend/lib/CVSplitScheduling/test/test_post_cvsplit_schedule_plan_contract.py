@@ -69,10 +69,18 @@ def test_plan_is_parameterized_verified_and_analysis_only() -> None:
             "checkedMul",
             "verifyPlan",
             "activeValues.size() > 1",
+            "pathStartsInUb",
+            "cubeLineages.size() != 2",
             "PostCVSplitSchedulePlanStatus::FlagOverflow",
             "PostCVSplitSchedulePlanStatus::MemoryBudgetExceeded",
     ):
         assert token in source
+    recurrence_gate = source.split("if (!reductionGeometryFound", 1)[1]
+    recurrence_gate = recurrence_gate.split(") {", 1)[0]
+    assert "!plan.recurrence.hasPermute" not in recurrence_gate
+    assert "probabilityTransfer.destinationLayout != CVSplitLayout::NZ" in source
+    assert "for (const CVSplitCubeRequest &request : requests.cubeRequests)" in source
+    assert "lineage * lanes" not in source
     lowered = source.lower()
     for forbidden in (
             "_attn_fwd",
