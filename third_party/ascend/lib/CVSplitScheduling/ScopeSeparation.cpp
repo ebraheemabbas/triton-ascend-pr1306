@@ -1231,11 +1231,12 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   linalg::ReduceOp sumReduce;
   math::ExpOp alpha;
   arith::AddFOp newDenominator;
-  for (Operation *cursor = precedingWait->getNextNode();
-       cursor && cursor != anchor; cursor = cursor->getNextNode()) {
-    if (cursor->hasTrait<OpTrait::IsTerminator>() ||
-        isa<hivm::SyncBlockWaitOp, hivm::SyncBlockSetOp>(cursor))
-      return failure();
+  for (Operation *cursor = precedingWait->getNextNode(); cursor;
+       cursor = cursor->getNextNode()) {
+    if (cursor->hasTrait<OpTrait::IsTerminator>())
+      break;
+    if (isa<hivm::SyncBlockWaitOp, hivm::SyncBlockSetOp>(cursor))
+      continue;
     bool hasRowTensorResult = llvm::any_of(
         cursor->getResultTypes(), [&](Type type) {
           auto tensor = dyn_cast<RankedTensorType>(type);
@@ -1343,6 +1344,9 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   for (Operation &operation : *anchor->getBlock())
     if (operationSet.contains(&operation))
       operations.push_back(&operation);
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-softmax-closure lane=" << lane
+             << " operations=" << operations.size() << "\n");
   if (operations.empty())
     return failure();
 
