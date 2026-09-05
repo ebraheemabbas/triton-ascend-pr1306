@@ -31,6 +31,9 @@
 #include "ascend/include/CVSplitScheduling/DependencyScheduler.h"
 #include "ascend/include/CVSplitScheduling/PreCheck.h"
 #include "ascend/include/CVSplitScheduling/PurePrerequisiteHoisting.h"
+#include "ascend/include/CVSplitScheduling/PostCVSplitDetachedSchedule.h"
+#include "ascend/include/CVSplitScheduling/PostCVSplitScheduleBinding.h"
+#include "ascend/include/CVSplitScheduling/PostCVSplitSchedulePlan.h"
 #include "ascend/include/CVSplitScheduling/ScopeSeparation.h"
 #include "ascend/include/CVSplitScheduling/SoftmaxRegroup.h"
 #include "ascend/include/CVSplitScheduling/UnfusePVMatmuls.h"
@@ -757,6 +760,12 @@ public:
     this->purePrerequisiteHoistBudgetBytes =
         options.purePrerequisiteHoistBudgetBytes;
     this->enableCostModelDiagnostics = options.enableCostModelDiagnostics;
+    this->enablePostSplitPlanDiagnostics =
+        options.enablePostSplitPlanDiagnostics;
+    this->enableDetachedScheduleDiagnostics =
+        options.enableDetachedScheduleDiagnostics;
+    this->enableScheduleBindingDiagnostics =
+        options.enableScheduleBindingDiagnostics;
     this->promoteFullyUnrolled = options.promoteFullyUnrolled;
     this->pipelineDistance = options.pipelineDistance;
     this->privateBufferUbBudgetBytes = options.privateBufferUbBudgetBytes;
@@ -1183,12 +1192,52 @@ private:
             LLVM_DEBUG(llvm::dbgs()
                        << "[cv-split] cost-model-schedules incomplete; "
                           "qualified scheduler/emitter remains active\n");
+          if (enablePostSplitPlanDiagnostics ||
+              enableDetachedScheduleDiagnostics ||
+              enableScheduleBindingDiagnostics) {
+            cv_split::PostCVSplitSchedulePlan postSplitPlan =
+                cv_split::buildPostCVSplitSchedulePlan(
+                    *requests, *materializedResources, *resourceLimits);
+            if (enablePostSplitPlanDiagnostics)
+              cv_split::logPostCVSplitSchedulePlan(postSplitPlan);
+            if (enableDetachedScheduleDiagnostics ||
+                enableScheduleBindingDiagnostics) {
+              cv_split::PostCVSplitDetachedSchedule detachedSchedule =
+                  cv_split::buildPostCVSplitDetachedSchedule(postSplitPlan);
+              if (enableDetachedScheduleDiagnostics)
+                cv_split::logPostCVSplitDetachedSchedule(detachedSchedule);
+              if (enableScheduleBindingDiagnostics) {
+                cv_split::PostCVSplitScheduleBinding binding =
+                    cv_split::bindPostCVSplitScheduleAnchors(
+                        body, classification, *materializedPlan,
+                        detachedSchedule);
+                cv_split::logPostCVSplitScheduleBinding(binding);
+              }
+            }
+          }
         } else
           LLVM_DEBUG(llvm::dbgs()
                      << "[cv-split] cost-model-inputs unavailable; qualified "
                         "scheduler/emitter remains active\n");
       }
     }
+
+    if (enablePostSplitPlanDiagnostics && !enableCostModelDiagnostics)
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[cv-split] post-split-plan unavailable reason="
+                    "cost-input-diagnostics-disabled mutation=no\n");
+    if (enableDetachedScheduleDiagnostics &&
+        !enableCostModelDiagnostics)
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[cv-split] detached-schedule unavailable reason="
+                    "cost-input-diagnostics-disabled publication=no "
+                    "mutation=no\n");
+    if (enableScheduleBindingDiagnostics &&
+        !enableCostModelDiagnostics)
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[cv-split] schedule-binding unavailable reason="
+                    "cost-input-diagnostics-disabled publication=no "
+                    "mutation=no\n");
 
     // Transfer-materialization phase (before scope separation)
     LLVM_DEBUG(llvm::dbgs()

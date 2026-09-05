@@ -31,6 +31,12 @@ namespace mlir::triton::cv_split {
 inline constexpr char kAppliedAttr[] =
     "triton_ascend.cv_split_scheduling.applied";
 
+/// Set only by a verified post-split schedule transaction. The backend consumes this
+/// as a fail-closed request to preserve compiler-owned sub-block and event
+/// scheduling instead of applying incompatible automatic policies.
+inline constexpr char kPreserveExplicitScheduleAttr[] =
+    "triton_ascend.cv_split_scheduling.preserve_explicit_schedule";
+
 } // namespace mlir::triton::cv_split
 
 #endif // TRITON_ASCEND_CV_SPLIT_SCHEDULING_ATTRIBUTES_H

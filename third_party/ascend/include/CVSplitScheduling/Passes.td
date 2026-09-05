@@ -70,6 +70,28 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
            "pipeline/resource/candidate facts and emit deterministic debug "
            "diagnostics. This option does not query the model, select a "
            "candidate, or mutate IR.">,
+    Option<"enablePostSplitPlanDiagnostics",
+           "enable-post-split-plan-diagnostics",
+           "bool", /*default*/"false",
+           "build and verify the parameterized post-CVSplit schedule "
+           "plan from typed materialized facts. Requires cost-model request "
+           "extraction, emits diagnostics only, and never mutates IR or emits "
+           "the backend-preservation attribute.">,
+    Option<"enableDetachedScheduleDiagnostics",
+           "enable-detached-schedule-diagnostics",
+           "bool", /*default*/"false",
+           "lower a verified post-CVSplit plan into paired, detached CUBE and "
+           "VECTOR command streams and verify their event, slot, live-depth, "
+           "geometry, reduction, and backend contracts. Emits diagnostics "
+           "only; it creates no MLIR operation, publishes no scope, and "
+           "never mutates IR.">,
+    Option<"enableScheduleBindingDiagnostics",
+           "enable-schedule-binding-diagnostics",
+           "bool", /*default*/"false",
+           "bind the verified detached post-CVSplit schedule to semantic MLIR "
+           "producer, consumer, and boundary anchors. Matching uses typed "
+           "dependency and engine facts rather than textual names. Emits "
+           "diagnostics only and never creates, publishes, or mutates IR.">,
     Option<"promoteFullyUnrolled", "promote-fully-unrolled",
            "bool", /*default*/"true",
            "promote the scope loops left by a candidate whose unroll consumed "

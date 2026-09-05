@@ -297,7 +297,13 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                 schedule_candidate_id=metadata["cv_split_schedule_candidate_id"],
                 enable_pure_prerequisite_hoisting=metadata["cv_split_enable_pure_prerequisite_hoisting"],
                 pure_prerequisite_hoist_budget_bytes=metadata["cv_split_pure_prerequisite_hoist_budget_bytes"],
-                enable_cost_model_diagnostics=metadata["cv_split_enable_cost_model_diagnostics"])
+                enable_cost_model_diagnostics=metadata["cv_split_enable_cost_model_diagnostics"],
+                enable_post_split_plan_diagnostics=metadata[
+                    "cv_split_enable_post_split_plan_diagnostics"],
+                enable_detached_schedule_diagnostics=metadata[
+                    "cv_split_enable_detached_schedule_diagnostics"],
+                enable_schedule_binding_diagnostics=metadata[
+                    "cv_split_enable_schedule_binding_diagnostics"])
 
         if try_dynamic_cv:
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
@@ -499,6 +505,8 @@ def _parse_linalg_metadata(linalg: str, metadata: dict):
     # --- Regular expressions and examples ---
 
     DISABLE_AUTO_TILE_AND_BIND_SUBBLOCK_REGEX = r'hivm.disable_auto_tile_and_bind_subblock'
+    PRESERVE_EXPLICIT_CV_SPLIT_SCHEDULE_REGEX = \
+        r'triton_ascend\.cv_split_scheduling\.preserve_explicit_schedule'
 
     # Inserted by DiscreteMaskAccessConversionPass / MemOpConverter when discrete
     # masked stores need cross-block exclusion (e.g. hivm.sync_block_lock).
@@ -524,6 +532,8 @@ def _parse_linalg_metadata(linalg: str, metadata: dict):
     metadata["shared"] = 1
     # Force disable auto tile and bind subblock if attribute is present in module
     metadata["auto_tile_and_bind_subblock"] = not re.search(DISABLE_AUTO_TILE_AND_BIND_SUBBLOCK_REGEX, linalg)
+    metadata["cv_split_preserve_explicit_schedule"] = \
+        re.search(PRESERVE_EXPLICIT_CV_SPLIT_SCHEDULE_REGEX, linalg) is not None
     # Turn off auto-blockify only for the ORDERED (token-ring) sync_block_lock:
     if re.search(SYNC_BLOCK_LOCK_REGEX, linalg) and not re.search(r"sync_block_lock_unordered", linalg):
         metadata["has_auto_blockify_blacklist_op"] = True
@@ -611,12 +621,24 @@ def _npu_compiler_supports_option(compiler_path: str, option: str) -> bool:
     return option in result.stdout
 
 
+def _preserves_explicit_cv_split_schedule(metadata):
+    return bool(metadata.get("cv_split_preserve_explicit_schedule", False))
+
+
 def get_auto_bind_sub_block_option(metadata):
+    if _preserves_explicit_cv_split_schedule(metadata):
+        return False
     # auto_tile_and_bind_subblock is read from the module.
     # enable_auto_bind_sub_block is set by the user and has a higher priority.
     enable_auto_bind_sub_block = metadata["enable_auto_bind_sub_block"]
     return (metadata["auto_tile_and_bind_subblock"]
             if enable_auto_bind_sub_block is None else enable_auto_bind_sub_block)
+
+
+def get_graph_sync_solver_option(metadata):
+    if _preserves_explicit_cv_split_schedule(metadata):
+        return False
+    return metadata["sync_solver"]
 
 
 def _save_npuir_debug_output(stdout_bytes: bytes, stderr_bytes: bytes, tmpdir: str, metadata_hash: str):
@@ -737,7 +759,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += \
                 [f"--enable-hivm-auto-cv-balance={enable_hivm_auto_cv_balance}"]
 
-        sync_solver = metadata["sync_solver"]
+        sync_solver = get_graph_sync_solver_option(metadata)
         if sync_solver is not None:
             _compile_option_list += \
                 [f"--enable-hivm-graph-sync-solver={sync_solver}"]
@@ -956,7 +978,7 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             _compile_option_list += \
                 [f"--enable-hivm-auto-cv-balance={enable_hivm_auto_cv_balance}"]
 
-        sync_solver = metadata["sync_solver"]
+        sync_solver = get_graph_sync_solver_option(metadata)
         if sync_solver is not None:
             _compile_option_list += [
                 f"--enable-hivm-graph-sync-solver={sync_solver}",
@@ -1218,6 +1240,15 @@ class NPUOptions:
     # Cost-model request diagnostic control. Extract and log typed cost-model inputs
     # without querying the model, selecting a candidate, or mutating IR.
     cv_split_enable_cost_model_diagnostics: bool = False
+    # Post-split plan diagnostic control. Build and verify the parameterized
+    # post-CVSplit schedule plan from the typed materialized request.
+    cv_split_enable_post_split_plan_diagnostics: bool = False
+    # Detached-schedule diagnostic control. Build and verify paired detached CUBE
+    # and VECTOR command streams without creating or publishing MLIR.
+    cv_split_enable_detached_schedule_diagnostics: bool = False
+    # Schedule-binding diagnostic control. Bind detached commands to semantic
+    # producer, consumer, and cross-core boundary anchors.
+    cv_split_enable_schedule_binding_diagnostics: bool = False
     # Spare UB, in bytes, that cross-scope transfers may spend to stop reusing
     # buffers across unrolled lanes. It funds merging the two CUBE->VECTOR
     # roles onto one union slot per lane, which is what lets HEAD_DIM differ
