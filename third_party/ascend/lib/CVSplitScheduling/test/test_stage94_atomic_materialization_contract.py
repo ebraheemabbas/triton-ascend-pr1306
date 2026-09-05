@@ -76,6 +76,9 @@ def test_generated_row_loops_handle_empty_scf_bodies() -> None:
     online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
     assert "if (!maxBody->empty())\n    maxBody->back().erase();" in online
     assert "if (!expBody->empty())\n    expBody->back().erase();" in online
+    assert "b.create<arith::ConstantIntOp>(loc, 0, 32)" in online
+    assert "b.create<arith::ConstantIntOp>(loc, rows, 32)" in online
+    assert online.count("create<arith::IndexCastOp>") >= 2
 
 
 def test_row_reduction_identities_are_materialized_inside_simd_scope() -> None:

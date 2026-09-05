@@ -1440,9 +1440,9 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=parent-loop-inits-ready\n");
-  Value lower = b.create<arith::ConstantIndexOp>(loc, 0);
-  Value upper = b.create<arith::ConstantIndexOp>(loc, rows);
-  Value step = b.create<arith::ConstantIndexOp>(loc, 1);
+  Value lower = b.create<arith::ConstantIntOp>(loc, 0, 32);
+  Value upper = b.create<arith::ConstantIntOp>(loc, rows, 32);
+  Value step = b.create<arith::ConstantIntOp>(loc, 1, 32);
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=max-loop-bounds-created\n");
@@ -1465,7 +1465,8 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=max-loop-default-yield-erased\n");
   OpBuilder mb = OpBuilder::atBlockEnd(maxBody);
-  Value row = maxLoop.getInductionVar();
+  Value row = mb.create<arith::IndexCastOp>(
+      loc, mb.getIndexType(), maxLoop.getInductionVar());
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=max-loop-shell-created\n");
@@ -1562,7 +1563,8 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   if (!expBody->empty())
     expBody->back().erase();
   OpBuilder eb = OpBuilder::atBlockEnd(expBody);
-  row = expLoop.getInductionVar();
+  row = eb.create<arith::IndexCastOp>(loc, eb.getIndexType(),
+                                      expLoop.getInductionVar());
   Value maximumRow = eb.create<tensor::ExtractSliceOp>(
       loc, rowScalarType, maximum, SmallVector<OpFoldResult>{row}, scalarSize,
       scalarStride);
