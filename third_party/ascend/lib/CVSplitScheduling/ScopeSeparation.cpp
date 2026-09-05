@@ -1362,21 +1362,42 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   auto packedType =
       RankedTensorType::get({n16, rows, kNzTileSize}, pElement);
 
-  auto createRowReductionInit =
-      [&](OpBuilder &rowBuilder,
-          linalg::ReduceOp reduction) -> FailureOr<Value> {
+  Operation *insertionAnchor = operations.front();
+  auto createReductionInit =
+      [&](OpBuilder &initBuilder, linalg::ReduceOp reduction,
+          RankedTensorType initType) -> FailureOr<Value> {
     auto fill = reduction.getDpsInits()[0].getDefiningOp<linalg::FillOp>();
     if (!fill || fill.getInputs().size() != 1)
       return failure();
-    Value empty = rowBuilder.create<tensor::EmptyOp>(
-        loc, rowScalarType.getShape(), rowScalarType.getElementType(),
-        rowScalarType.getEncoding());
-    return rowBuilder
-        .create<linalg::FillOp>(loc, fill.getInputs(), ValueRange{empty})
+    Value fillInput = fill.getInputs()[0];
+    if (Operation *definition = fillInput.getDefiningOp();
+        definition && definition->getBlock() == insertionAnchor->getBlock() &&
+        insertionAnchor->isBeforeInBlock(definition)) {
+      if (!isa<arith::ConstantOp>(definition))
+        return failure();
+      fillInput = initBuilder.clone(*definition)->getResult(0);
+    }
+    Value empty = initBuilder.create<tensor::EmptyOp>(
+        loc, initType.getShape(), initType.getElementType(),
+        initType.getEncoding());
+    return initBuilder
+        .create<linalg::FillOp>(loc, ValueRange{fillInput}, ValueRange{empty})
         .getResult(0);
   };
 
-  OpBuilder builder(operations.front());
+  OpBuilder builder(insertionAnchor);
+  FailureOr<Value> maxRowsInit =
+      createReductionInit(builder, maxReduce, maximumType);
+  FailureOr<Value> sumRowsInit =
+      createReductionInit(builder, sumReduce, maximumType);
+  if (failed(maxRowsInit) || failed(sumRowsInit))
+    return failure();
+  Value scaledRowsInit = builder.create<tensor::EmptyOp>(
+      loc, scaledType.getShape(), scaledType.getElementType(),
+      scaledType.getEncoding());
+  Value packedRowsInit = builder.create<tensor::EmptyOp>(
+      loc, packedType.getShape(), packedType.getElementType(),
+      packedType.getEncoding());
   SmallVector<Type> scopeResults{maximumType, maximumType, packedType,
                                  maximumType};
   auto simdScope = builder.create<scope::ScopeOp>(loc, scopeResults);
@@ -1394,16 +1415,9 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=scope-builder-ready\n");
 
-  auto emptyMaximum =
-      b.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{rows}, f32);
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-build-progress lane=" << lane
-             << " checkpoint=max-empty-created\n");
-  auto emptyScaled = b.create<tensor::EmptyOp>(
-      loc, ArrayRef<int64_t>{rows, width}, f32);
-  LLVM_DEBUG(llvm::dbgs()
-             << "[cv-split] stage94-build-progress lane=" << lane
-             << " checkpoint=scaled-empty-created\n");
+             << " checkpoint=parent-loop-inits-ready\n");
   Value lower = b.create<arith::ConstantIndexOp>(loc, 0);
   Value upper = b.create<arith::ConstantIndexOp>(loc, rows);
   Value step = b.create<arith::ConstantIndexOp>(loc, 1);
@@ -1415,7 +1429,7 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
              << " checkpoint=max-loop-create-begin\n");
   auto maxLoop = b.create<scf::ForOp>(
       loc, lower, upper, step,
-      ValueRange{emptyMaximum.getResult(), emptyScaled.getResult()});
+      ValueRange{*maxRowsInit, scaledRowsInit});
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=max-loop-create-end\n");
@@ -1489,7 +1503,8 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   SmallVector<OpFoldResult> scalarOffset{row};
   SmallVector<OpFoldResult> scalarSize{mb.getIndexAttr(1)};
   SmallVector<OpFoldResult> scalarStride{mb.getIndexAttr(1)};
-  FailureOr<Value> maxInit = createRowReductionInit(mb, maxReduce);
+  FailureOr<Value> maxInit =
+      createReductionInit(mb, maxReduce, rowScalarType);
   if (failed(maxInit))
     return failure();
   LLVM_DEBUG(llvm::dbgs()
@@ -1519,12 +1534,9 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   auto syncToken = b.create<arith::ConstantIntOp>(loc, 0, 64);
   auto syncMark = b.create<annotation::MarkOp>(loc, syncToken.getResult());
   syncMark->setAttr("SYNC_IN_VF", StringAttr::get(context, "VST_VLD"));
-  auto emptySum = b.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{rows}, f32);
-  auto emptyPacked = b.create<tensor::EmptyOp>(
-      loc, packedType.getShape(), packedType.getElementType());
   auto expLoop = b.create<scf::ForOp>(
       loc, lower, upper, step,
-      ValueRange{emptySum.getResult(), emptyPacked.getResult()});
+      ValueRange{*sumRowsInit, packedRowsInit});
   Block *expBody = expLoop.getBody();
   if (!expBody->empty())
     expBody->back().erase();
@@ -1569,7 +1581,8 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
     packedRows = eb.create<tensor::InsertSliceOp>(
         loc, packedChunk, packedRows, offsets, sizes, strides);
   }
-  FailureOr<Value> sumInit = createRowReductionInit(eb, sumReduce);
+  FailureOr<Value> sumInit =
+      createReductionInit(eb, sumReduce, rowScalarType);
   if (failed(sumInit))
     return failure();
   IRMapping sumMapping;

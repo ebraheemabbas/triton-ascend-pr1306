@@ -81,10 +81,18 @@ def test_generated_row_loops_handle_empty_scf_bodies() -> None:
 def test_row_reduction_identities_are_materialized_inside_simd_scope() -> None:
     source = read(LIB / "ScopeSeparation.cpp")
     online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
-    assert "createRowReductionInit" in online
+    assert "createReductionInit" in online
     assert "getDefiningOp<linalg::FillOp>()" in online
-    assert "createRowReductionInit(mb, maxReduce)" in online
-    assert "createRowReductionInit(eb, sumReduce)" in online
+    assert "createReductionInit(mb, maxReduce, rowScalarType)" in online
+    assert "createReductionInit(eb, sumReduce, rowScalarType)" in online
+
+
+def test_loop_carried_storage_is_created_before_the_simd_scope() -> None:
+    source = read(LIB / "ScopeSeparation.cpp")
+    online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
+    scope = online.index("builder.create<scope::ScopeOp>")
+    for token in ("maxRowsInit", "sumRowsInit", "scaledRowsInit", "packedRowsInit"):
+        assert online.index(token) < scope
 
 
 def test_online_softmax_marks_the_inter_loop_vector_dependency() -> None:
@@ -102,5 +110,6 @@ if __name__ == "__main__":
     test_no_textual_or_shape_identity_policy()
     test_generated_row_loops_handle_empty_scf_bodies()
     test_row_reduction_identities_are_materialized_inside_simd_scope()
+    test_loop_carried_storage_is_created_before_the_simd_scope()
     test_online_softmax_marks_the_inter_loop_vector_dependency()
     print("Stage 9.4b/c atomic materialization source contract: PASS")
