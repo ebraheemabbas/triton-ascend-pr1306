@@ -122,6 +122,24 @@ def test_online_softmax_marks_the_inter_loop_vector_dependency() -> None:
     assert online.index(marker) < online.index("auto expLoop =")
 
 
+def test_lane_scope_returns_only_maximum_sum_and_packed_probability() -> None:
+    source = read(LIB / "ScopeSeparation.cpp")
+    online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
+    result_types = "SmallVector<Type> scopeResults{maximumType, maximumType, packedType};"
+    returned = "ValueRange{maximum, expLoop.getResult(0), expLoop.getResult(1)}"
+    assert result_types in online
+    assert returned in online
+    worklist = online.split("SmallVector<Operation *> worklist", 1)[1].split("};", 1)[0]
+    assert "alpha.getOperation()" not in worklist
+    assert "newDenominator.getOperation()" not in worklist
+    replacements = online.split("SmallVector<std::pair<Value, Value>> replacements", 1)[1]
+    replacements = replacements.split("};", 1)[0]
+    assert "newMaximum.getResult()" in replacements
+    assert "sumReduce.getResult(0)" in replacements
+    assert "newDenominator.getResult()" not in replacements
+    assert "alpha.getResult()" not in replacements
+
+
 if __name__ == "__main__":
     test_forced_option_is_default_off_and_atomic()
     test_materializer_outlines_all_probability_regions()
@@ -130,4 +148,5 @@ if __name__ == "__main__":
     test_row_reduction_identities_are_materialized_inside_simd_scope()
     test_loop_carried_storage_is_created_before_the_simd_scope()
     test_online_softmax_marks_the_inter_loop_vector_dependency()
+    test_lane_scope_returns_only_maximum_sum_and_packed_probability()
     print("Stage 9.4b/c atomic materialization source contract: PASS")

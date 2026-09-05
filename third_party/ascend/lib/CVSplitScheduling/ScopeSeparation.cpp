@@ -1318,8 +1318,7 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   SmallVector<Operation *> worklist{
       scaledScore.getOperation(), maxReduce.getOperation(),
       newMaximum.getOperation(), probabilityExp.getOperation(),
-      probabilityProducer, sumReduce.getOperation(), alpha.getOperation(),
-      newDenominator.getOperation()};
+      probabilityProducer, sumReduce.getOperation()};
   while (!worklist.empty()) {
     Operation *operation = worklist.pop_back_val();
     if (!operationSet.insert(operation).second)
@@ -1420,8 +1419,7 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
       createUbBackedTensor(builder, scaledType, "stage94.scaled-rows");
   Value packedRowsInit =
       createUbBackedTensor(builder, packedType, "stage94.packed-rows");
-  SmallVector<Type> scopeResults{maximumType, maximumType, packedType,
-                                 maximumType};
+  SmallVector<Type> scopeResults{maximumType, maximumType, packedType};
   auto simdScope = builder.create<scope::ScopeOp>(loc, scopeResults);
   simdScope.getBodyRegion().emplaceBlock();
   simdScope->setAttr("noinline", UnitAttr::get(context));
@@ -1620,21 +1618,15 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=exp-pack-loop-created\n");
 
-  Value alphaValue = b.create<math::ExpOp>(
-      loc, b.create<arith::SubFOp>(loc, oldMaximum, maximum));
-   Value denominator = b.create<arith::AddFOp>(
-      loc, b.create<arith::MulFOp>(loc, oldDenominator, alphaValue),
-      expLoop.getResult(0));
   b.create<scope::ReturnOp>(
-      loc, ValueRange{maximum, denominator, expLoop.getResult(1), alphaValue});
+      loc, ValueRange{maximum, expLoop.getResult(0), expLoop.getResult(1)});
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=scope-return-created\n");
 
   SmallVector<std::pair<Value, Value>> replacements{
       {newMaximum.getResult(), simdScope->getResult(0)},
-      {newDenominator.getResult(), simdScope->getResult(1)},
-      {alpha.getResult(), simdScope->getResult(3)}};
+      {sumReduce.getResult(0), simdScope->getResult(1)}};
   for (auto [oldValue, replacement] : replacements) {
     SmallVector<OpOperand *> outsideUses;
     for (OpOperand &use : oldValue.getUses())
