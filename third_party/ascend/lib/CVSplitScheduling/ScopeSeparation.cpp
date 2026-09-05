@@ -908,6 +908,13 @@ outlineStage94VectorRegion(VectorToCubePack &pack, unsigned lane) {
     operation->remove();
     scopeBlock->push_back(operation);
   }
+  OpBuilder syncBuilder(probabilityProducer);
+  auto syncToken = syncBuilder.create<arith::ConstantIntOp>(loc, 0, 64);
+  auto syncMark =
+      syncBuilder.create<annotation::MarkOp>(loc, syncToken.getResult());
+  syncMark->setAttr("SYNC_IN_VF", StringAttr::get(context, "VST_VLD"));
+  setOpEngineTypeAttr(syncToken, EngineType::VECTOR);
+  setOpEngineTypeAttr(syncMark, EngineType::VECTOR);
   OpBuilder returnBuilder(scopeBlock, scopeBlock->end());
   auto returnOp =
       returnBuilder.create<scope::ReturnOp>(loc, outputs.getArrayRef());
