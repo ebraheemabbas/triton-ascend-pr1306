@@ -145,7 +145,8 @@ def test_integration_precedes_live_transfer_mutation() -> None:
     assert "if (enableStage9DetachedScheduleDiagnostics)" in cpp
     assert "stage93-detached unavailable" in cpp
     assert "mutation=no" in read(LIB / "PostCVSplitDetachedSchedule.cpp")
-    assert "kPreserveExplicitScheduleAttr" not in cpp
+    before_atomic = cpp.split("if (enableStage94AtomicRewrite) {", 1)[0]
+    assert "kPreserveExplicitScheduleAttr" not in before_atomic
 
 
 if __name__ == "__main__":

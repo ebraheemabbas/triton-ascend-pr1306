@@ -836,12 +836,120 @@ rebuildVectorToCubePacks(ArrayRef<VectorToCubePack> packs, Value sbidx,
   return success();
 }
 
+static FailureOr<Value>
+outlineStage94VectorRegion(VectorToCubePack &pack, unsigned lane) {
+  Operation *probabilityProducer = pack.pSrc.getDefiningOp();
+  Operation *anchor = pack.anchor;
+  if (!probabilityProducer || !anchor ||
+      probabilityProducer->getBlock() != anchor->getBlock() ||
+      !probabilityProducer->isBeforeInBlock(anchor))
+    return failure();
+
+  Operation *precedingWait = nullptr;
+  for (Operation *cursor = probabilityProducer->getPrevNode(); cursor;
+       cursor = cursor->getPrevNode()) {
+    if (isa<hivm::SyncBlockWaitOp>(cursor)) {
+      precedingWait = cursor;
+      break;
+    }
+  }
+  if (!precedingWait || !precedingWait->getNextNode() ||
+      precedingWait->getNextNode() == anchor)
+    return failure();
+
+  Operation *first = precedingWait->getNextNode();
+  SmallVector<Operation *> operations;
+  DenseSet<Operation *> operationSet;
+  bool containsProbabilityProducer = false;
+  for (Operation *cursor = first; cursor && cursor != anchor;
+       cursor = cursor->getNextNode()) {
+    if (cursor->hasTrait<OpTrait::IsTerminator>() ||
+        isa<hivm::SyncBlockWaitOp, hivm::SyncBlockSetOp>(cursor))
+      return failure();
+    operations.push_back(cursor);
+    operationSet.insert(cursor);
+    containsProbabilityProducer |= cursor == probabilityProducer;
+  }
+  if (!containsProbabilityProducer || operations.empty())
+    return failure();
+
+  SetVector<Value> outputs;
+  outputs.insert(pack.pSrc);
+  for (Operation *operation : operations) {
+    for (Value result : operation->getResults()) {
+      bool usedOutside = llvm::any_of(result.getUses(), [&](OpOperand &use) {
+        return !operationSet.contains(use.getOwner());
+      });
+      if (usedOutside)
+        outputs.insert(result);
+    }
+  }
+
+  SmallVector<Type> resultTypes;
+  for (Value output : outputs)
+    resultTypes.push_back(output.getType());
+  Location loc = probabilityProducer->getLoc();
+  MLIRContext *context = probabilityProducer->getContext();
+  OpBuilder builder(first);
+  auto simdScope = builder.create<scope::ScopeOp>(loc, resultTypes);
+  simdScope.getBodyRegion().emplaceBlock();
+  simdScope->setAttr("noinline", UnitAttr::get(context));
+  simdScope->setAttr("outline", BoolAttr::get(context, true));
+  simdScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
+  setOpEngineTypeAttr(simdScope, EngineType::VECTOR);
+
+  Block *scopeBlock = &simdScope.getBodyRegion().front();
+  for (Operation *operation : operations) {
+    operation->remove();
+    scopeBlock->push_back(operation);
+  }
+  OpBuilder returnBuilder(scopeBlock, scopeBlock->end());
+  auto returnOp =
+      returnBuilder.create<scope::ReturnOp>(loc, outputs.getArrayRef());
+
+  Value outlinedProbability;
+  for (auto [index, output] : llvm::enumerate(outputs)) {
+    Value replacement = simdScope->getResult(index);
+    if (output == pack.pSrc)
+      outlinedProbability = replacement;
+    SmallVector<OpOperand *> outsideUses;
+    for (OpOperand &use : output.getUses()) {
+      Operation *owner = use.getOwner();
+      if (owner != returnOp && !simdScope->isAncestor(owner))
+        outsideUses.push_back(&use);
+    }
+    for (OpOperand *use : outsideUses)
+      use->set(replacement);
+  }
+  if (!outlinedProbability)
+    return failure();
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-materialized-vector lane=" << lane
+             << " operations=" << operations.size()
+             << " results=" << outputs.size()
+             << " vector-mode=simd publication=detached\n");
+  return outlinedProbability;
+}
+
+static LogicalResult
+outlineStage94VectorRegions(MutableArrayRef<VectorToCubePack> packs) {
+  for (auto [lane, pack] : llvm::enumerate(packs)) {
+    FailureOr<Value> probability = outlineStage94VectorRegion(pack, lane);
+    if (failed(probability))
+      return failure();
+    pack.pSrc = *probability;
+  }
+  return success();
+}
+
 // Re-tile the VECTOR scope for ROW_SPLIT so both veccores do useful work (2x
 // vector throughput): M/2 rows per veccore, addressed by get_sub_block_idx,
 // matching the target IR. Runs the six steps in order; see each helper.
 static LogicalResult
 retileVectorScopeForRowSplit(scope::ScopeOp vecScope,
-                             const CrossScopeTransferInfo &transferInfo) {
+                             const CrossScopeTransferInfo &transferInfo,
+                             bool materializeStage94SimdRegions) {
   Location loc = vecScope.getLoc();
   MLIRContext *ctx = vecScope.getContext();
   auto ubAddrSpace = hivm::AddressSpaceAttr::get(ctx, hivm::AddressSpace::UB);
@@ -853,6 +961,9 @@ retileVectorScopeForRowSplit(scope::ScopeOp vecScope,
   Value sbidx = emitSubBlockIndex(vecScope, loc);
   unsigned clonedCount = cloneExternalInitsAsHalfHeight(vecScope, loc, blockM);
   if (failed(retileVectorScopeOps(vecScope, blockM)))
+    return failure();
+  if (materializeStage94SimdRegions &&
+      failed(outlineStage94VectorRegions(packs)))
     return failure();
   FailureOr<unsigned> nStores =
       retileOutputStores(vecScope, sbidx, loc, blockM);
@@ -873,7 +984,8 @@ retileVectorScopeForRowSplit(scope::ScopeOp vecScope,
 
 LogicalResult
 createScopeSeparation(func::FuncOp funcOp, scf::ForOp innerLoop,
-                      const CrossScopeTransferInfo &transferInfo) {
+                      const CrossScopeTransferInfo &transferInfo,
+                      bool materializeStage94SimdRegions) {
 
   MLIRContext *ctx = funcOp.getContext();
   Location loc = innerLoop.getLoc();
@@ -1021,7 +1133,8 @@ createScopeSeparation(func::FuncOp funcOp, scf::ForOp innerLoop,
 
   // Step 7: ROW_SPLIT re-tile of the VECTOR scope (BLOCK_M/2 rows per veccore,
   // both veccores active). Replaces the single-veccore NO_DUAL guard.
-  if (failed(retileVectorScopeForRowSplit(vecScope, transferInfo)))
+  if (failed(retileVectorScopeForRowSplit(
+          vecScope, transferInfo, materializeStage94SimdRegions)))
     return failure();
 
   LLVM_DEBUG(

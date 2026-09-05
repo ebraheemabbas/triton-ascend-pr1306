@@ -126,7 +126,8 @@ def test_integration_is_after_materialization_before_transfer_mutation() -> None
     assert extract < stage9 < transfer
     assert "if (enableStage9SchedulePlanDiagnostics)" in cpp
     assert "mutation=no" in read(LIB / "PostCVSplitSchedulePlan.cpp")
-    assert "kPreserveExplicitScheduleAttr" not in cpp
+    before_atomic = cpp.split("if (enableStage94AtomicRewrite) {", 1)[0]
+    assert "kPreserveExplicitScheduleAttr" not in before_atomic
     assert "PostCVSplitSchedulePlan.cpp" in read(LIB / "CMakeLists.txt")
 
 

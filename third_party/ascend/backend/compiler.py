@@ -303,7 +303,9 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                 enable_stage9_detached_schedule_diagnostics=metadata[
                     "cv_split_enable_stage9_detached_schedule_diagnostics"],
                 enable_stage94_anchor_binding_diagnostics=metadata[
-                    "cv_split_enable_stage94_anchor_binding_diagnostics"])
+                    "cv_split_enable_stage94_anchor_binding_diagnostics"],
+                enable_stage94_atomic_rewrite=metadata[
+                    "cv_split_enable_stage94_atomic_rewrite"])
 
         if try_dynamic_cv:
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
@@ -1249,6 +1251,9 @@ class NPUOptions:
     # Stage 9.4a analysis-only control. Bind detached commands to semantic
     # producer, consumer, and cross-core boundary anchors.
     cv_split_enable_stage94_anchor_binding_diagnostics: bool = False
+    # Stage 9.4b/c forced development path. Materialize and atomically publish
+    # both scopes only after the complete Stage 9 protocol verifies.
+    cv_split_enable_stage94_atomic_rewrite: bool = False
     # Spare UB, in bytes, that cross-scope transfers may spend to stop reusing
     # buffers across unrolled lanes. It funds merging the two CUBE->VECTOR
     # roles onto one union slot per lane, which is what lets HEAD_DIM differ

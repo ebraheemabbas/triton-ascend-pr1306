@@ -32,7 +32,8 @@
 namespace mlir::triton::cv_split {
 
 LogicalResult createScopeSeparation(func::FuncOp funcOp, scf::ForOp innerLoop,
-                                    const CrossScopeTransferInfo &transferInfo);
+                                    const CrossScopeTransferInfo &transferInfo,
+                                    bool materializeStage94SimdRegions = false);
 
 } // namespace mlir::triton::cv_split
 

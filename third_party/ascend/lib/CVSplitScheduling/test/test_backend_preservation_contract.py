@@ -64,11 +64,15 @@ def test_option_helper_semantics() -> None:
     assert namespace["get_graph_sync_solver_option"](metadata) is False
 
 
-def test_stage91_does_not_emit_or_mutate() -> None:
+def test_preservation_is_emitted_only_by_stage94_atomic_publication() -> None:
     pass_source = read(PASS)
     backend = read(BACKEND)
-    assert "kPreserveExplicitScheduleAttr" not in pass_source
-    assert "preserve_explicit_schedule" not in pass_source
+    atomic_marker = "if (enableStage94AtomicRewrite) {"
+    assert atomic_marker in pass_source
+    before_atomic, atomic_and_after = pass_source.split(atomic_marker, 1)
+    assert "kPreserveExplicitScheduleAttr" not in before_atomic
+    assert "kPreserveExplicitScheduleAttr" in atomic_and_after
+    assert pass_source.count("kPreserveExplicitScheduleAttr") == 1
     assert 'metadata["enable_auto_bind_sub_block"]' in backend
     assert 'return metadata["sync_solver"]' in backend
 
@@ -77,5 +81,5 @@ if __name__ == "__main__":
     test_attribute_and_metadata_contract()
     test_preservation_overrides_conflicting_user_policy()
     test_option_helper_semantics()
-    test_stage91_does_not_emit_or_mutate()
+    test_preservation_is_emitted_only_by_stage94_atomic_publication()
     print("Stage 9.1 backend preservation source contract: PASS")

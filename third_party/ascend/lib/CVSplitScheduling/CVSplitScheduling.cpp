@@ -766,6 +766,7 @@ public:
         options.enableStage9DetachedScheduleDiagnostics;
     this->enableStage94AnchorBindingDiagnostics =
         options.enableStage94AnchorBindingDiagnostics;
+    this->enableStage94AtomicRewrite = options.enableStage94AtomicRewrite;
     this->promoteFullyUnrolled = options.promoteFullyUnrolled;
     this->pipelineDistance = options.pipelineDistance;
     this->privateBufferUbBudgetBytes = options.privateBufferUbBudgetBytes;
@@ -1167,6 +1168,8 @@ private:
     // Stage 8.2: convert the verified materialized plan into stable numeric
     // v4 request facts. This is read-only and diagnostic-only; incomplete
     // extraction never changes the qualified scheduling/emission path.
+    bool stage94BindingReady = false;
+    bool stage94StructuralCandidateReady = false;
     if (enableCostModelDiagnostics) {
       if (!materializedPlan || !materializedResources ||
           !scheduleCandidateSet) {
@@ -1194,24 +1197,45 @@ private:
                           "qualified scheduler/emitter remains active\n");
           if (enableStage9SchedulePlanDiagnostics ||
               enableStage9DetachedScheduleDiagnostics ||
-              enableStage94AnchorBindingDiagnostics) {
+              enableStage94AnchorBindingDiagnostics ||
+              enableStage94AtomicRewrite) {
             cv_split::PostCVSplitSchedulePlan stage9Plan =
                 cv_split::buildPostCVSplitSchedulePlan(
                     *requests, *materializedResources, *resourceLimits);
             if (enableStage9SchedulePlanDiagnostics)
               cv_split::logPostCVSplitSchedulePlan(stage9Plan);
             if (enableStage9DetachedScheduleDiagnostics ||
-                enableStage94AnchorBindingDiagnostics) {
+                enableStage94AnchorBindingDiagnostics ||
+                enableStage94AtomicRewrite) {
               cv_split::PostCVSplitDetachedSchedule detachedSchedule =
                   cv_split::buildPostCVSplitDetachedSchedule(stage9Plan);
               if (enableStage9DetachedScheduleDiagnostics)
                 cv_split::logPostCVSplitDetachedSchedule(detachedSchedule);
-              if (enableStage94AnchorBindingDiagnostics) {
+              if (enableStage94AnchorBindingDiagnostics ||
+                  enableStage94AtomicRewrite) {
                 cv_split::PostCVSplitScheduleBinding binding =
                     cv_split::bindPostCVSplitScheduleAnchors(
                         body, classification, *materializedPlan,
                         detachedSchedule);
-                cv_split::logPostCVSplitScheduleBinding(binding);
+                if (enableStage94AnchorBindingDiagnostics)
+                  cv_split::logPostCVSplitScheduleBinding(binding);
+                stage94BindingReady =
+                    binding.status ==
+                        cv_split::PostCVSplitScheduleBindingStatus::Ready &&
+                    binding.verified;
+                if (forcedScheduleCandidate && stage94BindingReady) {
+                  stage94StructuralCandidateReady =
+                      llvm::all_of(
+                          forcedScheduleCandidate->matrixLineageLimits,
+                          [&](const auto &lineage) {
+                            unsigned requiredDepth =
+                                lineage.originId == binding.lanes.front()
+                                                        .scoreOriginId
+                                    ? detachedSchedule.observedMaxScoreLive
+                                    : detachedSchedule.observedMaxProductLive;
+                            return lineage.inFlightLimit >= requiredDepth;
+                          });
+                }
               }
             }
           }
@@ -1238,6 +1262,17 @@ private:
                  << "[cv-split] stage94-binding unavailable reason="
                     "cost-input-diagnostics-disabled publication=no "
                     "mutation=no\n");
+
+    if (enableStage94AtomicRewrite &&
+        (!stage94BindingReady || !stage94StructuralCandidateReady)) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[cv-split] stage94-atomic rejected binding-ready="
+                 << (stage94BindingReady ? "yes" : "no")
+                 << " structural-candidate-ready="
+                 << (stage94StructuralCandidateReady ? "yes" : "no")
+                 << " mutation=no\n");
+      return failure();
+    }
 
     // Stage 8: Insert cross-scope transfers (BEFORE scope separation)
     LLVM_DEBUG(llvm::dbgs()
@@ -1277,8 +1312,16 @@ private:
     // Stage 9: Scope separation (like DynamicCVPipeline/SeparateCVScope)
     LLVM_DEBUG(llvm::dbgs()
                << "[cv-split] === Stage 9: scope separation ===\n");
-    if (failed(cv_split::createScopeSeparation(funcOp, loop, *transferInfo))) {
+    if (failed(cv_split::createScopeSeparation(
+            funcOp, loop, *transferInfo, enableStage94AtomicRewrite))) {
       return failure();
+    }
+    if (enableStage94AtomicRewrite) {
+      moduleOp->setAttr(cv_split::kPreserveExplicitScheduleAttr,
+                        UnitAttr::get(funcOp.getContext()));
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[cv-split] stage94-atomic published cube=yes vector=yes "
+                    "preservation-attribute=yes\n");
     }
     hoistInvariantTensorFillTemplates(outerLoop);
     LLVM_DEBUG(llvm::dbgs() << "[cv-split] Stage 9 complete\n");

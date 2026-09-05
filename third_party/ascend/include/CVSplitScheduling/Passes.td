@@ -92,6 +92,12 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
            "producer, consumer, and boundary anchors. Matching uses typed "
            "dependency and engine facts rather than textual names. Emits "
            "diagnostics only and never creates, publishes, or mutates IR.">,
+    Option<"enableStage94AtomicRewrite", "enable-stage94-atomic-rewrite",
+           "bool", /*default*/"false",
+           "force the verified Stage 9 schedule to materialize SIMD regions "
+           "and publish both CUBE and VECTOR scopes transactionally. Requires "
+           "a complete semantic binding and a two-live-result structural "
+           "candidate; failure restores the original function.">,
     Option<"promoteFullyUnrolled", "promote-fully-unrolled",
            "bool", /*default*/"true",
            "promote the scope loops left by a candidate whose unroll consumed "

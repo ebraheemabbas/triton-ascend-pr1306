@@ -154,7 +154,8 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
          bool enableCostModelDiagnostics,
          bool enableStage9SchedulePlanDiagnostics,
          bool enableStage9DetachedScheduleDiagnostics,
-         bool enableStage94AnchorBindingDiagnostics) {
+         bool enableStage94AnchorBindingDiagnostics,
+         bool enableStage94AtomicRewrite) {
         CVSplitSchedulingOptions opts;
         opts.compileOn91095 = compileOn91095;
         opts.unrollFactor = unrollFactor;
@@ -170,6 +171,7 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
             enableStage9DetachedScheduleDiagnostics;
         opts.enableStage94AnchorBindingDiagnostics =
             enableStage94AnchorBindingDiagnostics;
+        opts.enableStage94AtomicRewrite = enableStage94AtomicRewrite;
         opts.promoteFullyUnrolled = promoteFullyUnrolled;
         opts.privateBufferUbBudgetBytes = privateBufferUbBudgetBytes;
         opts.promotePrivateBufferPools = promotePrivateBufferPools;
@@ -192,7 +194,8 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       py::arg("enable_cost_model_diagnostics") = false,
       py::arg("enable_stage9_schedule_plan_diagnostics") = false,
       py::arg("enable_stage9_detached_schedule_diagnostics") = false,
-      py::arg("enable_stage94_anchor_binding_diagnostics") = false);
+      py::arg("enable_stage94_anchor_binding_diagnostics") = false,
+      py::arg("enable_stage94_atomic_rewrite") = false);
 
   m.def(
       "add_graph_optimize",
