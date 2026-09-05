@@ -355,11 +355,8 @@ PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
   plan.forwardEventCount = 3 * lanes;
   plan.releaseEventCount = plan.scoreLiveDepth + plan.productLiveDepth;
   plan.requiredEventCount = plan.events.size();
-  if (plan.events.empty() || nextFlag == 0 ||
-      nextFlag - 1 > plan.maximumLogicalFlagId) {
-    plan.status = PostCVSplitSchedulePlanStatus::FlagOverflow;
-    return plan;
-  }
+  const bool flagOverflow = plan.events.empty() || nextFlag == 0 ||
+                            nextFlag - 1 > plan.maximumLogicalFlagId;
 
   llvm::SmallVector<unsigned> activeValues;
   for (unsigned lane = 0; lane < lanes; ++lane)
@@ -383,6 +380,10 @@ PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
   plan.reductionRootValue = activeValues.front();
   plan.affineTreeRequired = true;
 
+  if (flagOverflow) {
+    plan.status = PostCVSplitSchedulePlanStatus::FlagOverflow;
+    return plan;
+  }
   const bool ubWithinBudget =
       !limits.extraUbBudgetBytes ||
       plan.incrementalUbBytes <= *limits.extraUbBudgetBytes;
