@@ -17,6 +17,7 @@ add_triton_library(CVSplitScheduling
   PreCheck.cpp
   PurePrerequisiteHoisting.cpp
   PostCVSplitDetachedSchedule.cpp
+  PostCVSplitScheduleBinding.cpp
   PostCVSplitSchedulePlan.cpp
   ScopeSeparation.cpp
   SoftmaxRegroup.cpp

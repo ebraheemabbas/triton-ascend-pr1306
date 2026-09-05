@@ -32,6 +32,7 @@
 #include "ascend/include/CVSplitScheduling/PreCheck.h"
 #include "ascend/include/CVSplitScheduling/PurePrerequisiteHoisting.h"
 #include "ascend/include/CVSplitScheduling/PostCVSplitDetachedSchedule.h"
+#include "ascend/include/CVSplitScheduling/PostCVSplitScheduleBinding.h"
 #include "ascend/include/CVSplitScheduling/PostCVSplitSchedulePlan.h"
 #include "ascend/include/CVSplitScheduling/ScopeSeparation.h"
 #include "ascend/include/CVSplitScheduling/SoftmaxRegroup.h"
@@ -763,6 +764,8 @@ public:
         options.enableStage9SchedulePlanDiagnostics;
     this->enableStage9DetachedScheduleDiagnostics =
         options.enableStage9DetachedScheduleDiagnostics;
+    this->enableStage94AnchorBindingDiagnostics =
+        options.enableStage94AnchorBindingDiagnostics;
     this->promoteFullyUnrolled = options.promoteFullyUnrolled;
     this->pipelineDistance = options.pipelineDistance;
     this->privateBufferUbBudgetBytes = options.privateBufferUbBudgetBytes;
@@ -1190,16 +1193,26 @@ private:
                        << "[cv-split] cost-model-schedules incomplete; "
                           "qualified scheduler/emitter remains active\n");
           if (enableStage9SchedulePlanDiagnostics ||
-              enableStage9DetachedScheduleDiagnostics) {
+              enableStage9DetachedScheduleDiagnostics ||
+              enableStage94AnchorBindingDiagnostics) {
             cv_split::PostCVSplitSchedulePlan stage9Plan =
                 cv_split::buildPostCVSplitSchedulePlan(
                     *requests, *materializedResources, *resourceLimits);
             if (enableStage9SchedulePlanDiagnostics)
               cv_split::logPostCVSplitSchedulePlan(stage9Plan);
-            if (enableStage9DetachedScheduleDiagnostics) {
+            if (enableStage9DetachedScheduleDiagnostics ||
+                enableStage94AnchorBindingDiagnostics) {
               cv_split::PostCVSplitDetachedSchedule detachedSchedule =
                   cv_split::buildPostCVSplitDetachedSchedule(stage9Plan);
-              cv_split::logPostCVSplitDetachedSchedule(detachedSchedule);
+              if (enableStage9DetachedScheduleDiagnostics)
+                cv_split::logPostCVSplitDetachedSchedule(detachedSchedule);
+              if (enableStage94AnchorBindingDiagnostics) {
+                cv_split::PostCVSplitScheduleBinding binding =
+                    cv_split::bindPostCVSplitScheduleAnchors(
+                        body, classification, *materializedPlan,
+                        detachedSchedule);
+                cv_split::logPostCVSplitScheduleBinding(binding);
+              }
             }
           }
         } else
@@ -1217,6 +1230,12 @@ private:
         !enableCostModelDiagnostics)
       LLVM_DEBUG(llvm::dbgs()
                  << "[cv-split] stage93-detached unavailable reason="
+                    "cost-input-diagnostics-disabled publication=no "
+                    "mutation=no\n");
+    if (enableStage94AnchorBindingDiagnostics &&
+        !enableCostModelDiagnostics)
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[cv-split] stage94-binding unavailable reason="
                     "cost-input-diagnostics-disabled publication=no "
                     "mutation=no\n");
 

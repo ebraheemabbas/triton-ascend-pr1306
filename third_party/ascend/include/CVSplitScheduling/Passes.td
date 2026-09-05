@@ -85,6 +85,13 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
            "geometry, reduction, and backend contracts. Emits diagnostics "
            "only; it creates no MLIR operation, publishes no scope, and "
            "never mutates IR.">,
+    Option<"enableStage94AnchorBindingDiagnostics",
+           "enable-stage94-anchor-binding-diagnostics",
+           "bool", /*default*/"false",
+           "bind the verified detached Stage 9 schedule to semantic MLIR "
+           "producer, consumer, and boundary anchors. Matching uses typed "
+           "dependency and engine facts rather than textual names. Emits "
+           "diagnostics only and never creates, publishes, or mutates IR.">,
     Option<"promoteFullyUnrolled", "promote-fully-unrolled",
            "bool", /*default*/"true",
            "promote the scope loops left by a candidate whose unroll consumed "
