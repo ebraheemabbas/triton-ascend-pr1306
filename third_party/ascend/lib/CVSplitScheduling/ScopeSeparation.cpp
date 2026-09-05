@@ -30,6 +30,7 @@
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -750,13 +751,23 @@ rebuildVectorToCubePacks(ArrayRef<VectorToCubePack> packs, Value sbidx,
       return failure();
     }
     auto pType = dyn_cast<RankedTensorType>(p.pSrc.getType());
-    if (!pType || pType.getRank() != 2 || !pType.hasStaticShape()) {
-      emitError(loc, "V->C pack source must be a static rank-2 tensor");
+    if (!pType || !pType.hasStaticShape() ||
+        (pType.getRank() != 2 && pType.getRank() != 3)) {
+      emitError(loc, "V->C pack source must be a static rank-2 tensor or "
+                     "direct [N/16,M,16] tensor");
       return failure();
     }
-    int64_t M = pType.getShape()[0];
-    int64_t N = pType.getShape()[1];
-    int64_t N16 = N / kNzTileSize, M16 = M / kNzTileSize;
+    bool directPacked = pType.getRank() == 3;
+    int64_t M = directPacked ? pType.getShape()[1] : pType.getShape()[0];
+    int64_t N16 =
+        directPacked ? pType.getShape()[0] : pType.getShape()[1] / kNzTileSize;
+    int64_t N = N16 * kNzTileSize;
+    int64_t M16 = M / kNzTileSize;
+    if (M <= 0 || N <= 0 || M % kNzTileSize != 0 ||
+        (directPacked && pType.getShape()[2] != kNzTileSize)) {
+      emitError(loc, "invalid direct NZ pack geometry");
+      return failure();
+    }
     Type elemType = pType.getElementType();
     Operation *pProducer = p.pSrc.getDefiningOp();
     if (!pProducer || pProducer->getBlock() != p.anchor->getBlock() ||
@@ -783,19 +794,24 @@ rebuildVectorToCubePacks(ArrayRef<VectorToCubePack> packs, Value sbidx,
       return failure();
     }
     auto i64Ty = b.getI64Type();
-    // reshape [M,N] -> [M, N16, kNzTileSize]
-    auto s3Type = RankedTensorType::get({3}, i64Ty);
-    auto s3 = b.create<arith::ConstantOp>(
-        loc, s3Type,
-        DenseElementsAttr::get(s3Type, ArrayRef<int64_t>{M, N16, kNzTileSize}));
-    auto resh1Type = RankedTensorType::get({M, N16, kNzTileSize}, elemType);
-    auto resh1 =
-        b.create<tensor::ReshapeOp>(loc, resh1Type, p.pSrc, s3.getResult());
-    // transpose [M,N16,kNzTileSize] -> [N16,M,kNzTileSize]
-    auto emptyT = b.create<tensor::EmptyOp>(
-        loc, ArrayRef<int64_t>{N16, M, kNzTileSize}, elemType);
-    auto transp = b.create<linalg::TransposeOp>(
-        loc, resh1.getResult(), emptyT.getResult(), ArrayRef<int64_t>{1, 0, 2});
+    Value packedTensor = p.pSrc;
+    if (!directPacked) {
+      // Generic fallback: reshape [M,N] and transpose to [N16,M,16].
+      auto s3Type = RankedTensorType::get({3}, i64Ty);
+      auto s3 = b.create<arith::ConstantOp>(
+          loc, s3Type,
+          DenseElementsAttr::get(
+              s3Type, ArrayRef<int64_t>{M, N16, kNzTileSize}));
+      auto resh1Type = RankedTensorType::get({M, N16, kNzTileSize}, elemType);
+      auto resh1 =
+          b.create<tensor::ReshapeOp>(loc, resh1Type, p.pSrc, s3.getResult());
+      auto emptyT = b.create<tensor::EmptyOp>(
+          loc, ArrayRef<int64_t>{N16, M, kNzTileSize}, elemType);
+      auto transpose = b.create<linalg::TransposeOp>(
+          loc, resh1.getResult(), emptyT.getResult(),
+          ArrayRef<int64_t>{1, 0, 2});
+      packedTensor = transpose->getResult(0);
+    }
 
     b.setInsertionPoint(p.anchor);
     // reshape [N16,M,kNzTileSize] -> [N16,M16,kNzTileSize,kNzTileSize]
@@ -806,7 +822,7 @@ rebuildVectorToCubePacks(ArrayRef<VectorToCubePack> packs, Value sbidx,
             s4Type, ArrayRef<int64_t>{N16, M16, kNzTileSize, kNzTileSize}));
     auto nzType =
         RankedTensorType::get({N16, M16, kNzTileSize, kNzTileSize}, elemType);
-    auto resh2 = b.create<tensor::ReshapeOp>(loc, nzType, transp->getResult(0),
+    auto resh2 = b.create<tensor::ReshapeOp>(loc, nzType, packedTensor,
                                              s4.getResult());
     // to_memref + cast to UB
     auto memT = MemRefType::get({N16, M16, kNzTileSize, kNzTileSize}, elemType);
@@ -1180,11 +1196,294 @@ materializeStage94RowwiseRegion(VectorToCubePack &pack, unsigned lane) {
   return outlinedProbability;
 }
 
+static FailureOr<Value>
+materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
+  Operation *probabilityProducer = pack.pSrc.getDefiningOp();
+  Operation *anchor = pack.anchor;
+  auto probabilityType = dyn_cast<RankedTensorType>(pack.pSrc.getType());
+  if (!probabilityProducer || !anchor || !probabilityType ||
+      !probabilityType.hasStaticShape() || probabilityType.getRank() != 2 ||
+      probabilityProducer->getBlock() != anchor->getBlock())
+    return failure();
+  int64_t rows = probabilityType.getDimSize(0);
+  int64_t width = probabilityType.getDimSize(1);
+  constexpr int64_t chunkWidth = 4 * kNzTileSize;
+  if (rows <= 0 || width <= 0 || width % chunkWidth != 0)
+    return failure();
+
+  Operation *precedingWait = nullptr;
+  for (Operation *cursor = probabilityProducer->getPrevNode(); cursor;
+       cursor = cursor->getPrevNode())
+    if (isa<hivm::SyncBlockWaitOp>(cursor)) {
+      precedingWait = cursor;
+      break;
+    }
+  if (!precedingWait)
+    return failure();
+
+  SmallVector<Operation *> operations;
+  DenseSet<Operation *> operationSet;
+  arith::MulFOp scaledScore;
+  linalg::ReduceOp maxReduce;
+  arith::MaximumFOp newMaximum;
+  math::ExpOp probabilityExp;
+  linalg::ReduceOp sumReduce;
+  math::ExpOp alpha;
+  arith::AddFOp newDenominator;
+  for (Operation *cursor = precedingWait->getNextNode();
+       cursor && cursor != anchor; cursor = cursor->getNextNode()) {
+    if (cursor->hasTrait<OpTrait::IsTerminator>() ||
+        isa<hivm::SyncBlockWaitOp, hivm::SyncBlockSetOp>(cursor))
+      return failure();
+    bool hasRowTensorResult = llvm::any_of(
+        cursor->getResultTypes(), [&](Type type) {
+          auto tensor = dyn_cast<RankedTensorType>(type);
+          return tensor && tensor.hasStaticShape() && tensor.getRank() > 0 &&
+                 tensor.getDimSize(0) == rows;
+        });
+    if (!hasRowTensorResult || isa<bufferization::ToTensorOp>(cursor) ||
+        isa<arith::ConstantOp>(cursor))
+      continue;
+    operations.push_back(cursor);
+    operationSet.insert(cursor);
+    if (auto op = dyn_cast<arith::MulFOp>(cursor)) {
+      auto result = dyn_cast<RankedTensorType>(op.getType());
+      if (result && result.getRank() == 2 && !scaledScore)
+        scaledScore = op;
+    } else if (auto op = dyn_cast<linalg::ReduceOp>(cursor)) {
+      if (!maxReduce)
+        maxReduce = op;
+      else if (!sumReduce)
+        sumReduce = op;
+    } else if (auto op = dyn_cast<arith::MaximumFOp>(cursor)) {
+      auto result = dyn_cast<RankedTensorType>(op.getType());
+      if (result && result.getRank() == 1)
+        newMaximum = op;
+    } else if (auto op = dyn_cast<math::ExpOp>(cursor)) {
+      auto result = dyn_cast<RankedTensorType>(op.getType());
+      if (result && result.getRank() == 2)
+        probabilityExp = op;
+      else if (result && result.getRank() == 1)
+        alpha = op;
+    } else if (auto op = dyn_cast<arith::AddFOp>(cursor)) {
+      auto result = dyn_cast<RankedTensorType>(op.getType());
+      if (result && result.getRank() == 1)
+        newDenominator = op;
+    }
+  }
+  if (!scaledScore || !maxReduce || !newMaximum || !probabilityExp ||
+      !sumReduce || !alpha || !newDenominator ||
+      probabilityProducer != pack.pSrc.getDefiningOp())
+    return failure();
+
+  Value score = scaledScore.getLhs();
+  Value scale = scaledScore.getRhs();
+  Value oldMaximum = newMaximum.getLhs() == maxReduce.getResult(0)
+                         ? newMaximum.getRhs()
+                         : newMaximum.getLhs();
+  Value alphaInput = alpha.getOperand();
+  auto alphaSub = alphaInput.getDefiningOp<arith::SubFOp>();
+  if (!alphaSub)
+    return failure();
+  Value oldDenominator;
+  for (Operation *operation : operations)
+    if (auto mul = dyn_cast<arith::MulFOp>(operation)) {
+      if (mul.getLhs() == alpha.getResult())
+        oldDenominator = mul.getRhs();
+      else if (mul.getRhs() == alpha.getResult())
+        oldDenominator = mul.getLhs();
+    }
+  if (!oldDenominator)
+    return failure();
+
+  Location loc = probabilityProducer->getLoc();
+  MLIRContext *context = probabilityProducer->getContext();
+  Type f32 = cast<RankedTensorType>(scaledScore.getType()).getElementType();
+  Type pElement = probabilityType.getElementType();
+  auto rowVectorType = RankedTensorType::get({1, chunkWidth}, f32);
+  auto rowScalarType = RankedTensorType::get({1}, f32);
+  auto maximumType = RankedTensorType::get({rows}, f32);
+  auto scaledType = RankedTensorType::get({rows, width}, f32);
+  int64_t n16 = width / kNzTileSize;
+  auto packedType =
+      RankedTensorType::get({n16, rows, kNzTileSize}, pElement);
+
+  OpBuilder builder(operations.front());
+  SmallVector<Type> scopeResults{maximumType, maximumType, packedType,
+                                 maximumType};
+  auto simdScope = builder.create<scope::ScopeOp>(loc, scopeResults);
+  simdScope.getBodyRegion().emplaceBlock();
+  simdScope->setAttr("noinline", UnitAttr::get(context));
+  simdScope->setAttr("outline", BoolAttr::get(context, true));
+  simdScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
+  setOpEngineTypeAttr(simdScope, EngineType::VECTOR);
+  Block *scopeBlock = &simdScope.getBodyRegion().front();
+  OpBuilder b = OpBuilder::atBlockEnd(scopeBlock);
+
+  auto emptyMaximum =
+      b.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{rows}, f32);
+  auto emptyScaled = b.create<tensor::EmptyOp>(
+      loc, ArrayRef<int64_t>{rows, width}, f32);
+  Value lower = b.create<arith::ConstantIndexOp>(loc, 0);
+  Value upper = b.create<arith::ConstantIndexOp>(loc, rows);
+  Value step = b.create<arith::ConstantIndexOp>(loc, 1);
+  auto maxLoop = b.create<scf::ForOp>(
+      loc, lower, upper, step,
+      ValueRange{emptyMaximum.getResult(), emptyScaled.getResult()});
+  Block *maxBody = maxLoop.getBody();
+  maxBody->back().erase();
+  OpBuilder mb = OpBuilder::atBlockEnd(maxBody);
+  Value row = maxLoop.getInductionVar();
+
+  auto extractRowChunk = [&](OpBuilder &rb, Value tensorValue, int64_t chunk,
+                             Type elementType) {
+    auto type = RankedTensorType::get({1, chunkWidth}, elementType);
+    SmallVector<OpFoldResult> offsets{row, rb.getIndexAttr(chunk)};
+    SmallVector<OpFoldResult> sizes{rb.getIndexAttr(1),
+                                    rb.getIndexAttr(chunkWidth)};
+    SmallVector<OpFoldResult> strides{rb.getIndexAttr(1), rb.getIndexAttr(1)};
+    return rb.create<tensor::ExtractSliceOp>(loc, type, tensorValue, offsets,
+                                              sizes, strides)
+        .getResult();
+  };
+  auto insertRowChunk = [&](OpBuilder &rb, Value value, Value destination,
+                            int64_t chunk) {
+    SmallVector<OpFoldResult> offsets{row, rb.getIndexAttr(chunk)};
+    SmallVector<OpFoldResult> sizes{rb.getIndexAttr(1),
+                                    rb.getIndexAttr(chunkWidth)};
+    SmallVector<OpFoldResult> strides{rb.getIndexAttr(1), rb.getIndexAttr(1)};
+    return rb.create<tensor::InsertSliceOp>(loc, value, destination, offsets,
+                                             sizes, strides)
+        .getResult();
+  };
+  Value scaledRows = maxLoop.getRegionIterArgs()[1];
+  Value combinedMaximum;
+  for (int64_t chunk = 0; chunk < width; chunk += chunkWidth) {
+    Value scoreChunk = extractRowChunk(mb, score, chunk, f32);
+    Value scaleChunk = extractRowChunk(mb, scale, chunk, f32);
+    Value scaled = mb.create<arith::MulFOp>(loc, scoreChunk, scaleChunk);
+    scaledRows = insertRowChunk(mb, scaled, scaledRows, chunk);
+    combinedMaximum = combinedMaximum
+                          ? mb.create<arith::MaximumFOp>(loc, combinedMaximum,
+                                                        scaled)
+                                .getResult()
+                          : scaled;
+  }
+  SmallVector<OpFoldResult> scalarOffset{row};
+  SmallVector<OpFoldResult> scalarSize{mb.getIndexAttr(1)};
+  SmallVector<OpFoldResult> scalarStride{mb.getIndexAttr(1)};
+  Value maxInit = mb.create<tensor::ExtractSliceOp>(
+      loc, rowScalarType, maxReduce.getDpsInits()[0], scalarOffset,
+      scalarSize, scalarStride);
+  IRMapping maxMapping;
+  maxMapping.map(maxReduce.getDpsInputs()[0], combinedMaximum);
+  maxMapping.map(maxReduce.getDpsInits()[0], maxInit);
+  Operation *maxClone = mb.clone(*maxReduce, maxMapping);
+  maxClone->getResult(0).setType(rowScalarType);
+  Value maxRows = mb.create<tensor::InsertSliceOp>(
+      loc, maxClone->getResult(0), maxLoop.getRegionIterArgs()[0],
+      scalarOffset, scalarSize, scalarStride);
+  mb.create<scf::YieldOp>(loc, ValueRange{maxRows, scaledRows});
+
+  Value maximum =
+      b.create<arith::MaximumFOp>(loc, oldMaximum, maxLoop.getResult(0));
+  auto emptySum = b.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{rows}, f32);
+  auto emptyPacked = b.create<tensor::EmptyOp>(
+      loc, packedType.getShape(), packedType.getElementType());
+  auto expLoop = b.create<scf::ForOp>(
+      loc, lower, upper, step,
+      ValueRange{emptySum.getResult(), emptyPacked.getResult()});
+  Block *expBody = expLoop.getBody();
+  expBody->back().erase();
+  OpBuilder eb = OpBuilder::atBlockEnd(expBody);
+  row = expLoop.getInductionVar();
+  Value maximumRow = eb.create<tensor::ExtractSliceOp>(
+      loc, rowScalarType, maximum, SmallVector<OpFoldResult>{row}, scalarSize,
+      scalarStride);
+  auto broadcastInit =
+      eb.create<tensor::EmptyOp>(loc, rowVectorType.getShape(), f32);
+  Value maximumBroadcast = eb.create<linalg::BroadcastOp>(
+      loc, maximumRow, broadcastInit, ArrayRef<int64_t>{1});
+  Value sumChunks;
+  Value packedRows = expLoop.getRegionIterArgs()[1];
+  for (int64_t chunk = 0; chunk < width; chunk += chunkWidth) {
+    Value scaled = extractRowChunk(eb, maxLoop.getResult(1), chunk, f32);
+    Value shifted = eb.create<arith::SubFOp>(loc, scaled, maximumBroadcast);
+    Value exponential = eb.create<math::ExpOp>(loc, shifted);
+    sumChunks = sumChunks
+                    ? eb.create<arith::AddFOp>(loc, sumChunks, exponential)
+                          .getResult()
+                    : exponential;
+    Value cast = eb.create<arith::TruncFOp>(
+        loc, RankedTensorType::get({1, chunkWidth}, pElement), exponential);
+    auto shapeType = RankedTensorType::get({3}, b.getI64Type());
+    auto shape = eb.create<arith::ConstantOp>(
+        loc, shapeType,
+        DenseElementsAttr::get(
+            shapeType,
+            ArrayRef<int64_t>{chunkWidth / kNzTileSize, 1, kNzTileSize}));
+    auto packedChunkType = RankedTensorType::get(
+        {chunkWidth / kNzTileSize, 1, kNzTileSize}, pElement);
+    Value packedChunk = eb.create<tensor::ReshapeOp>(
+        loc, packedChunkType, cast, shape);
+    SmallVector<OpFoldResult> offsets{
+        eb.getIndexAttr(chunk / kNzTileSize), row, eb.getIndexAttr(0)};
+    SmallVector<OpFoldResult> sizes{
+        eb.getIndexAttr(chunkWidth / kNzTileSize), eb.getIndexAttr(1),
+        eb.getIndexAttr(kNzTileSize)};
+    SmallVector<OpFoldResult> strides(3, eb.getIndexAttr(1));
+    packedRows = eb.create<tensor::InsertSliceOp>(
+        loc, packedChunk, packedRows, offsets, sizes, strides);
+  }
+  Value sumInit = eb.create<tensor::ExtractSliceOp>(
+      loc, rowScalarType, sumReduce.getDpsInits()[0],
+      SmallVector<OpFoldResult>{row}, scalarSize, scalarStride);
+  IRMapping sumMapping;
+  sumMapping.map(sumReduce.getDpsInputs()[0], sumChunks);
+  sumMapping.map(sumReduce.getDpsInits()[0], sumInit);
+  Operation *sumClone = eb.clone(*sumReduce, sumMapping);
+  sumClone->getResult(0).setType(rowScalarType);
+  Value sumRows = eb.create<tensor::InsertSliceOp>(
+      loc, sumClone->getResult(0), expLoop.getRegionIterArgs()[0],
+      SmallVector<OpFoldResult>{row}, scalarSize, scalarStride);
+  eb.create<scf::YieldOp>(loc, ValueRange{sumRows, packedRows});
+
+  Value alphaValue = b.create<math::ExpOp>(
+      loc, b.create<arith::SubFOp>(loc, oldMaximum, maximum));
+   Value denominator = b.create<arith::AddFOp>(
+      loc, b.create<arith::MulFOp>(loc, oldDenominator, alphaValue),
+      expLoop.getResult(0));
+  b.create<scope::ReturnOp>(
+      loc, ValueRange{maximum, denominator, expLoop.getResult(1), alphaValue});
+
+  SmallVector<std::pair<Value, Value>> replacements{
+      {newMaximum.getResult(), simdScope->getResult(0)},
+      {newDenominator.getResult(), simdScope->getResult(1)},
+      {alpha.getResult(), simdScope->getResult(3)}};
+  for (auto [oldValue, replacement] : replacements) {
+    SmallVector<OpOperand *> outsideUses;
+    for (OpOperand &use : oldValue.getUses())
+      if (!operationSet.contains(use.getOwner()))
+        outsideUses.push_back(&use);
+    for (OpOperand *use : outsideUses)
+      use->set(replacement);
+  }
+  for (Operation *operation : llvm::reverse(operations))
+    operation->erase();
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-materialized-online-softmax lane=" << lane
+             << " rows=" << rows << " chunk-width=" << chunkWidth
+             << " chunks=" << (width / chunkWidth)
+             << " direct-nz=yes publication=detached\n");
+  return simdScope->getResult(2);
+}
+
 static LogicalResult
 outlineStage94VectorRegions(MutableArrayRef<VectorToCubePack> packs) {
   for (auto [lane, pack] : llvm::enumerate(packs)) {
     FailureOr<Value> probability =
-        materializeStage94RowwiseRegion(pack, lane);
+        materializeStage94OnlineSoftmaxRegion(pack, lane);
     if (failed(probability))
       return failure();
     pack.pSrc = *probability;
