@@ -499,6 +499,8 @@ def _parse_linalg_metadata(linalg: str, metadata: dict):
     # --- Regular expressions and examples ---
 
     DISABLE_AUTO_TILE_AND_BIND_SUBBLOCK_REGEX = r'hivm.disable_auto_tile_and_bind_subblock'
+    PRESERVE_EXPLICIT_CV_SPLIT_SCHEDULE_REGEX = \
+        r'triton_ascend\.cv_split_scheduling\.preserve_explicit_schedule'
 
     # Inserted by DiscreteMaskAccessConversionPass / MemOpConverter when discrete
     # masked stores need cross-block exclusion (e.g. hivm.sync_block_lock).
@@ -524,6 +526,8 @@ def _parse_linalg_metadata(linalg: str, metadata: dict):
     metadata["shared"] = 1
     # Force disable auto tile and bind subblock if attribute is present in module
     metadata["auto_tile_and_bind_subblock"] = not re.search(DISABLE_AUTO_TILE_AND_BIND_SUBBLOCK_REGEX, linalg)
+    metadata["cv_split_preserve_explicit_schedule"] = \
+        re.search(PRESERVE_EXPLICIT_CV_SPLIT_SCHEDULE_REGEX, linalg) is not None
     # Turn off auto-blockify only for the ORDERED (token-ring) sync_block_lock:
     if re.search(SYNC_BLOCK_LOCK_REGEX, linalg) and not re.search(r"sync_block_lock_unordered", linalg):
         metadata["has_auto_blockify_blacklist_op"] = True
@@ -611,12 +615,24 @@ def _npu_compiler_supports_option(compiler_path: str, option: str) -> bool:
     return option in result.stdout
 
 
+def _preserves_explicit_cv_split_schedule(metadata):
+    return bool(metadata.get("cv_split_preserve_explicit_schedule", False))
+
+
 def get_auto_bind_sub_block_option(metadata):
+    if _preserves_explicit_cv_split_schedule(metadata):
+        return False
     # auto_tile_and_bind_subblock is read from the module.
     # enable_auto_bind_sub_block is set by the user and has a higher priority.
     enable_auto_bind_sub_block = metadata["enable_auto_bind_sub_block"]
     return (metadata["auto_tile_and_bind_subblock"]
             if enable_auto_bind_sub_block is None else enable_auto_bind_sub_block)
+
+
+def get_graph_sync_solver_option(metadata):
+    if _preserves_explicit_cv_split_schedule(metadata):
+        return False
+    return metadata["sync_solver"]
 
 
 def _save_npuir_debug_output(stdout_bytes: bytes, stderr_bytes: bytes, tmpdir: str, metadata_hash: str):
@@ -737,7 +753,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += \
                 [f"--enable-hivm-auto-cv-balance={enable_hivm_auto_cv_balance}"]
 
-        sync_solver = metadata["sync_solver"]
+        sync_solver = get_graph_sync_solver_option(metadata)
         if sync_solver is not None:
             _compile_option_list += \
                 [f"--enable-hivm-graph-sync-solver={sync_solver}"]
@@ -956,7 +972,7 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             _compile_option_list += \
                 [f"--enable-hivm-auto-cv-balance={enable_hivm_auto_cv_balance}"]
 
-        sync_solver = metadata["sync_solver"]
+        sync_solver = get_graph_sync_solver_option(metadata)
         if sync_solver is not None:
             _compile_option_list += [
                 f"--enable-hivm-graph-sync-solver={sync_solver}",
