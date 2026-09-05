@@ -91,29 +91,20 @@ def test_row_reduction_identities_are_materialized_inside_simd_scope() -> None:
     assert "createReductionInit(eb, sumReduce, rowScalarType)" in online
 
 
-def test_loop_carried_storage_is_created_before_the_simd_scope() -> None:
+def test_loop_storage_follows_escape_lifetimes() -> None:
     source = read(LIB / "ScopeSeparation.cpp")
     online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
     scope = online.index("builder.create<scope::ScopeOp>")
-    for token in (
-            "maxRowsInit",
-            "sumRowsInit",
-            "scaledRowsInit",
-            "packedRowsInit",
-    ):
+    for token in ("sumRowsInit", "scaledRowsInit", "packedRowsInit"):
         assert online.index(token) < scope
-    sum_storage = 'createUbBackedTensor(builder, maximumType, "stage94.sum-rows")'
-    max_storage = 'createUbBackedTensor(builder, maximumType, "stage94.max-rows")'
+    sum_storage = 'createLoopStorage(builder, maximumType, "stage94.sum-rows")'
+    max_storage = 'createLoopStorage(b, maximumType, "stage94.max-rows")'
     assert sum_storage in online
     assert max_storage in online
-    assert online.index(sum_storage) < online.index(max_storage)
+    assert online.index(sum_storage) < scope < online.index(max_storage)
     for token in (
-            "createUbBackedTensor",
-            "hivm::AddressSpace::UB",
-            "memref::AllocOp",
-            'mark->setAttr("effects"',
-            "memref::MemorySpaceCastOp",
-            "bufferization::ToTensorOp",
+            "createLoopStorage",
+            "tensor::EmptyOp",
             '"stage94.max-rows"',
             '"stage94.sum-rows"',
             '"stage94.scaled-rows"',
@@ -178,7 +169,7 @@ if __name__ == "__main__":
     test_no_textual_or_shape_identity_policy()
     test_generated_row_loops_handle_empty_scf_bodies()
     test_row_reduction_identities_are_materialized_inside_simd_scope()
-    test_loop_carried_storage_is_created_before_the_simd_scope()
+    test_loop_storage_follows_escape_lifetimes()
     test_online_softmax_marks_the_inter_loop_vector_dependency()
     test_final_maximum_preserves_original_tensor_semantics()
     test_direct_nz_pack_reshapes_f32_before_truncation()

@@ -1364,28 +1364,15 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
       RankedTensorType::get({n16, rows, kNzTileSize}, pElement);
 
   Operation *insertionAnchor = operations.front();
-  auto ubAddrSpace =
-      hivm::AddressSpaceAttr::get(context, hivm::AddressSpace::UB);
-  auto createUbBackedTensor = [&](OpBuilder &storageBuilder,
-                                  RankedTensorType tensorType,
-                                  StringRef role) -> Value {
+  auto createLoopStorage = [&](OpBuilder &storageBuilder,
+                               RankedTensorType tensorType,
+                               StringRef role) -> Value {
     Location storageLoc =
         NameLoc::get(storageBuilder.getStringAttr(role), loc);
-    auto ubType = MemRefType::get(tensorType.getShape(),
-                                  tensorType.getElementType(), nullptr,
-                                  ubAddrSpace);
-    auto allocation =
-        storageBuilder.create<memref::AllocOp>(storageLoc, ubType);
-    auto mark = storageBuilder.create<annotation::MarkOp>(
-        storageLoc, allocation.getResult());
-    mark->setAttr("effects", storageBuilder.getStrArrayAttr({"write", "read"}));
-    auto plainType = MemRefType::get(tensorType.getShape(),
-                                     tensorType.getElementType());
-    Value cast = storageBuilder.create<memref::MemorySpaceCastOp>(
-        storageLoc, plainType, allocation.getResult());
     return storageBuilder
-        .create<bufferization::ToTensorOp>(storageLoc, tensorType, cast, true,
-                                           true)
+        .create<tensor::EmptyOp>(storageLoc, tensorType.getShape(),
+                                 tensorType.getElementType(),
+                                 tensorType.getEncoding())
         .getResult();
   };
   auto createReductionInit =
@@ -1413,17 +1400,12 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   };
 
   OpBuilder builder(insertionAnchor);
-  // Keep output-aliasing storage first. One-shot bufferization assigns scope
-  // results in order; placing the returned sum before the non-returned max-row
-  // scratch avoids an otherwise unnecessary out-of-place loop copy.
   Value sumRowsInit =
-      createUbBackedTensor(builder, maximumType, "stage94.sum-rows");
-  Value maxRowsInit =
-      createUbBackedTensor(builder, maximumType, "stage94.max-rows");
+      createLoopStorage(builder, maximumType, "stage94.sum-rows");
   Value scaledRowsInit =
-      createUbBackedTensor(builder, scaledType, "stage94.scaled-rows");
+      createLoopStorage(builder, scaledType, "stage94.scaled-rows");
   Value packedRowsInit =
-      createUbBackedTensor(builder, packedType, "stage94.packed-rows");
+      createLoopStorage(builder, packedType, "stage94.packed-rows");
   SmallVector<Type> scopeResults{maximumType, maximumType, packedType};
   auto simdScope = builder.create<scope::ScopeOp>(loc, scopeResults);
   simdScope.getBodyRegion().emplaceBlock();
@@ -1437,6 +1419,11 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
              << " checkpoint=scope-created\n");
   Block *scopeBlock = &simdScope.getBodyRegion().front();
   OpBuilder b = OpBuilder::atBlockEnd(scopeBlock);
+  // The row maxima are scratch, not a scope result. Keep their lifetime inside
+  // the SIMD scope so SCF bufferization cannot confuse them with the same-shaped
+  // sum result and insert a cross-boundary copy.
+  Value maxRowsInit =
+      createLoopStorage(b, maximumType, "stage94.max-rows");
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=scope-builder-ready\n");
