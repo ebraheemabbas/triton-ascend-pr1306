@@ -1571,18 +1571,20 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
                     ? eb.create<arith::AddFOp>(loc, sumChunks, exponential)
                           .getResult()
                     : exponential;
-    Value cast = eb.create<arith::TruncFOp>(
-        loc, RankedTensorType::get({1, chunkWidth}, pElement), exponential);
     auto shapeType = RankedTensorType::get({3}, b.getI64Type());
     auto shape = eb.create<arith::ConstantOp>(
         loc, shapeType,
         DenseElementsAttr::get(
             shapeType,
             ArrayRef<int64_t>{chunkWidth / kNzTileSize, 1, kNzTileSize}));
+    auto packedFloatChunkType = RankedTensorType::get(
+        {chunkWidth / kNzTileSize, 1, kNzTileSize}, f32);
+    Value packedFloatChunk = eb.create<tensor::ReshapeOp>(
+        loc, packedFloatChunkType, exponential, shape);
     auto packedChunkType = RankedTensorType::get(
         {chunkWidth / kNzTileSize, 1, kNzTileSize}, pElement);
-    Value packedChunk = eb.create<tensor::ReshapeOp>(
-        loc, packedChunkType, cast, shape);
+    Value packedChunk = eb.create<arith::TruncFOp>(
+        loc, packedChunkType, packedFloatChunk);
     SmallVector<OpFoldResult> offsets{
         eb.getIndexAttr(chunk / kNzTileSize), row, eb.getIndexAttr(0)};
     SmallVector<OpFoldResult> sizes{

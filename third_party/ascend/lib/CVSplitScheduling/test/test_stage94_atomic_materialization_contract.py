@@ -127,6 +127,18 @@ def test_online_softmax_marks_the_inter_loop_vector_dependency() -> None:
     assert online.index(marker) < online.index("auto expLoop =")
 
 
+def test_direct_nz_pack_reshapes_f32_before_truncation() -> None:
+    source = read(LIB / "ScopeSeparation.cpp")
+    online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
+    reshape = "Value packedFloatChunk = eb.create<tensor::ReshapeOp>"
+    truncate = "Value packedChunk = eb.create<arith::TruncFOp>"
+    assert reshape in online
+    assert truncate in online
+    assert online.index(reshape) < online.index(truncate)
+    assert "packedFloatChunkType, exponential, shape" in online
+    assert "packedChunkType, packedFloatChunk" in online
+
+
 def test_lane_scope_returns_only_maximum_sum_and_packed_probability() -> None:
     source = read(LIB / "ScopeSeparation.cpp")
     online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
@@ -157,5 +169,6 @@ if __name__ == "__main__":
     test_row_reduction_identities_are_materialized_inside_simd_scope()
     test_loop_carried_storage_is_created_before_the_simd_scope()
     test_online_softmax_marks_the_inter_loop_vector_dependency()
+    test_direct_nz_pack_reshapes_f32_before_truncation()
     test_lane_scope_returns_only_maximum_sum_and_packed_probability()
     print("Stage 9.4b/c atomic materialization source contract: PASS")
