@@ -1288,8 +1288,8 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   if (!alphaSub)
     return failure();
   Value oldDenominator;
-  for (Operation *operation : operations)
-    if (auto mul = dyn_cast<arith::MulFOp>(operation)) {
+  for (Value operand : newDenominator->getOperands())
+    if (auto mul = operand.getDefiningOp<arith::MulFOp>()) {
       if (mul.getLhs() == alpha.getResult())
         oldDenominator = mul.getRhs();
       else if (mul.getRhs() == alpha.getResult())
