@@ -77,6 +77,14 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
            "plan from typed materialized facts. Requires cost-model request "
            "extraction, emits diagnostics only, and never mutates IR or emits "
            "the backend-preservation attribute.">,
+    Option<"enableStage9DetachedScheduleDiagnostics",
+           "enable-stage9-detached-schedule-diagnostics",
+           "bool", /*default*/"false",
+           "lower a verified Stage 9.2 plan into paired, detached CUBE and "
+           "VECTOR command streams and verify their event, slot, live-depth, "
+           "geometry, reduction, and backend contracts. Emits diagnostics "
+           "only; it creates no MLIR operation, publishes no scope, and "
+           "never mutates IR.">,
     Option<"promoteFullyUnrolled", "promote-fully-unrolled",
            "bool", /*default*/"true",
            "promote the scope loops left by a candidate whose unroll consumed "

@@ -299,7 +299,9 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                 pure_prerequisite_hoist_budget_bytes=metadata["cv_split_pure_prerequisite_hoist_budget_bytes"],
                 enable_cost_model_diagnostics=metadata["cv_split_enable_cost_model_diagnostics"],
                 enable_stage9_schedule_plan_diagnostics=metadata[
-                    "cv_split_enable_stage9_schedule_plan_diagnostics"])
+                    "cv_split_enable_stage9_schedule_plan_diagnostics"],
+                enable_stage9_detached_schedule_diagnostics=metadata[
+                    "cv_split_enable_stage9_detached_schedule_diagnostics"])
 
         if try_dynamic_cv:
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
@@ -1237,6 +1239,9 @@ class NPUOptions:
     # without querying the model, selecting a candidate, or mutating IR.
     cv_split_enable_cost_model_diagnostics: bool = False
     # Stage 9.2 analysis-only control. Build and verify the parameterized
+    # Stage 9.3 analysis-only control. Build and verify paired detached CUBE
+    # and VECTOR command streams without creating or publishing MLIR.
+    cv_split_enable_stage9_detached_schedule_diagnostics: bool = False
     # post-CVSplit schedule plan from the typed materialized request.
     cv_split_enable_stage9_schedule_plan_diagnostics: bool = False
     # Spare UB, in bytes, that cross-scope transfers may spend to stop reusing

@@ -31,6 +31,7 @@
 #include "ascend/include/CVSplitScheduling/DependencyScheduler.h"
 #include "ascend/include/CVSplitScheduling/PreCheck.h"
 #include "ascend/include/CVSplitScheduling/PurePrerequisiteHoisting.h"
+#include "ascend/include/CVSplitScheduling/PostCVSplitDetachedSchedule.h"
 #include "ascend/include/CVSplitScheduling/PostCVSplitSchedulePlan.h"
 #include "ascend/include/CVSplitScheduling/ScopeSeparation.h"
 #include "ascend/include/CVSplitScheduling/SoftmaxRegroup.h"
@@ -760,6 +761,8 @@ public:
     this->enableCostModelDiagnostics = options.enableCostModelDiagnostics;
     this->enableStage9SchedulePlanDiagnostics =
         options.enableStage9SchedulePlanDiagnostics;
+    this->enableStage9DetachedScheduleDiagnostics =
+        options.enableStage9DetachedScheduleDiagnostics;
     this->promoteFullyUnrolled = options.promoteFullyUnrolled;
     this->pipelineDistance = options.pipelineDistance;
     this->privateBufferUbBudgetBytes = options.privateBufferUbBudgetBytes;
@@ -1186,11 +1189,18 @@ private:
             LLVM_DEBUG(llvm::dbgs()
                        << "[cv-split] cost-model-schedules incomplete; "
                           "qualified scheduler/emitter remains active\n");
-          if (enableStage9SchedulePlanDiagnostics) {
+          if (enableStage9SchedulePlanDiagnostics ||
+              enableStage9DetachedScheduleDiagnostics) {
             cv_split::PostCVSplitSchedulePlan stage9Plan =
                 cv_split::buildPostCVSplitSchedulePlan(
                     *requests, *materializedResources, *resourceLimits);
-            cv_split::logPostCVSplitSchedulePlan(stage9Plan);
+            if (enableStage9SchedulePlanDiagnostics)
+              cv_split::logPostCVSplitSchedulePlan(stage9Plan);
+            if (enableStage9DetachedScheduleDiagnostics) {
+              cv_split::PostCVSplitDetachedSchedule detachedSchedule =
+                  cv_split::buildPostCVSplitDetachedSchedule(stage9Plan);
+              cv_split::logPostCVSplitDetachedSchedule(detachedSchedule);
+            }
           }
         } else
           LLVM_DEBUG(llvm::dbgs()
@@ -1203,6 +1213,12 @@ private:
       LLVM_DEBUG(llvm::dbgs()
                  << "[cv-split] stage9-plan unavailable reason="
                     "cost-input-diagnostics-disabled mutation=no\n");
+    if (enableStage9DetachedScheduleDiagnostics &&
+        !enableCostModelDiagnostics)
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[cv-split] stage93-detached unavailable reason="
+                    "cost-input-diagnostics-disabled publication=no "
+                    "mutation=no\n");
 
     // Stage 8: Insert cross-scope transfers (BEFORE scope separation)
     LLVM_DEBUG(llvm::dbgs()
