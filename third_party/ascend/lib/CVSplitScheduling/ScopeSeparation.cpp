@@ -914,6 +914,7 @@ outlineStage94VectorRegion(VectorToCubePack &pack, unsigned lane) {
   OpBuilder builder(first);
   auto simdScope = builder.create<scope::ScopeOp>(loc, resultTypes);
   simdScope.getBodyRegion().emplaceBlock();
+  simdScope.setNoInline(true);
   simdScope->setAttr("noinline", UnitAttr::get(context));
   simdScope->setAttr("outline", BoolAttr::get(context, true));
   simdScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
@@ -1041,6 +1042,7 @@ materializeStage94RowwiseRegion(VectorToCubePack &pack, unsigned lane) {
   OpBuilder builder(operations.front());
   auto simdScope = builder.create<scope::ScopeOp>(loc, resultTypes);
   simdScope.getBodyRegion().emplaceBlock();
+  simdScope.setNoInline(true);
   simdScope->setAttr("noinline", UnitAttr::get(context));
   simdScope->setAttr("outline", BoolAttr::get(context, true));
   simdScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
@@ -1422,6 +1424,7 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   SmallVector<Type> scopeResults{maximumType, maximumType, packedType};
   auto simdScope = builder.create<scope::ScopeOp>(loc, scopeResults);
   simdScope.getBodyRegion().emplaceBlock();
+  simdScope.setNoInline(true);
   simdScope->setAttr("noinline", UnitAttr::get(context));
   simdScope->setAttr("outline", BoolAttr::get(context, true));
   simdScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
