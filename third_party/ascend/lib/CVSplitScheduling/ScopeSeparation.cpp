@@ -1363,9 +1363,28 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
       RankedTensorType::get({n16, rows, kNzTileSize}, pElement);
 
   Operation *insertionAnchor = operations.front();
+  auto ubAddrSpace =
+      hivm::AddressSpaceAttr::get(context, hivm::AddressSpace::UB);
+  auto createUbBackedTensor = [&](OpBuilder &storageBuilder,
+                                  RankedTensorType tensorType) -> Value {
+    auto ubType = MemRefType::get(tensorType.getShape(),
+                                  tensorType.getElementType(), nullptr,
+                                  ubAddrSpace);
+    auto allocation = storageBuilder.create<memref::AllocOp>(loc, ubType);
+    auto mark =
+        storageBuilder.create<annotation::MarkOp>(loc, allocation.getResult());
+    mark->setAttr("effects", storageBuilder.getStrArrayAttr({"write", "read"}));
+    auto plainType = MemRefType::get(tensorType.getShape(),
+                                     tensorType.getElementType());
+    Value cast = storageBuilder.create<memref::MemorySpaceCastOp>(
+        loc, plainType, allocation.getResult());
+    return storageBuilder
+        .create<bufferization::ToTensorOp>(loc, tensorType, cast, true, true)
+        .getResult();
+  };
   auto createReductionInit =
       [&](OpBuilder &initBuilder, linalg::ReduceOp reduction,
-          RankedTensorType initType) -> FailureOr<Value> {
+          RankedTensorType initType, bool ubBacked) -> FailureOr<Value> {
     auto fill = reduction.getDpsInits()[0].getDefiningOp<linalg::FillOp>();
     if (!fill || fill.getInputs().size() != 1)
       return failure();
@@ -1377,9 +1396,16 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
         return failure();
       fillInput = initBuilder.clone(*definition)->getResult(0);
     }
-    Value empty = initBuilder.create<tensor::EmptyOp>(
-        loc, initType.getShape(), initType.getElementType(),
-        initType.getEncoding());
+    Value empty;
+    if (ubBacked) {
+      empty = createUbBackedTensor(initBuilder, initType);
+    } else {
+      empty = initBuilder
+                  .create<tensor::EmptyOp>(
+                      loc, initType.getShape(), initType.getElementType(),
+                      initType.getEncoding())
+                  .getResult();
+    }
     return initBuilder
         .create<linalg::FillOp>(loc, ValueRange{fillInput}, ValueRange{empty})
         .getResult(0);
@@ -1387,17 +1413,13 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
 
   OpBuilder builder(insertionAnchor);
   FailureOr<Value> maxRowsInit =
-      createReductionInit(builder, maxReduce, maximumType);
+      createReductionInit(builder, maxReduce, maximumType, true);
   FailureOr<Value> sumRowsInit =
-      createReductionInit(builder, sumReduce, maximumType);
+      createReductionInit(builder, sumReduce, maximumType, true);
   if (failed(maxRowsInit) || failed(sumRowsInit))
     return failure();
-  Value scaledRowsInit = builder.create<tensor::EmptyOp>(
-      loc, scaledType.getShape(), scaledType.getElementType(),
-      scaledType.getEncoding());
-  Value packedRowsInit = builder.create<tensor::EmptyOp>(
-      loc, packedType.getShape(), packedType.getElementType(),
-      packedType.getEncoding());
+  Value scaledRowsInit = createUbBackedTensor(builder, scaledType);
+  Value packedRowsInit = createUbBackedTensor(builder, packedType);
   SmallVector<Type> scopeResults{maximumType, maximumType, packedType,
                                  maximumType};
   auto simdScope = builder.create<scope::ScopeOp>(loc, scopeResults);
@@ -1504,7 +1526,7 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   SmallVector<OpFoldResult> scalarSize{mb.getIndexAttr(1)};
   SmallVector<OpFoldResult> scalarStride{mb.getIndexAttr(1)};
   FailureOr<Value> maxInit =
-      createReductionInit(mb, maxReduce, rowScalarType);
+      createReductionInit(mb, maxReduce, rowScalarType, false);
   if (failed(maxInit))
     return failure();
   LLVM_DEBUG(llvm::dbgs()
@@ -1582,7 +1604,7 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
         loc, packedChunk, packedRows, offsets, sizes, strides);
   }
   FailureOr<Value> sumInit =
-      createReductionInit(eb, sumReduce, rowScalarType);
+      createReductionInit(eb, sumReduce, rowScalarType, false);
   if (failed(sumInit))
     return failure();
   IRMapping sumMapping;
