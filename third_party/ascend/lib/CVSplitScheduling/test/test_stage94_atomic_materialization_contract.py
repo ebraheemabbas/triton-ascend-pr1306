@@ -97,21 +97,25 @@ def test_loop_carried_storage_is_created_before_the_simd_scope() -> None:
     scope = online.index("builder.create<scope::ScopeOp>")
     for token in ("maxRowsInit", "sumRowsInit", "scaledRowsInit", "packedRowsInit"):
         assert online.index(token) < scope
-    assert 'createUbBackedTensor(builder, maximumType, "stage94.max-rows")' in online
-    assert 'createUbBackedTensor(builder, maximumType, "stage94.sum-rows")' in online
+    assert 'createLoopStorage(builder, maximumType, "stage94.max-rows")' in online
+    assert 'createLoopStorage(builder, maximumType, "stage94.sum-rows")' in online
     for token in (
-            "createUbBackedTensor",
-            "hivm::AddressSpace::UB",
-            "memref::AllocOp",
-            'mark->setAttr("effects"',
-            "memref::MemorySpaceCastOp",
-            "bufferization::ToTensorOp",
+            "createLoopStorage",
+            "tensor::EmptyOp",
             '"stage94.max-rows"',
             '"stage94.sum-rows"',
             '"stage94.scaled-rows"',
             '"stage94.packed-rows"',
     ):
         assert token in online
+    loop_storage = online.split("auto createLoopStorage", 1)[1].split("};", 1)[0]
+    for forbidden in (
+            "memref::AllocOp",
+            "memref::MemorySpaceCastOp",
+            "bufferization::ToTensorOp",
+            'mark->setAttr("effects"',
+    ):
+        assert forbidden not in loop_storage
 
 
 def test_online_softmax_marks_the_inter_loop_vector_dependency() -> None:

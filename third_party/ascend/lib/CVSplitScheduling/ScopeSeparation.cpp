@@ -1364,28 +1364,15 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
       RankedTensorType::get({n16, rows, kNzTileSize}, pElement);
 
   Operation *insertionAnchor = operations.front();
-  auto ubAddrSpace =
-      hivm::AddressSpaceAttr::get(context, hivm::AddressSpace::UB);
-  auto createUbBackedTensor = [&](OpBuilder &storageBuilder,
-                                  RankedTensorType tensorType,
-                                  StringRef role) -> Value {
+  auto createLoopStorage = [&](OpBuilder &storageBuilder,
+                               RankedTensorType tensorType,
+                               StringRef role) -> Value {
     Location storageLoc =
         NameLoc::get(storageBuilder.getStringAttr(role), loc);
-    auto ubType = MemRefType::get(tensorType.getShape(),
-                                  tensorType.getElementType(), nullptr,
-                                  ubAddrSpace);
-    auto allocation =
-        storageBuilder.create<memref::AllocOp>(storageLoc, ubType);
-    auto mark = storageBuilder.create<annotation::MarkOp>(
-        storageLoc, allocation.getResult());
-    mark->setAttr("effects", storageBuilder.getStrArrayAttr({"write", "read"}));
-    auto plainType = MemRefType::get(tensorType.getShape(),
-                                     tensorType.getElementType());
-    Value cast = storageBuilder.create<memref::MemorySpaceCastOp>(
-        storageLoc, plainType, allocation.getResult());
     return storageBuilder
-        .create<bufferization::ToTensorOp>(storageLoc, tensorType, cast, true,
-                                           true)
+        .create<tensor::EmptyOp>(storageLoc, tensorType.getShape(),
+                                 tensorType.getElementType(),
+                                 tensorType.getEncoding())
         .getResult();
   };
   auto createReductionInit =
@@ -1414,13 +1401,13 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
 
   OpBuilder builder(insertionAnchor);
   Value maxRowsInit =
-      createUbBackedTensor(builder, maximumType, "stage94.max-rows");
+      createLoopStorage(builder, maximumType, "stage94.max-rows");
   Value sumRowsInit =
-      createUbBackedTensor(builder, maximumType, "stage94.sum-rows");
+      createLoopStorage(builder, maximumType, "stage94.sum-rows");
   Value scaledRowsInit =
-      createUbBackedTensor(builder, scaledType, "stage94.scaled-rows");
+      createLoopStorage(builder, scaledType, "stage94.scaled-rows");
   Value packedRowsInit =
-      createUbBackedTensor(builder, packedType, "stage94.packed-rows");
+      createLoopStorage(builder, packedType, "stage94.packed-rows");
   SmallVector<Type> scopeResults{maximumType, maximumType, packedType};
   auto simdScope = builder.create<scope::ScopeOp>(loc, scopeResults);
   simdScope.getBodyRegion().emplaceBlock();
