@@ -100,29 +100,26 @@ def test_loop_carried_storage_is_created_before_the_simd_scope() -> None:
             "sumRowsInit",
             "scaledRowsInit",
             "packedRowsInit",
-            "maximumInit",
     ):
         assert online.index(token) < scope
-    assert 'createLoopStorage(builder, maximumType, "stage94.max-rows")' in online
-    assert 'createLoopStorage(builder, maximumType, "stage94.sum-rows")' in online
+    sum_storage = 'createUbBackedTensor(builder, maximumType, "stage94.sum-rows")'
+    max_storage = 'createUbBackedTensor(builder, maximumType, "stage94.max-rows")'
+    assert sum_storage in online
+    assert max_storage in online
+    assert online.index(sum_storage) < online.index(max_storage)
     for token in (
-            "createLoopStorage",
-            "tensor::EmptyOp",
+            "createUbBackedTensor",
+            "hivm::AddressSpace::UB",
+            "memref::AllocOp",
+            'mark->setAttr("effects"',
+            "memref::MemorySpaceCastOp",
+            "bufferization::ToTensorOp",
             '"stage94.max-rows"',
             '"stage94.sum-rows"',
             '"stage94.scaled-rows"',
             '"stage94.packed-rows"',
-            '"stage94.maximum"',
     ):
         assert token in online
-    loop_storage = online.split("auto createLoopStorage", 1)[1].split("};", 1)[0]
-    for forbidden in (
-            "memref::AllocOp",
-            "memref::MemorySpaceCastOp",
-            "bufferization::ToTensorOp",
-            'mark->setAttr("effects"',
-    ):
-        assert forbidden not in loop_storage
 
 
 def test_online_softmax_marks_the_inter_loop_vector_dependency() -> None:
@@ -134,16 +131,11 @@ def test_online_softmax_marks_the_inter_loop_vector_dependency() -> None:
     assert online.index(marker) < online.index("auto expLoop =")
 
 
-def test_final_maximum_has_an_explicit_destination() -> None:
+def test_final_maximum_preserves_original_tensor_semantics() -> None:
     source = read(LIB / "ScopeSeparation.cpp")
     online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
-    assert 'createLoopStorage(builder, maximumType, "stage94.maximum")' in online
-    assert "hfusion::BinaryFn::maxf" in online
-    assert "b.create<hfusion::ElemwiseBinaryOp>" in online
-    assert "ValueRange{oldMaximum, maxLoop.getResult(0)}" in online
-    assert "ValueRange{maximumInit}" in online
-    assert 'b.getNamedAttr("fun", maximumFunction)' in online
-    assert "Value maximum = maximumOp->getResult(0);" in online
+    assert "b.create<arith::MaximumFOp>(loc, oldMaximum, maxLoop.getResult(0))" in online
+    assert '"stage94.maximum"' not in online
 
 
 def test_direct_nz_pack_reshapes_f32_before_truncation() -> None:
@@ -188,7 +180,7 @@ if __name__ == "__main__":
     test_row_reduction_identities_are_materialized_inside_simd_scope()
     test_loop_carried_storage_is_created_before_the_simd_scope()
     test_online_softmax_marks_the_inter_loop_vector_dependency()
-    test_final_maximum_has_an_explicit_destination()
+    test_final_maximum_preserves_original_tensor_semantics()
     test_direct_nz_pack_reshapes_f32_before_truncation()
     test_lane_scope_returns_only_maximum_sum_and_packed_probability()
     print("Stage 9.4b/c atomic materialization source contract: PASS")

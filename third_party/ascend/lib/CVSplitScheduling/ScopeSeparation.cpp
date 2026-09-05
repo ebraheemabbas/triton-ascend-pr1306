@@ -24,7 +24,6 @@
 #include "ascend/include/CVSplitScheduling/HardwareConstants.h"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
-#include "bishengir/Dialect/HFusion/IR/HFusion.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/Scope/IR/Scope.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -1365,15 +1364,28 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
       RankedTensorType::get({n16, rows, kNzTileSize}, pElement);
 
   Operation *insertionAnchor = operations.front();
-  auto createLoopStorage = [&](OpBuilder &storageBuilder,
-                               RankedTensorType tensorType,
-                               StringRef role) -> Value {
+  auto ubAddrSpace =
+      hivm::AddressSpaceAttr::get(context, hivm::AddressSpace::UB);
+  auto createUbBackedTensor = [&](OpBuilder &storageBuilder,
+                                  RankedTensorType tensorType,
+                                  StringRef role) -> Value {
     Location storageLoc =
         NameLoc::get(storageBuilder.getStringAttr(role), loc);
+    auto ubType = MemRefType::get(tensorType.getShape(),
+                                  tensorType.getElementType(), nullptr,
+                                  ubAddrSpace);
+    auto allocation =
+        storageBuilder.create<memref::AllocOp>(storageLoc, ubType);
+    auto mark = storageBuilder.create<annotation::MarkOp>(
+        storageLoc, allocation.getResult());
+    mark->setAttr("effects", storageBuilder.getStrArrayAttr({"write", "read"}));
+    auto plainType = MemRefType::get(tensorType.getShape(),
+                                     tensorType.getElementType());
+    Value cast = storageBuilder.create<memref::MemorySpaceCastOp>(
+        storageLoc, plainType, allocation.getResult());
     return storageBuilder
-        .create<tensor::EmptyOp>(storageLoc, tensorType.getShape(),
-                                 tensorType.getElementType(),
-                                 tensorType.getEncoding())
+        .create<bufferization::ToTensorOp>(storageLoc, tensorType, cast, true,
+                                           true)
         .getResult();
   };
   auto createReductionInit =
@@ -1401,16 +1413,17 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   };
 
   OpBuilder builder(insertionAnchor);
-  Value maxRowsInit =
-      createLoopStorage(builder, maximumType, "stage94.max-rows");
+  // Keep output-aliasing storage first. One-shot bufferization assigns scope
+  // results in order; placing the returned sum before the non-returned max-row
+  // scratch avoids an otherwise unnecessary out-of-place loop copy.
   Value sumRowsInit =
-      createLoopStorage(builder, maximumType, "stage94.sum-rows");
+      createUbBackedTensor(builder, maximumType, "stage94.sum-rows");
+  Value maxRowsInit =
+      createUbBackedTensor(builder, maximumType, "stage94.max-rows");
   Value scaledRowsInit =
-      createLoopStorage(builder, scaledType, "stage94.scaled-rows");
+      createUbBackedTensor(builder, scaledType, "stage94.scaled-rows");
   Value packedRowsInit =
-      createLoopStorage(builder, packedType, "stage94.packed-rows");
-  Value maximumInit =
-      createLoopStorage(builder, maximumType, "stage94.maximum");
+      createUbBackedTensor(builder, packedType, "stage94.packed-rows");
   SmallVector<Type> scopeResults{maximumType, maximumType, packedType};
   auto simdScope = builder.create<scope::ScopeOp>(loc, scopeResults);
   simdScope.getBodyRegion().emplaceBlock();
@@ -1542,13 +1555,8 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=max-loop-created\n");
 
-  auto maximumFunction = b.getAttr<hfusion::BinaryFnAttr>(
-      hfusion::BinaryFn::maxf);
-  auto maximumOp = b.create<hfusion::ElemwiseBinaryOp>(
-      loc, ValueRange{oldMaximum, maxLoop.getResult(0)},
-      ValueRange{maximumInit},
-      ArrayRef<NamedAttribute>{b.getNamedAttr("fun", maximumFunction)});
-  Value maximum = maximumOp->getResult(0);
+  Value maximum =
+      b.create<arith::MaximumFOp>(loc, oldMaximum, maxLoop.getResult(0));
   auto syncToken = b.create<arith::ConstantIntOp>(loc, 0, 64);
   auto syncMark = b.create<annotation::MarkOp>(loc, syncToken.getResult());
   syncMark->setAttr("SYNC_IN_VF", StringAttr::get(context, "VST_VLD"));
