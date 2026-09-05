@@ -1376,19 +1376,43 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
              << " checkpoint=scope-created\n");
   Block *scopeBlock = &simdScope.getBodyRegion().front();
   OpBuilder b = OpBuilder::atBlockEnd(scopeBlock);
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-build-progress lane=" << lane
+             << " checkpoint=scope-builder-ready\n");
 
   auto emptyMaximum =
       b.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{rows}, f32);
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-build-progress lane=" << lane
+             << " checkpoint=max-empty-created\n");
   auto emptyScaled = b.create<tensor::EmptyOp>(
       loc, ArrayRef<int64_t>{rows, width}, f32);
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-build-progress lane=" << lane
+             << " checkpoint=scaled-empty-created\n");
   Value lower = b.create<arith::ConstantIndexOp>(loc, 0);
   Value upper = b.create<arith::ConstantIndexOp>(loc, rows);
   Value step = b.create<arith::ConstantIndexOp>(loc, 1);
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-build-progress lane=" << lane
+             << " checkpoint=max-loop-bounds-created\n");
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-build-progress lane=" << lane
+             << " checkpoint=max-loop-create-begin\n");
   auto maxLoop = b.create<scf::ForOp>(
       loc, lower, upper, step,
       ValueRange{emptyMaximum.getResult(), emptyScaled.getResult()});
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-build-progress lane=" << lane
+             << " checkpoint=max-loop-create-end\n");
   Block *maxBody = maxLoop.getBody();
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-build-progress lane=" << lane
+             << " checkpoint=max-loop-body-ready\n");
   maxBody->back().erase();
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-build-progress lane=" << lane
+             << " checkpoint=max-loop-default-yield-erased\n");
   OpBuilder mb = OpBuilder::atBlockEnd(maxBody);
   Value row = maxLoop.getInductionVar();
   LLVM_DEBUG(llvm::dbgs()
