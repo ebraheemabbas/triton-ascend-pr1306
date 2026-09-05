@@ -997,11 +997,12 @@ materializeStage94RowwiseRegion(VectorToCubePack &pack, unsigned lane) {
   SmallVector<Operation *> operations;
   DenseSet<Operation *> operationSet;
   bool containsProbabilityProducer = false;
-  for (Operation *cursor = precedingWait->getNextNode();
-       cursor && cursor != anchor; cursor = cursor->getNextNode()) {
-    if (cursor->hasTrait<OpTrait::IsTerminator>() ||
-        isa<hivm::SyncBlockWaitOp, hivm::SyncBlockSetOp>(cursor))
-      return failure();
+  for (Operation *cursor = precedingWait->getNextNode(); cursor;
+       cursor = cursor->getNextNode()) {
+    if (cursor->hasTrait<OpTrait::IsTerminator>())
+      break;
+    if (isa<hivm::SyncBlockWaitOp, hivm::SyncBlockSetOp>(cursor))
+      continue;
     bool hasRowTensorResult = llvm::any_of(
         cursor->getResultTypes(), [&](Type type) {
           auto tensor = dyn_cast<RankedTensorType>(type);
@@ -1244,8 +1245,6 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
     if (!hasRowTensorResult || isa<bufferization::ToTensorOp>(cursor) ||
         isa<arith::ConstantOp>(cursor))
       continue;
-    operations.push_back(cursor);
-    operationSet.insert(cursor);
     if (auto op = dyn_cast<arith::MulFOp>(cursor)) {
       auto result = dyn_cast<RankedTensorType>(op.getType());
       if (result && result.getRank() == 2 && !scaledScore)
@@ -1270,6 +1269,9 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
       if (result && result.getRank() == 1)
         newDenominator = op;
     }
+    if (scaledScore && maxReduce && newMaximum && probabilityExp &&
+        sumReduce && alpha && newDenominator)
+      break;
   }
   if (!scaledScore || !maxReduce || !newMaximum || !probabilityExp ||
       !sumReduce || !alpha || !newDenominator ||
@@ -1294,6 +1296,41 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
         oldDenominator = mul.getLhs();
     }
   if (!oldDenominator)
+    return failure();
+
+  DenseSet<Value> externalValues{score, scale, oldMaximum, oldDenominator,
+                                 maxReduce.getDpsInits()[0],
+                                 sumReduce.getDpsInits()[0]};
+  SmallVector<Operation *> worklist{
+      scaledScore.getOperation(), maxReduce.getOperation(),
+      newMaximum.getOperation(), probabilityExp.getOperation(),
+      probabilityProducer, sumReduce.getOperation(), alpha.getOperation(),
+      newDenominator.getOperation()};
+  while (!worklist.empty()) {
+    Operation *operation = worklist.pop_back_val();
+    if (!operationSet.insert(operation).second)
+      continue;
+    for (Value operand : operation->getOperands()) {
+      if (externalValues.contains(operand))
+        continue;
+      Operation *definition = operand.getDefiningOp();
+      if (!definition || definition->getBlock() != anchor->getBlock() ||
+          isa<bufferization::ToTensorOp, arith::ConstantOp>(definition))
+        continue;
+      bool hasRowTensorResult = llvm::any_of(
+          definition->getResultTypes(), [&](Type type) {
+            auto tensor = dyn_cast<RankedTensorType>(type);
+            return tensor && tensor.hasStaticShape() && tensor.getRank() > 0 &&
+                   tensor.getDimSize(0) == rows;
+          });
+      if (hasRowTensorResult)
+        worklist.push_back(definition);
+    }
+  }
+  for (Operation &operation : *anchor->getBlock())
+    if (operationSet.contains(&operation))
+      operations.push_back(&operation);
+  if (operations.empty())
     return failure();
 
   Location loc = probabilityProducer->getLoc();
