@@ -1549,7 +1549,7 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
             nestedLoc, regionArgs[0], regionArgs[1]);
         nestedBuilder.create<linalg::YieldOp>(nestedLoc, elementMaximum);
       });
-  Value maximum = maximumOp.getResult(0);
+  Value maximum = maximumOp->getResult(0);
   auto syncToken = b.create<arith::ConstantIntOp>(loc, 0, 64);
   auto syncMark = b.create<annotation::MarkOp>(loc, syncToken.getResult());
   syncMark->setAttr("SYNC_IN_VF", StringAttr::get(context, "VST_VLD"));

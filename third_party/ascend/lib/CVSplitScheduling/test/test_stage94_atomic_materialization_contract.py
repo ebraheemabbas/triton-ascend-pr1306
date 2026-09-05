@@ -142,7 +142,7 @@ def test_final_maximum_has_an_explicit_destination() -> None:
     assert "ValueRange{oldMaximum, maxLoop.getResult(0)}, maximumInit" in online
     assert "nestedBuilder.create<arith::MaximumFOp>" in online
     assert "nestedBuilder.create<linalg::YieldOp>" in online
-    assert "Value maximum = maximumOp.getResult(0);" in online
+    assert "Value maximum = maximumOp->getResult(0);" in online
 
 
 def test_direct_nz_pack_reshapes_f32_before_truncation() -> None:
