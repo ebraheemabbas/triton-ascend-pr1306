@@ -944,10 +944,205 @@ outlineStage94VectorRegion(VectorToCubePack &pack, unsigned lane) {
   return outlinedProbability;
 }
 
+static RankedTensorType stage94RowType(RankedTensorType type, int64_t rows) {
+  if (!type.hasStaticShape() || type.getRank() == 0 ||
+      type.getDimSize(0) != rows)
+    return type;
+  SmallVector<int64_t> shape(type.getShape());
+  shape[0] = 1;
+  return RankedTensorType::get(shape, type.getElementType(),
+                               type.getEncoding());
+}
+
+static FailureOr<Value>
+materializeStage94RowwiseRegion(VectorToCubePack &pack, unsigned lane) {
+  auto probabilityType = dyn_cast<RankedTensorType>(pack.pSrc.getType());
+  Operation *probabilityProducer = pack.pSrc.getDefiningOp();
+  Operation *anchor = pack.anchor;
+  if (!probabilityType || !probabilityType.hasStaticShape() ||
+      probabilityType.getRank() != 2 || probabilityType.getDimSize(0) <= 0 ||
+      !probabilityProducer || !anchor ||
+      probabilityProducer->getBlock() != anchor->getBlock() ||
+      !probabilityProducer->isBeforeInBlock(anchor))
+    return failure();
+  int64_t rows = probabilityType.getDimSize(0);
+
+  Operation *precedingWait = nullptr;
+  for (Operation *cursor = probabilityProducer->getPrevNode(); cursor;
+       cursor = cursor->getPrevNode()) {
+    if (isa<hivm::SyncBlockWaitOp>(cursor)) {
+      precedingWait = cursor;
+      break;
+    }
+  }
+  if (!precedingWait || !precedingWait->getNextNode())
+    return failure();
+
+  SmallVector<Operation *> operations;
+  DenseSet<Operation *> operationSet;
+  bool containsProbabilityProducer = false;
+  for (Operation *cursor = precedingWait->getNextNode();
+       cursor && cursor != anchor; cursor = cursor->getNextNode()) {
+    if (cursor->hasTrait<OpTrait::IsTerminator>() ||
+        isa<hivm::SyncBlockWaitOp, hivm::SyncBlockSetOp>(cursor))
+      return failure();
+    bool hasRowTensorResult = llvm::any_of(
+        cursor->getResultTypes(), [&](Type type) {
+          auto tensor = dyn_cast<RankedTensorType>(type);
+          return tensor && tensor.hasStaticShape() && tensor.getRank() > 0 &&
+                 tensor.getDimSize(0) == rows;
+        });
+    if (!hasRowTensorResult || isa<bufferization::ToTensorOp>(cursor) ||
+        isa<arith::ConstantOp>(cursor))
+      continue;
+    operations.push_back(cursor);
+    operationSet.insert(cursor);
+    containsProbabilityProducer |= cursor == probabilityProducer;
+  }
+  if (!containsProbabilityProducer || operations.empty())
+    return failure();
+
+  SetVector<Value> outputs;
+  outputs.insert(pack.pSrc);
+  for (Operation *operation : operations)
+    for (Value result : operation->getResults()) {
+      auto tensor = dyn_cast<RankedTensorType>(result.getType());
+      if (!tensor || tensor.getRank() == 0 || tensor.getDimSize(0) != rows)
+        continue;
+      if (llvm::any_of(result.getUses(), [&](OpOperand &use) {
+            return !operationSet.contains(use.getOwner());
+          }))
+        outputs.insert(result);
+    }
+
+  SmallVector<Type> resultTypes;
+  SmallVector<Value> initValues;
+  for (Value output : outputs)
+    resultTypes.push_back(output.getType());
+  Location loc = probabilityProducer->getLoc();
+  MLIRContext *context = probabilityProducer->getContext();
+  OpBuilder builder(operations.front());
+  auto simdScope = builder.create<scope::ScopeOp>(loc, resultTypes);
+  simdScope.getBodyRegion().emplaceBlock();
+  simdScope->setAttr("noinline", UnitAttr::get(context));
+  simdScope->setAttr("outline", BoolAttr::get(context, true));
+  simdScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
+  setOpEngineTypeAttr(simdScope, EngineType::VECTOR);
+
+  Block *scopeBlock = &simdScope.getBodyRegion().front();
+  OpBuilder scopeBuilder = OpBuilder::atBlockEnd(scopeBlock);
+  for (Value output : outputs) {
+    auto type = cast<RankedTensorType>(output.getType());
+    initValues.push_back(scopeBuilder.create<tensor::EmptyOp>(
+        loc, type.getShape(), type.getElementType(), type.getEncoding()));
+  }
+  Value lower = scopeBuilder.create<arith::ConstantIndexOp>(loc, 0);
+  Value upper = scopeBuilder.create<arith::ConstantIndexOp>(loc, rows);
+  Value step = scopeBuilder.create<arith::ConstantIndexOp>(loc, 1);
+  auto rowLoop = scopeBuilder.create<scf::ForOp>(loc, lower, upper, step,
+                                                 initValues);
+  Block *rowBody = rowLoop.getBody();
+  if (!rowBody->empty())
+    rowBody->back().erase();
+  OpBuilder rowBuilder = OpBuilder::atBlockEnd(rowBody);
+  Value row = rowLoop.getInductionVar();
+  IRMapping mapping;
+
+  auto mapExternal = [&](Value value) -> Value {
+    if (Value mapped = mapping.lookupOrNull(value))
+      return mapped;
+    auto tensor = dyn_cast<RankedTensorType>(value.getType());
+    if (!tensor || !tensor.hasStaticShape() || tensor.getRank() == 0 ||
+        tensor.getDimSize(0) != rows)
+      return value;
+    RankedTensorType rowType = stage94RowType(tensor, rows);
+    SmallVector<OpFoldResult> offsets(tensor.getRank(),
+                                      rowBuilder.getIndexAttr(0));
+    SmallVector<OpFoldResult> sizes;
+    SmallVector<OpFoldResult> strides(tensor.getRank(),
+                                      rowBuilder.getIndexAttr(1));
+    offsets[0] = row;
+    for (int64_t size : rowType.getShape())
+      sizes.push_back(rowBuilder.getIndexAttr(size));
+    Value slice = rowBuilder
+                      .create<tensor::ExtractSliceOp>(
+                          loc, rowType, value, offsets, sizes, strides)
+                      .getResult();
+    mapping.map(value, slice);
+    return slice;
+  };
+
+  for (Operation *operation : operations) {
+    for (Value operand : operation->getOperands())
+      if (!mapping.contains(operand) &&
+          !operationSet.contains(operand.getDefiningOp()))
+        (void)mapExternal(operand);
+    if (operation == probabilityProducer) {
+      auto token = rowBuilder.create<arith::ConstantIntOp>(loc, 0, 64);
+      auto mark =
+          rowBuilder.create<annotation::MarkOp>(loc, token.getResult());
+      mark->setAttr("SYNC_IN_VF", StringAttr::get(context, "VST_VLD"));
+    }
+    Operation *clone = rowBuilder.clone(*operation, mapping);
+    for (auto [original, cloned] :
+         llvm::zip_equal(operation->getResults(), clone->getResults())) {
+      auto tensor = dyn_cast<RankedTensorType>(original.getType());
+      if (tensor)
+        cloned.setType(stage94RowType(tensor, rows));
+    }
+  }
+
+  SmallVector<Value> yielded;
+  for (auto [index, output] : llvm::enumerate(outputs)) {
+    Value rowValue = mapping.lookupOrNull(output);
+    if (!rowValue)
+      return failure();
+    auto rowType = cast<RankedTensorType>(rowValue.getType());
+    SmallVector<OpFoldResult> offsets(rowType.getRank(),
+                                      rowBuilder.getIndexAttr(0));
+    SmallVector<OpFoldResult> sizes;
+    SmallVector<OpFoldResult> strides(rowType.getRank(),
+                                      rowBuilder.getIndexAttr(1));
+    offsets[0] = row;
+    for (int64_t size : rowType.getShape())
+      sizes.push_back(rowBuilder.getIndexAttr(size));
+    yielded.push_back(rowBuilder.create<tensor::InsertSliceOp>(
+        loc, rowValue, rowLoop.getRegionIterArgs()[index], offsets, sizes,
+        strides));
+  }
+  rowBuilder.create<scf::YieldOp>(loc, yielded);
+  scopeBuilder.create<scope::ReturnOp>(loc, rowLoop.getResults());
+
+  Value outlinedProbability;
+  for (auto [index, output] : llvm::enumerate(outputs)) {
+    Value replacement = simdScope->getResult(index);
+    if (output == pack.pSrc)
+      outlinedProbability = replacement;
+    SmallVector<OpOperand *> outsideUses;
+    for (OpOperand &use : output.getUses())
+      if (!operationSet.contains(use.getOwner()))
+        outsideUses.push_back(&use);
+    for (OpOperand *use : outsideUses)
+      use->set(replacement);
+  }
+  for (Operation *operation : llvm::reverse(operations))
+    operation->erase();
+  if (!outlinedProbability)
+    return failure();
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-materialized-rowwise lane=" << lane
+             << " operations=" << operations.size() << " rows=" << rows
+             << " results=" << outputs.size()
+             << " vector-mode=simd publication=detached\n");
+  return outlinedProbability;
+}
+
 static LogicalResult
 outlineStage94VectorRegions(MutableArrayRef<VectorToCubePack> packs) {
   for (auto [lane, pack] : llvm::enumerate(packs)) {
-    FailureOr<Value> probability = outlineStage94VectorRegion(pack, lane);
+    FailureOr<Value> probability =
+        materializeStage94RowwiseRegion(pack, lane);
     if (failed(probability))
       return failure();
     pack.pSrc = *probability;
