@@ -87,10 +87,20 @@ def test_row_reduction_identities_are_materialized_inside_simd_scope() -> None:
     assert "createRowReductionInit(eb, sumReduce)" in online
 
 
+def test_online_softmax_marks_the_inter_loop_vector_dependency() -> None:
+    source = read(LIB / "ScopeSeparation.cpp")
+    online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
+    marker = 'syncMark->setAttr("SYNC_IN_VF", StringAttr::get(context, "VST_VLD"))'
+    assert marker in online
+    assert online.index("Value maximum =") < online.index(marker)
+    assert online.index(marker) < online.index("auto expLoop =")
+
+
 if __name__ == "__main__":
     test_forced_option_is_default_off_and_atomic()
     test_materializer_outlines_all_probability_regions()
     test_no_textual_or_shape_identity_policy()
     test_generated_row_loops_handle_empty_scf_bodies()
     test_row_reduction_identities_are_materialized_inside_simd_scope()
+    test_online_softmax_marks_the_inter_loop_vector_dependency()
     print("Stage 9.4b/c atomic materialization source contract: PASS")

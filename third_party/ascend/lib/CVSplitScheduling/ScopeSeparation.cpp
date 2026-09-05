@@ -1516,6 +1516,9 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
 
   Value maximum =
       b.create<arith::MaximumFOp>(loc, oldMaximum, maxLoop.getResult(0));
+  auto syncToken = b.create<arith::ConstantIntOp>(loc, 0, 64);
+  auto syncMark = b.create<annotation::MarkOp>(loc, syncToken.getResult());
+  syncMark->setAttr("SYNC_IN_VF", StringAttr::get(context, "VST_VLD"));
   auto emptySum = b.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{rows}, f32);
   auto emptyPacked = b.create<tensor::EmptyOp>(
       loc, packedType.getShape(), packedType.getElementType());
