@@ -99,8 +99,11 @@ def test_builder_is_paired_parameterized_and_non_mutating() -> None:
             "verifyGeometryAndReduction",
             "publicationEligible = false",
             "mutationPerformed = false",
+            "plan.backend.enableGraphSync",
+            "graph-sync=on",
     ):
         assert token in source
+    assert "disableGraphSync" not in source
     assert "PostCVSplitDetachedSchedule.cpp" in cmake
     lowered = source.lower()
     for forbidden in (

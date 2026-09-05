@@ -639,7 +639,7 @@ def get_auto_bind_sub_block_option(metadata):
 
 def get_graph_sync_solver_option(metadata):
     if _preserves_explicit_cv_split_schedule(metadata):
-        return False
+        return True
     return metadata["sync_solver"]
 
 

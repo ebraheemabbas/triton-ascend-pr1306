@@ -146,7 +146,7 @@ static bool verifyPlan(const PostCVSplitSchedulePlan &plan) {
       plan.reductionSteps.size() != lanes - 1 || !plan.affineTreeRequired ||
       plan.backend.vfMergeLevel != 1 ||
       !plan.backend.disableAutoBindSubBlock ||
-      !plan.backend.disableGraphSync)
+      !plan.backend.enableGraphSync)
     return false;
 
   for (const PostCVSplitSlotAssignment &slot : plan.slots) {
@@ -479,7 +479,7 @@ void logPostCVSplitSchedulePlan(const PostCVSplitSchedulePlan &plan) {
                  << " forward=" << plan.forwardEventCount
                  << " release=" << plan.releaseEventCount
                  << " required=" << plan.requiredEventCount << "\n";
-    llvm::dbgs() << "[cv-split] stage9-backend auto-bind=off graph-sync=off"
+    llvm::dbgs() << "[cv-split] stage9-backend auto-bind=off graph-sync=on"
                     " vf-merge="
                  << plan.backend.vfMergeLevel << " attribute-emitted=no\n";
     for (const PostCVSplitSlotAssignment &slot : plan.slots)

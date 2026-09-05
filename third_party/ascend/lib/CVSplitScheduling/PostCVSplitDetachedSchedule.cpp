@@ -509,7 +509,7 @@ verifyDetachedSchedule(const PostCVSplitSchedulePlan &plan,
                        PostCVSplitDetachedSchedule &schedule) {
   if (plan.backend.vfMergeLevel != 1 ||
       !plan.backend.disableAutoBindSubBlock ||
-      !plan.backend.disableGraphSync)
+      !plan.backend.enableGraphSync)
     return PostCVSplitDetachedScheduleStatus::BackendMismatch;
   if (schedule.cubeCommands.size() != 7 * plan.recurrence.logicalLaneCount ||
       schedule.vectorCommands.size() !=
@@ -805,7 +805,7 @@ void logPostCVSplitDetachedSchedule(
                  << schedule.observedMaxScoreLive
                  << " product-max=" << schedule.observedMaxProductLive
                  << " reduction-root=" << schedule.reductionRootValue << "\n";
-    llvm::dbgs() << "[cv-split] stage93-backend auto-bind=off graph-sync=off"
+    llvm::dbgs() << "[cv-split] stage93-backend auto-bind=off graph-sync=on"
                     " vf-merge="
                  << schedule.backend.vfMergeLevel
                  << " attribute-emitted=no publication=no\n";

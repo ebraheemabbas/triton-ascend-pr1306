@@ -55,6 +55,7 @@ def test_plan_is_parameterized_verified_and_analysis_only() -> None:
             "PostCVSplitVectorLanePlan",
             "PostCVSplitReductionStep",
             "PostCVSplitBackendRequirements",
+            "enableGraphSync",
             "buildPostCVSplitSchedulePlan",
     ):
         assert token in header
@@ -73,6 +74,7 @@ def test_plan_is_parameterized_verified_and_analysis_only() -> None:
             "cubeLineages.size() != 2",
             "PostCVSplitSchedulePlanStatus::FlagOverflow",
             "PostCVSplitSchedulePlanStatus::MemoryBudgetExceeded",
+            "graph-sync=on",
     ):
         assert token in source
     recurrence_gate = source.split("if (!reductionGeometryFound", 1)[1]
@@ -95,6 +97,7 @@ def test_plan_is_parameterized_verified_and_analysis_only() -> None:
             "erase()",
     ):
         assert forbidden not in lowered
+    assert "disableGraphSync" not in header + source
 
 
 def test_reference_parameterization_and_golden_fixture() -> None:

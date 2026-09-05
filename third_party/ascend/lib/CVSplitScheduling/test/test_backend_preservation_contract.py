@@ -31,9 +31,10 @@ def test_preservation_overrides_conflicting_user_policy() -> None:
     auto_bind = auto_bind.split("def get_graph_sync_solver_option", 1)[0]
     graph_sync = backend.split("def get_graph_sync_solver_option", 1)[1]
     graph_sync = graph_sync.split("def _save_npuir_debug_output", 1)[0]
-    for body in (auto_bind, graph_sync):
-        assert "_preserves_explicit_cv_split_schedule(metadata)" in body
-        assert "return False" in body
+    assert "_preserves_explicit_cv_split_schedule(metadata)" in auto_bind
+    assert "return False" in auto_bind
+    assert "_preserves_explicit_cv_split_schedule(metadata)" in graph_sync
+    assert "return True" in graph_sync
     assert backend.count(
         "sync_solver = get_graph_sync_solver_option(metadata)") == 2
 
@@ -55,13 +56,13 @@ def test_option_helper_semantics() -> None:
     metadata = {
         "auto_tile_and_bind_subblock": False,
         "enable_auto_bind_sub_block": True,
-        "sync_solver": True,
+        "sync_solver": False,
     }
     assert namespace["get_auto_bind_sub_block_option"](metadata) is True
-    assert namespace["get_graph_sync_solver_option"](metadata) is True
+    assert namespace["get_graph_sync_solver_option"](metadata) is False
     metadata["cv_split_preserve_explicit_schedule"] = True
     assert namespace["get_auto_bind_sub_block_option"](metadata) is False
-    assert namespace["get_graph_sync_solver_option"](metadata) is False
+    assert namespace["get_graph_sync_solver_option"](metadata) is True
 
 
 def test_preservation_is_emitted_only_by_stage94_atomic_publication() -> None:
