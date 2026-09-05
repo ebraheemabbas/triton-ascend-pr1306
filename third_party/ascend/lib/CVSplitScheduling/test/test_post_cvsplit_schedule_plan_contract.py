@@ -29,19 +29,38 @@ def reference_plan(lanes: int, score_width: int, score_bytes: int,
     }
 
 
-def test_option_is_default_off_and_fully_propagated() -> None:
+def test_schedule_mode_is_default_disabled_and_fully_propagated() -> None:
     passes = read(INCLUDE / "Passes.td")
     cpp = read(LIB / "CVSplitScheduling.cpp")
     backend = read(BACKEND)
     pybind = read(PYBIND)
-    assert 'Option<"enablePostSplitPlanDiagnostics"' in passes
-    option = passes.split(
-        'Option<"enablePostSplitPlanDiagnostics"', 1)[1]
-    assert '"bool", /*default*/"false"' in option.split('>,', 1)[0]
-    assert "options.enablePostSplitPlanDiagnostics" in cpp
-    assert "opts.enablePostSplitPlanDiagnostics" in pybind
-    assert "cv_split_enable_post_split_plan_diagnostics: bool = False" in backend
-    assert '"cv_split_enable_post_split_plan_diagnostics"' in backend
+    assert 'Option<"postSplitScheduleMode"' in passes
+    option = passes.split('Option<"postSplitScheduleMode"', 1)[1]
+    option = option.split('>,', 1)[0]
+    assert '"std::string"' in option
+    assert r'\"disabled\"' in option
+    assert "options.postSplitScheduleMode" in cpp
+    assert "opts.postSplitScheduleMode" in pybind
+    assert 'py::arg("post_split_schedule_mode") = "disabled"' in pybind
+    assert 'cv_split_post_split_schedule_mode: str = "disabled"' in backend
+    assert '"cv_split_post_split_schedule_mode"' in backend
+    assert 'post_split_schedule_mode=metadata[' in backend
+    for legacy in (
+            "enablePostSplitPlanDiagnostics",
+            "enableDetachedScheduleDiagnostics",
+            "enableScheduleBindingDiagnostics",
+            "enableScheduleMaterialization",
+    ):
+        assert legacy not in passes + cpp + pybind
+
+
+def test_schedule_mode_values_and_invalid_input_are_explicit() -> None:
+    cpp = read(LIB / "CVSplitScheduling.cpp")
+    for value in ("disabled", "analyze", "materialize"):
+        assert f'value == "{value}"' in cpp
+    assert "parsePostSplitScheduleMode(postSplitScheduleMode)" in cpp
+    assert "invalid post-split-schedule-mode" in cpp
+    assert "signalPassFailure()" in cpp
 
 
 def test_plan_is_parameterized_verified_and_analysis_only() -> None:
@@ -55,6 +74,7 @@ def test_plan_is_parameterized_verified_and_analysis_only() -> None:
             "PostCVSplitVectorLanePlan",
             "PostCVSplitReductionStep",
             "PostCVSplitBackendRequirements",
+            "enableGraphSync",
             "buildPostCVSplitSchedulePlan",
     ):
         assert token in header
@@ -73,6 +93,7 @@ def test_plan_is_parameterized_verified_and_analysis_only() -> None:
             "cubeLineages.size() != 2",
             "PostCVSplitSchedulePlanStatus::FlagOverflow",
             "PostCVSplitSchedulePlanStatus::MemoryBudgetExceeded",
+            "graph-sync=on",
     ):
         assert token in source
     recurrence_gate = source.split("if (!reductionGeometryFound", 1)[1]
@@ -95,6 +116,7 @@ def test_plan_is_parameterized_verified_and_analysis_only() -> None:
             "erase()",
     ):
         assert forbidden not in lowered
+    assert "disableGraphSync" not in header + source
 
 
 def test_reference_parameterization_and_golden_fixture() -> None:
@@ -118,21 +140,38 @@ def test_reference_parameterization_and_golden_fixture() -> None:
     assert u4_hd128["events"] <= 16 < u8["events"]
 
 
+def test_release_event_resources_follow_the_last_real_consumer() -> None:
+    source = read(LIB / "PostCVSplitSchedulePlan.cpp")
+    releases = source.split(
+        "for (unsigned slot = 0; slot < plan.scoreLiveDepth; ++slot)", 1)[1]
+    score, product = releases.split(
+        "for (unsigned slot = 0; slot < plan.productLiveDepth; ++slot)", 1)
+    product = product.split("plan.forwardEventCount", 1)[0]
+    assert "PrincipalResource::Mte3" in score
+    assert "PrincipalResource::Fixpipe" in score
+    assert "PrincipalResource::Vector" not in score
+    assert "PrincipalResource::Vector" in product
+    assert "PrincipalResource::Fixpipe" in product
+
+
 def test_integration_is_after_materialization_before_transfer_mutation() -> None:
     cpp = read(LIB / "CVSplitScheduling.cpp")
     extract = cpp.index("extractCostModelRequests(")
     planPosition = cpp.index("buildPostCVSplitSchedulePlan(")
     transfer = cpp.index("insertCrossScopeTransfers(", planPosition)
     assert extract < planPosition < transfer
-    assert "if (enablePostSplitPlanDiagnostics)" in cpp
+    assert "if (analyzePostSplitSchedule)" in cpp
     assert "mutation=no" in read(LIB / "PostCVSplitSchedulePlan.cpp")
-    assert "kPreserveExplicitScheduleAttr" not in cpp
+    before_atomic = cpp.split("if (materializePostSplitSchedule) {", 1)[0]
+    assert "kPreserveExplicitScheduleAttr" not in before_atomic
     assert "PostCVSplitSchedulePlan.cpp" in read(LIB / "CMakeLists.txt")
 
 
 if __name__ == "__main__":
-    test_option_is_default_off_and_fully_propagated()
+    test_schedule_mode_is_default_disabled_and_fully_propagated()
+    test_schedule_mode_values_and_invalid_input_are_explicit()
     test_plan_is_parameterized_verified_and_analysis_only()
     test_reference_parameterization_and_golden_fixture()
+    test_release_event_resources_follow_the_last_real_consumer()
     test_integration_is_after_materialization_before_transfer_mutation()
     print("Post-CVSplit schedule plan source contract: PASS")

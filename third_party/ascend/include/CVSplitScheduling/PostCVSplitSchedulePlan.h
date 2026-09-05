@@ -96,7 +96,7 @@ struct PostCVSplitReductionStep {
 
 struct PostCVSplitBackendRequirements {
   bool disableAutoBindSubBlock = true;
-  bool disableGraphSync = true;
+  bool enableGraphSync = true;
   unsigned vfMergeLevel = 1;
 };
 

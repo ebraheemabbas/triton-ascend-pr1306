@@ -152,9 +152,7 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
          bool enablePurePrerequisiteHoisting,
          int64_t purePrerequisiteHoistBudgetBytes,
          bool enableCostModelDiagnostics,
-         bool enablePostSplitPlanDiagnostics,
-         bool enableDetachedScheduleDiagnostics,
-         bool enableScheduleBindingDiagnostics) {
+         const std::string &postSplitScheduleMode) {
         CVSplitSchedulingOptions opts;
         opts.compileOn91095 = compileOn91095;
         opts.unrollFactor = unrollFactor;
@@ -164,12 +162,7 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
         opts.purePrerequisiteHoistBudgetBytes =
             purePrerequisiteHoistBudgetBytes;
         opts.enableCostModelDiagnostics = enableCostModelDiagnostics;
-        opts.enablePostSplitPlanDiagnostics =
-            enablePostSplitPlanDiagnostics;
-        opts.enableDetachedScheduleDiagnostics =
-            enableDetachedScheduleDiagnostics;
-        opts.enableScheduleBindingDiagnostics =
-            enableScheduleBindingDiagnostics;
+        opts.postSplitScheduleMode = postSplitScheduleMode;
         opts.promoteFullyUnrolled = promoteFullyUnrolled;
         opts.privateBufferUbBudgetBytes = privateBufferUbBudgetBytes;
         opts.promotePrivateBufferPools = promotePrivateBufferPools;
@@ -190,9 +183,7 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       py::arg("enable_pure_prerequisite_hoisting") = false,
       py::arg("pure_prerequisite_hoist_budget_bytes") = 0,
       py::arg("enable_cost_model_diagnostics") = false,
-      py::arg("enable_post_split_plan_diagnostics") = false,
-      py::arg("enable_detached_schedule_diagnostics") = false,
-      py::arg("enable_schedule_binding_diagnostics") = false);
+      py::arg("post_split_schedule_mode") = "disabled");
 
   m.def(
       "add_graph_optimize",

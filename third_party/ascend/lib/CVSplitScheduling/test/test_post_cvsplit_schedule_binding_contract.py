@@ -15,19 +15,13 @@ def read(path: Path) -> str:
     return path.read_text()
 
 
-def test_option_is_default_off_and_propagated() -> None:
-    passes = read(INCLUDE / "Passes.td")
+def test_analyze_mode_reaches_semantic_binding() -> None:
     cpp = read(LIB / "CVSplitScheduling.cpp")
-    backend = read(BACKEND)
-    pybind = read(PYBIND)
-    assert 'Option<"enableScheduleBindingDiagnostics"' in passes
-    option = passes.split(
-        'Option<"enableScheduleBindingDiagnostics"', 1)[1]
-    assert '"bool", /*default*/"false"' in option.split('>,', 1)[0]
-    assert "options.enableScheduleBindingDiagnostics" in cpp
-    assert "opts.enableScheduleBindingDiagnostics" in pybind
-    assert "cv_split_enable_schedule_binding_diagnostics: bool = False" in backend
-    assert '"cv_split_enable_schedule_binding_diagnostics"' in backend
+    analyze = cpp.index("if (analyzePostSplitSchedule)")
+    detached = cpp.index("buildPostCVSplitDetachedSchedule(", analyze)
+    binding = cpp.index("bindPostCVSplitScheduleAnchors(", detached)
+    assert analyze < detached < binding
+    assert "logPostCVSplitScheduleBinding(binding)" in cpp
 
 
 def test_binding_is_semantic_complete_and_non_mutating() -> None:
@@ -80,13 +74,13 @@ def test_binding_runs_after_detached_plan_before_transfer_mutation() -> None:
     binding = cpp.index("bindPostCVSplitScheduleAnchors(")
     transfer = cpp.index("insertCrossScopeTransfers(", binding)
     assert detached < binding < transfer
-    assert "schedule-binding unavailable" in cpp
+    assert "logPostCVSplitScheduleBinding(binding)" in cpp
     assert "mutation=no" in read(LIB / "PostCVSplitScheduleBinding.cpp")
     assert "PostCVSplitScheduleBinding.cpp" in read(LIB / "CMakeLists.txt")
 
 
 if __name__ == "__main__":
-    test_option_is_default_off_and_propagated()
+    test_analyze_mode_reaches_semantic_binding()
     test_binding_is_semantic_complete_and_non_mutating()
     test_binding_runs_after_detached_plan_before_transfer_mutation()
     print("Semantic anchor binding source contract: PASS")

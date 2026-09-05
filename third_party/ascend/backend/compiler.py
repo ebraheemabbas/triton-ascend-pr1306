@@ -298,12 +298,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                 enable_pure_prerequisite_hoisting=metadata["cv_split_enable_pure_prerequisite_hoisting"],
                 pure_prerequisite_hoist_budget_bytes=metadata["cv_split_pure_prerequisite_hoist_budget_bytes"],
                 enable_cost_model_diagnostics=metadata["cv_split_enable_cost_model_diagnostics"],
-                enable_post_split_plan_diagnostics=metadata[
-                    "cv_split_enable_post_split_plan_diagnostics"],
-                enable_detached_schedule_diagnostics=metadata[
-                    "cv_split_enable_detached_schedule_diagnostics"],
-                enable_schedule_binding_diagnostics=metadata[
-                    "cv_split_enable_schedule_binding_diagnostics"])
+                post_split_schedule_mode=metadata[
+                    "cv_split_post_split_schedule_mode"])
 
         if try_dynamic_cv:
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
@@ -637,8 +633,14 @@ def get_auto_bind_sub_block_option(metadata):
 
 def get_graph_sync_solver_option(metadata):
     if _preserves_explicit_cv_split_schedule(metadata):
-        return False
+        return True
     return metadata["sync_solver"]
+
+
+def get_mixed_cv_option(metadata):
+    if _preserves_explicit_cv_split_schedule(metadata):
+        return None
+    return metadata["enable_mixed_cv"]
 
 
 def _save_npuir_debug_output(stdout_bytes: bytes, stderr_bytes: bytes, tmpdir: str, metadata_hash: str):
@@ -799,7 +801,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += \
                 [f"--limit-auto-multi-buffer-buffer={auto_multi_buffer_buffer}"]
 
-        enable_mixed_cv = metadata["enable_mixed_cv"]
+        enable_mixed_cv = get_mixed_cv_option(metadata)
         if enable_mixed_cv is not None:
             _compile_option_list += \
                 [f"--enable-mixed-cv={enable_mixed_cv}"]
@@ -1240,15 +1242,10 @@ class NPUOptions:
     # Cost-model request diagnostic control. Extract and log typed cost-model inputs
     # without querying the model, selecting a candidate, or mutating IR.
     cv_split_enable_cost_model_diagnostics: bool = False
-    # Post-split plan diagnostic control. Build and verify the parameterized
-    # post-CVSplit schedule plan from the typed materialized request.
-    cv_split_enable_post_split_plan_diagnostics: bool = False
-    # Detached-schedule diagnostic control. Build and verify paired detached CUBE
-    # and VECTOR command streams without creating or publishing MLIR.
-    cv_split_enable_detached_schedule_diagnostics: bool = False
-    # Schedule-binding diagnostic control. Bind detached commands to semantic
-    # producer, consumer, and cross-core boundary anchors.
-    cv_split_enable_schedule_binding_diagnostics: bool = False
+    # Post-split schedule policy. "disabled" keeps the generic path,
+    # "analyze" verifies and reports the complete detached schedule without
+    # mutation, and "materialize" publishes both scopes transactionally.
+    cv_split_post_split_schedule_mode: str = "disabled"
     # Spare UB, in bytes, that cross-scope transfers may spend to stop reusing
     # buffers across unrolled lanes. It funds merging the two CUBE->VECTOR
     # roles onto one union slot per lane, which is what lets HEAD_DIM differ

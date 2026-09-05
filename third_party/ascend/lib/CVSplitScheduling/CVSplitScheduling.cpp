@@ -65,6 +65,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
@@ -73,6 +74,7 @@
 #include <functional>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <queue>
 
 #define DEBUG_TYPE "cv-split-scheduling"
@@ -120,6 +122,19 @@ using namespace mlir::triton;
 // ============================================================================
 
 namespace {
+
+enum class PostSplitScheduleMode { Disabled, Analyze, Materialize };
+
+static std::optional<PostSplitScheduleMode>
+parsePostSplitScheduleMode(llvm::StringRef value) {
+  if (value == "disabled")
+    return PostSplitScheduleMode::Disabled;
+  if (value == "analyze")
+    return PostSplitScheduleMode::Analyze;
+  if (value == "materialize")
+    return PostSplitScheduleMode::Materialize;
+  return std::nullopt;
+}
 
 using cv_split::kUnrollOriginIdAttrName;
 
@@ -760,12 +775,7 @@ public:
     this->purePrerequisiteHoistBudgetBytes =
         options.purePrerequisiteHoistBudgetBytes;
     this->enableCostModelDiagnostics = options.enableCostModelDiagnostics;
-    this->enablePostSplitPlanDiagnostics =
-        options.enablePostSplitPlanDiagnostics;
-    this->enableDetachedScheduleDiagnostics =
-        options.enableDetachedScheduleDiagnostics;
-    this->enableScheduleBindingDiagnostics =
-        options.enableScheduleBindingDiagnostics;
+    this->postSplitScheduleMode = options.postSplitScheduleMode;
     this->promoteFullyUnrolled = options.promoteFullyUnrolled;
     this->pipelineDistance = options.pipelineDistance;
     this->privateBufferUbBudgetBytes = options.privateBufferUbBudgetBytes;
@@ -776,12 +786,22 @@ public:
   }
 
   void runOnOperation() override {
+    ModuleOp moduleOp = getOperation();
+    std::optional<PostSplitScheduleMode> parsedMode =
+        parsePostSplitScheduleMode(postSplitScheduleMode);
+    if (!parsedMode) {
+      moduleOp.emitError()
+          << "invalid post-split-schedule-mode '" << postSplitScheduleMode
+          << "'; expected disabled, analyze, or materialize";
+      signalPassFailure();
+      return;
+    }
+    activePostSplitScheduleMode = *parsedMode;
+
     if (!compileOn91095) {
       LLVM_DEBUG(llvm::dbgs() << "[cv-split] Not A5 target, skipping\n");
       return;
     }
-
-    ModuleOp moduleOp = getOperation();
     LLVM_DEBUG(llvm::dbgs()
                << "\n[cv-split] ============================\n"
                << "[cv-split]  CVSplitScheduling START\n"
@@ -855,6 +875,13 @@ public:
   }
 
 private:
+  PostSplitScheduleMode activePostSplitScheduleMode =
+      PostSplitScheduleMode::Disabled;
+
+  bool shouldMaterializePostSplitSchedule() const {
+    return activePostSplitScheduleMode == PostSplitScheduleMode::Materialize;
+  }
+
   SmallVector<CandidateState>
   prepareCandidates(MutableArrayRef<FunctionBackup> functionBackups) {
     SmallVector<CandidateState> candidates;
@@ -901,8 +928,14 @@ private:
     bool transformedAnyCandidate = false;
     for (CandidateState &candidate : candidates) {
       FunctionBackup &state = *candidate.functionBackup;
-      if (failed(processFunction(state.function, candidate.loop)) ||
-          failed(verify(state.function))) {
+      LogicalResult processResult =
+          processFunction(state.function, candidate.loop);
+      LLVM_DEBUG(if (succeeded(processResult) && shouldMaterializePostSplitSchedule()) {
+        llvm::dbgs() << "[cv-split] schedule-materialization-preverify-ir-begin\n";
+        state.function.print(llvm::dbgs());
+        llvm::dbgs() << "\n[cv-split] schedule-materialization-preverify-ir-end\n";
+      });
+      if (failed(processResult) || failed(verify(state.function))) {
         LLVM_DEBUG(llvm::dbgs()
                    << "[cv-split] Candidate failed; restoring function and "
                       "trying next function\n");
@@ -1164,10 +1197,21 @@ private:
       }
     }
 
-    // Cost-request extraction phase: convert the verified materialized plan into stable numeric
-    // v4 request facts. This is read-only and diagnostic-only; incomplete
-    // extraction never changes the qualified scheduling/emission path.
-    if (enableCostModelDiagnostics) {
+    // Build typed cost requests whenever diagnostics or the post-split
+    // schedule needs them. Diagnostics report facts; they do not enable the
+    // transformation.
+    const bool analyzePostSplitSchedule =
+        activePostSplitScheduleMode != PostSplitScheduleMode::Disabled;
+    const bool materializePostSplitSchedule =
+        activePostSplitScheduleMode == PostSplitScheduleMode::Materialize;
+    const bool needCostRequests =
+        enableCostModelDiagnostics || analyzePostSplitSchedule;
+    bool bindingReady = false;
+    bool structuralCandidateReady = false;
+    bool symmetricGeometryReady = false;
+    std::optional<cv_split::PostCVSplitDetachedSchedule>
+        materializationSchedule;
+    if (needCostRequests) {
       if (!materializedPlan || !materializedResources ||
           !scheduleCandidateSet) {
         LLVM_DEBUG(llvm::dbgs()
@@ -1179,65 +1223,83 @@ private:
                 body, classification, *materializedPlan,
                 *materializedResources, *scheduleCandidateSet);
         if (succeeded(requests)) {
-          cv_split::logCostModelRequests(*requests);
-          if (failed(cv_split::logPrimitiveCostEstimates(*requests)))
-            LLVM_DEBUG(llvm::dbgs()
-                       << "[cv-split] cost-model-primitives incomplete; "
-                          "qualified scheduler/emitter remains active\n");
-          std::optional<unsigned> fallbackCandidateId;
-          if (forcedScheduleCandidate)
-            fallbackCandidateId = forcedScheduleCandidate->candidateId;
-          if (failed(cv_split::logCandidateScheduleEstimates(
-                  *requests, fallbackCandidateId)))
-            LLVM_DEBUG(llvm::dbgs()
-                       << "[cv-split] cost-model-schedules incomplete; "
-                          "qualified scheduler/emitter remains active\n");
-          if (enablePostSplitPlanDiagnostics ||
-              enableDetachedScheduleDiagnostics ||
-              enableScheduleBindingDiagnostics) {
+          if (enableCostModelDiagnostics) {
+            cv_split::logCostModelRequests(*requests);
+            if (failed(cv_split::logPrimitiveCostEstimates(*requests)))
+              LLVM_DEBUG(llvm::dbgs()
+                         << "[cv-split] cost-model-primitives incomplete; "
+                            "qualified scheduler/emitter remains active\n");
+            std::optional<unsigned> fallbackCandidateId;
+            if (forcedScheduleCandidate)
+              fallbackCandidateId = forcedScheduleCandidate->candidateId;
+            if (failed(cv_split::logCandidateScheduleEstimates(
+                    *requests, fallbackCandidateId)))
+              LLVM_DEBUG(llvm::dbgs()
+                         << "[cv-split] cost-model-schedules incomplete; "
+                            "qualified scheduler/emitter remains active\n");
+          }
+
+          if (analyzePostSplitSchedule) {
             cv_split::PostCVSplitSchedulePlan postSplitPlan =
                 cv_split::buildPostCVSplitSchedulePlan(
                     *requests, *materializedResources, *resourceLimits);
-            if (enablePostSplitPlanDiagnostics)
-              cv_split::logPostCVSplitSchedulePlan(postSplitPlan);
-            if (enableDetachedScheduleDiagnostics ||
-                enableScheduleBindingDiagnostics) {
-              cv_split::PostCVSplitDetachedSchedule detachedSchedule =
-                  cv_split::buildPostCVSplitDetachedSchedule(postSplitPlan);
-              if (enableDetachedScheduleDiagnostics)
-                cv_split::logPostCVSplitDetachedSchedule(detachedSchedule);
-              if (enableScheduleBindingDiagnostics) {
-                cv_split::PostCVSplitScheduleBinding binding =
-                    cv_split::bindPostCVSplitScheduleAnchors(
-                        body, classification, *materializedPlan,
-                        detachedSchedule);
-                cv_split::logPostCVSplitScheduleBinding(binding);
-              }
+            symmetricGeometryReady =
+                postSplitPlan.recurrence.scoreWidth != 0 &&
+                postSplitPlan.recurrence.headDimension ==
+                    postSplitPlan.recurrence.scoreWidth;
+            cv_split::logPostCVSplitSchedulePlan(postSplitPlan);
+
+            cv_split::PostCVSplitDetachedSchedule detachedSchedule =
+                cv_split::buildPostCVSplitDetachedSchedule(postSplitPlan);
+            cv_split::logPostCVSplitDetachedSchedule(detachedSchedule);
+
+            cv_split::PostCVSplitScheduleBinding binding =
+                cv_split::bindPostCVSplitScheduleAnchors(
+                    body, classification, *materializedPlan,
+                    detachedSchedule);
+            cv_split::logPostCVSplitScheduleBinding(binding);
+            bindingReady =
+                binding.status ==
+                    cv_split::PostCVSplitScheduleBindingStatus::Ready &&
+                binding.verified;
+            if (forcedScheduleCandidate && bindingReady) {
+              structuralCandidateReady = llvm::all_of(
+                  forcedScheduleCandidate->matrixLineageLimits,
+                  [&](const auto &lineage) {
+                    unsigned requiredDepth =
+                        lineage.originId == binding.lanes.front().scoreOriginId
+                            ? detachedSchedule.observedMaxScoreLive
+                            : detachedSchedule.observedMaxProductLive;
+                    return lineage.inFlightLimit >= requiredDepth;
+                  });
             }
+            if (materializePostSplitSchedule && detachedSchedule.verified)
+              materializationSchedule.emplace(detachedSchedule);
           }
-        } else
+        } else {
           LLVM_DEBUG(llvm::dbgs()
                      << "[cv-split] cost-model-inputs unavailable; qualified "
                         "scheduler/emitter remains active\n");
+        }
       }
     }
 
-    if (enablePostSplitPlanDiagnostics && !enableCostModelDiagnostics)
+    if (materializePostSplitSchedule &&
+        (!bindingReady || !structuralCandidateReady ||
+         !symmetricGeometryReady)) {
       LLVM_DEBUG(llvm::dbgs()
-                 << "[cv-split] post-split-plan unavailable reason="
-                    "cost-input-diagnostics-disabled mutation=no\n");
-    if (enableDetachedScheduleDiagnostics &&
-        !enableCostModelDiagnostics)
-      LLVM_DEBUG(llvm::dbgs()
-                 << "[cv-split] detached-schedule unavailable reason="
-                    "cost-input-diagnostics-disabled publication=no "
-                    "mutation=no\n");
-    if (enableScheduleBindingDiagnostics &&
-        !enableCostModelDiagnostics)
-      LLVM_DEBUG(llvm::dbgs()
-                 << "[cv-split] schedule-binding unavailable reason="
-                    "cost-input-diagnostics-disabled publication=no "
-                    "mutation=no\n");
+                 << "[cv-split] schedule-materialization rejected "
+                    "binding-ready="
+                 << (bindingReady ? "yes" : "no")
+                 << " structural-candidate-ready="
+                 << (structuralCandidateReady ? "yes" : "no")
+                 << " symmetric-geometry-ready="
+                 << (symmetricGeometryReady ? "yes" : "no")
+                 << " mutation=no\n");
+      return failure();
+    }
+    if (materializePostSplitSchedule && !materializationSchedule)
+      return failure();
 
     // Transfer-materialization phase (before scope separation)
     LLVM_DEBUG(llvm::dbgs()
@@ -1277,8 +1339,18 @@ private:
     // Scope-separation phase (like DynamicCVPipeline/SeparateCVScope)
     LLVM_DEBUG(llvm::dbgs()
                << "[cv-split] === CUBE/VECTOR scope separation ===\n");
-    if (failed(cv_split::createScopeSeparation(funcOp, loop, *transferInfo))) {
+    if (failed(cv_split::createScopeSeparation(
+            funcOp, loop, *transferInfo, materializePostSplitSchedule,
+            materializationSchedule ? &*materializationSchedule : nullptr,
+            forcedScheduleCandidate))) {
       return failure();
+    }
+    if (materializePostSplitSchedule) {
+      moduleOp->setAttr(cv_split::kPreserveExplicitScheduleAttr,
+                        UnitAttr::get(funcOp.getContext()));
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[cv-split] schedule-materialization published cube=yes vector=yes "
+                    "preservation-attribute=yes\n");
     }
     hoistInvariantTensorFillTemplates(outerLoop);
     LLVM_DEBUG(llvm::dbgs() << "[cv-split] CUBE/VECTOR scope separation complete\n");

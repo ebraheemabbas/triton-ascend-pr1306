@@ -344,7 +344,7 @@ static TransferFootprint getTransferFootprint(const CrossScopeTransfer &xfer,
 // and only exposes the resulting L1 storage as an [M, N] memref.
 //
 // The view is cached because the same ping/pong buffer is reused by multiple
-// unrolled stages. Emitting a convert_layout for every lane creates aliasing
+// unrolled lanes. Emitting a convert_layout for every lane creates aliasing
 // ND views that BiShengIR can mis-track into a misaligned / zero-burst L1->L0
 // load. It is inserted at the start of the loop so it dominates every reuse.
 // Keeping it inside the loop is also required by SplitMixKernel, which cannot

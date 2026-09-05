@@ -30,6 +30,7 @@
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -44,6 +45,8 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include <optional>
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -307,9 +310,13 @@ static scf::ForOp removeUnusedLoopCarriedValues(scf::ForOp loop) {
 }
 
 static LogicalResult
-retileVectorScopeForRowSplit(scope::ScopeOp vecScope,
-                             const CrossScopeTransferInfo &transferInfo);
-static void sinkCubeLoadChainsToMatmul(Block *body);
+retileVectorScopeForRowSplit(
+    scope::ScopeOp vecScope, scf::ForOp cubeLoop, scf::ForOp vectorLoop,
+    const CrossScopeTransferInfo &transferInfo,
+    bool materializePostSplitSchedule,
+    const PostCVSplitDetachedSchedule *detachedSchedule);
+static LogicalResult sinkCubeLoadChainsToMatmul(
+    Block *body, unsigned productOperandPrefetchDepth);
 
 // Sink each cube matmul's operand load chain to immediately before the matmul.
 // See the call site (createScopeSeparation step 6b) for the rationale.
@@ -323,7 +330,9 @@ static void sinkCubeLoadChainsToMatmul(Block *body);
 // consumed by all PV matmuls, accumulator fill tensors) in place while moving
 // private portions of each chain. Movable ops retain their existing relative
 // order and are placed immediately before their matmul.
-static void sinkCubeLoadChainsToMatmul(Block *body) {
+static LogicalResult
+sinkCubeLoadChainsToMatmul(Block *body,
+                           unsigned productOperandPrefetchDepth) {
   auto isChainType = [](Operation *o) {
     return isa<memref::ReinterpretCastOp, memref::AllocOp, memref::CopyOp,
                bufferization::ToTensorOp, linalg::TransposeOp>(o);
@@ -420,6 +429,137 @@ static void sinkCubeLoadChainsToMatmul(Block *body) {
     for (Operation *op : movable)
       op->moveBefore(mm);
   }
+
+  if (productOperandPrefetchDepth == 0)
+    return failure();
+  if (productOperandPrefetchDepth == 1)
+    return success();
+
+  MLIRContext *context = body->getParentOp()->getContext();
+  auto pipeMte3 = hivm::PipeAttr::get(context, hivm::PIPE::PIPE_MTE3);
+  auto pipeMte1 = hivm::PipeAttr::get(context, hivm::PIPE::PIPE_MTE1);
+  SmallVector<Operation *> probabilityWaits;
+  SmallVector<Operation *> productMatmuls;
+  for (Operation &operation : *body) {
+    auto wait = dyn_cast<hivm::SyncBlockWaitOp>(&operation);
+    if (!wait || wait.getTpipe() != pipeMte3 || wait.getPipe() != pipeMte1)
+      continue;
+    Operation *matmul = nullptr;
+    for (Operation *cursor = operation.getNextNode(); cursor;
+         cursor = cursor->getNextNode()) {
+      if (isa<linalg::MatmulOp, linalg::MatmulTransposeBOp>(cursor)) {
+        matmul = cursor;
+        break;
+      }
+      if (auto laterWait = dyn_cast<hivm::SyncBlockWaitOp>(cursor);
+          laterWait && laterWait.getTpipe() == pipeMte3 &&
+          laterWait.getPipe() == pipeMte1)
+        return failure();
+      if (cursor->hasTrait<OpTrait::IsTerminator>())
+        break;
+    }
+    if (!matmul)
+      return failure();
+    probabilityWaits.push_back(wait);
+    productMatmuls.push_back(matmul);
+  }
+  if (productMatmuls.empty() ||
+      productOperandPrefetchDepth > productMatmuls.size())
+    return failure();
+
+  Operation *lastScoreMatmul = nullptr;
+  for (MatmulChain &chain : chains)
+    if (chain.matmul->isBeforeInBlock(probabilityWaits.front()))
+      lastScoreMatmul = chain.matmul;
+  if (!lastScoreMatmul || !lastScoreMatmul->getNextNode())
+    return failure();
+
+  auto findMatmulChain = [&](Operation *matmul) -> MatmulChain * {
+    for (MatmulChain &chain : chains)
+      if (chain.matmul == matmul)
+        return &chain;
+    return nullptr;
+  };
+  auto collectOperandChain = [&](Value root) {
+    SetVector<Operation *> chain;
+    SmallVector<Value> worklist{root};
+    while (!worklist.empty()) {
+      Value value = worklist.pop_back_val();
+      Operation *definition = value.getDefiningOp();
+      if (!definition || definition->getBlock() != body ||
+          !isChainType(definition) || !chain.insert(definition))
+        continue;
+      for (Value operand : definition->getOperands())
+        worklist.push_back(operand);
+      if (isa<memref::AllocOp>(definition))
+        for (Operation *user : definition->getResult(0).getUsers())
+          if (auto copy = dyn_cast<memref::CopyOp>(user);
+              copy && copy->getBlock() == body &&
+              copy.getTarget() == definition->getResult(0) &&
+              chain.insert(copy))
+            for (Value operand : copy->getOperands())
+              worklist.push_back(operand);
+    }
+    return chain;
+  };
+
+  SmallVector<SmallVector<Operation *>> productOperandLoadChains;
+  productOperandLoadChains.reserve(productMatmuls.size());
+  for (Operation *matmul : productMatmuls) {
+    MatmulChain *fullChain = findMatmulChain(matmul);
+    if (!fullChain)
+      return failure();
+    SmallVector<Operation *> selected;
+    unsigned copiedOperandChains = 0;
+    for (Value operand : matmul->getOperands()) {
+      SetVector<Operation *> operandChain = collectOperandChain(operand);
+      unsigned copyCount = llvm::count_if(operandChain, [](Operation *op) {
+        return isa<memref::CopyOp>(op);
+      });
+      if (copyCount == 0)
+        continue;
+      if (copyCount != 1 || copiedOperandChains++ != 0)
+        return failure();
+      for (Operation *operation : operandChain) {
+        if (!safeToMove(operation, matmul, fullChain->ops))
+          return failure();
+        selected.push_back(operation);
+      }
+    }
+    if (copiedOperandChains != 1 || selected.empty())
+      return failure();
+    llvm::sort(selected, [](Operation *lhs, Operation *rhs) {
+      return lhs->isBeforeInBlock(rhs);
+    });
+    productOperandLoadChains.push_back(std::move(selected));
+  }
+
+  const unsigned prefetchDistance = productOperandPrefetchDepth - 1;
+  for (auto [lane, loadChain] :
+       llvm::enumerate(productOperandLoadChains)) {
+    Operation *anchor =
+        lane < prefetchDistance
+            ? lastScoreMatmul->getNextNode()
+            : productMatmuls[lane - prefetchDistance];
+    DenseSet<Operation *> moving;
+    moving.insert(loadChain.begin(), loadChain.end());
+    for (Operation *operation : loadChain)
+      for (Value operand : operation->getOperands())
+        if (Operation *definition = operand.getDefiningOp();
+            definition && definition->getBlock() == body &&
+            !moving.contains(definition) &&
+            (definition == anchor || anchor->isBeforeInBlock(definition)))
+          return failure();
+    for (Operation *operation : loadChain)
+      operation->moveBefore(anchor);
+  }
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] product-operand-prefetch depth="
+             << productOperandPrefetchDepth
+             << " distance=" << prefetchDistance
+             << " lanes=" << productOperandLoadChains.size() << "\n");
+  return success();
 }
 
 // ============================================================================
@@ -473,7 +613,102 @@ struct VectorToCubePack {
   Value pSrc;
   Value l1Alloc;
   Operation *anchor;
+  Operation *scoreReleaseAnchor = nullptr;
 };
+
+struct ReleaseLanePlan {
+  unsigned lane = 0;
+  unsigned scoreReleaseFlag = 0;
+  unsigned productReleaseFlag = 0;
+  PrincipalResource scoreSignalingResource =
+      PrincipalResource::ScalarControl;
+  PrincipalResource scoreWaitingResource = PrincipalResource::ScalarControl;
+  PrincipalResource productSignalingResource =
+      PrincipalResource::ScalarControl;
+  PrincipalResource productWaitingResource =
+      PrincipalResource::ScalarControl;
+  Operation *scoreCubeDrain = nullptr;
+  Operation *scoreVectorRelease = nullptr;
+  Operation *productCubeDrain = nullptr;
+  Operation *productVectorRelease = nullptr;
+};
+
+struct InitialReleaseSignal {
+  PostCVSplitLineageRole role = PostCVSplitLineageRole::Score;
+  unsigned slot = 0;
+  unsigned flag = 0;
+  PrincipalResource signalingResource = PrincipalResource::ScalarControl;
+  PrincipalResource waitingResource = PrincipalResource::ScalarControl;
+};
+
+struct ReleaseProtocolPlan {
+  SmallVector<ReleaseLanePlan> lanes;
+  SmallVector<InitialReleaseSignal> initialSignals;
+  Operation *legacyCubeWait = nullptr;
+  Operation *legacyVectorSet = nullptr;
+};
+
+struct OwnershipLanePlan {
+  PostCVSplitLineageRole role = PostCVSplitLineageRole::Score;
+  unsigned lane = 0;
+  unsigned slot = 0;
+  Value oldBuffer;
+  Operation *cubeDrain = nullptr;
+  Operation *vectorCast = nullptr;
+};
+
+struct BufferOwnershipPlan {
+  SmallVector<OwnershipLanePlan> lanes;
+  SmallVector<Value> oldBuffers;
+  MemRefType scoreBufferType;
+  MemRefType productBufferType;
+  unsigned scoreSlotCount = 0;
+  unsigned productSlotCount = 0;
+};
+
+static std::optional<unsigned> getStaticEventFlag(Operation *operation) {
+  std::optional<IntegerAttr> flag;
+  if (auto set = dyn_cast<hivm::SyncBlockSetOp>(operation))
+    flag = set.getStaticFlagId();
+  else if (auto wait = dyn_cast<hivm::SyncBlockWaitOp>(operation))
+    flag = wait.getStaticFlagId();
+  if (!flag || (*flag).getInt() < 0)
+    return std::nullopt;
+  return static_cast<unsigned>((*flag).getInt());
+}
+
+static const PostCVSplitDetachedCommand *findDetachedCommand(
+    ArrayRef<PostCVSplitDetachedCommand> commands,
+    PostCVSplitDetachedCommandKind kind, unsigned lane) {
+  auto command = llvm::find_if(commands, [&](const auto &candidate) {
+    return candidate.kind == kind && candidate.lane == lane;
+  });
+  return command == commands.end() ? nullptr : &*command;
+}
+
+static const PostCVSplitDetachedCommand *findDetachedCommandByFlag(
+    ArrayRef<PostCVSplitDetachedCommand> commands,
+    PostCVSplitDetachedCommandKind kind, unsigned flag) {
+  auto command = llvm::find_if(commands, [&](const auto &candidate) {
+    return candidate.kind == kind && candidate.hasEvent &&
+           candidate.logicalFlagId == flag;
+  });
+  return command == commands.end() ? nullptr : &*command;
+}
+
+static hivm::PipeAttr pipeForResource(MLIRContext *context,
+                                             PrincipalResource resource) {
+  switch (resource) {
+  case PrincipalResource::Fixpipe:
+    return hivm::PipeAttr::get(context, hivm::PIPE::PIPE_FIX);
+  case PrincipalResource::Vector:
+    return hivm::PipeAttr::get(context, hivm::PIPE::PIPE_V);
+  case PrincipalResource::Mte3:
+    return hivm::PipeAttr::get(context, hivm::PIPE::PIPE_MTE3);
+  default:
+    return nullptr;
+  }
+}
 
 // Step 1: emit get_sub_block_idx at the top of the scope and return it as an
 // index value (0 or 1 — which of the core's two veccores is executing).
@@ -750,13 +985,23 @@ rebuildVectorToCubePacks(ArrayRef<VectorToCubePack> packs, Value sbidx,
       return failure();
     }
     auto pType = dyn_cast<RankedTensorType>(p.pSrc.getType());
-    if (!pType || pType.getRank() != 2 || !pType.hasStaticShape()) {
-      emitError(loc, "V->C pack source must be a static rank-2 tensor");
+    if (!pType || !pType.hasStaticShape() ||
+        (pType.getRank() != 2 && pType.getRank() != 3)) {
+      emitError(loc, "V->C pack source must be a static rank-2 tensor or "
+                     "direct [N/16,M,16] tensor");
       return failure();
     }
-    int64_t M = pType.getShape()[0];
-    int64_t N = pType.getShape()[1];
-    int64_t N16 = N / kNzTileSize, M16 = M / kNzTileSize;
+    bool directPacked = pType.getRank() == 3;
+    int64_t M = directPacked ? pType.getShape()[1] : pType.getShape()[0];
+    int64_t N16 =
+        directPacked ? pType.getShape()[0] : pType.getShape()[1] / kNzTileSize;
+    int64_t N = N16 * kNzTileSize;
+    int64_t M16 = M / kNzTileSize;
+    if (M <= 0 || N <= 0 || M % kNzTileSize != 0 ||
+        (directPacked && pType.getShape()[2] != kNzTileSize)) {
+      emitError(loc, "invalid direct NZ pack geometry");
+      return failure();
+    }
     Type elemType = pType.getElementType();
     Operation *pProducer = p.pSrc.getDefiningOp();
     if (!pProducer || pProducer->getBlock() != p.anchor->getBlock() ||
@@ -783,19 +1028,24 @@ rebuildVectorToCubePacks(ArrayRef<VectorToCubePack> packs, Value sbidx,
       return failure();
     }
     auto i64Ty = b.getI64Type();
-    // reshape [M,N] -> [M, N16, kNzTileSize]
-    auto s3Type = RankedTensorType::get({3}, i64Ty);
-    auto s3 = b.create<arith::ConstantOp>(
-        loc, s3Type,
-        DenseElementsAttr::get(s3Type, ArrayRef<int64_t>{M, N16, kNzTileSize}));
-    auto resh1Type = RankedTensorType::get({M, N16, kNzTileSize}, elemType);
-    auto resh1 =
-        b.create<tensor::ReshapeOp>(loc, resh1Type, p.pSrc, s3.getResult());
-    // transpose [M,N16,kNzTileSize] -> [N16,M,kNzTileSize]
-    auto emptyT = b.create<tensor::EmptyOp>(
-        loc, ArrayRef<int64_t>{N16, M, kNzTileSize}, elemType);
-    auto transp = b.create<linalg::TransposeOp>(
-        loc, resh1.getResult(), emptyT.getResult(), ArrayRef<int64_t>{1, 0, 2});
+    Value packedTensor = p.pSrc;
+    if (!directPacked) {
+      // Generic fallback: reshape [M,N] and transpose to [N16,M,16].
+      auto s3Type = RankedTensorType::get({3}, i64Ty);
+      auto s3 = b.create<arith::ConstantOp>(
+          loc, s3Type,
+          DenseElementsAttr::get(
+              s3Type, ArrayRef<int64_t>{M, N16, kNzTileSize}));
+      auto resh1Type = RankedTensorType::get({M, N16, kNzTileSize}, elemType);
+      auto resh1 =
+          b.create<tensor::ReshapeOp>(loc, resh1Type, p.pSrc, s3.getResult());
+      auto emptyT = b.create<tensor::EmptyOp>(
+          loc, ArrayRef<int64_t>{N16, M, kNzTileSize}, elemType);
+      auto transpose = b.create<linalg::TransposeOp>(
+          loc, resh1.getResult(), emptyT.getResult(),
+          ArrayRef<int64_t>{1, 0, 2});
+      packedTensor = transpose->getResult(0);
+    }
 
     b.setInsertionPoint(p.anchor);
     // reshape [N16,M,kNzTileSize] -> [N16,M16,kNzTileSize,kNzTileSize]
@@ -806,7 +1056,7 @@ rebuildVectorToCubePacks(ArrayRef<VectorToCubePack> packs, Value sbidx,
             s4Type, ArrayRef<int64_t>{N16, M16, kNzTileSize, kNzTileSize}));
     auto nzType =
         RankedTensorType::get({N16, M16, kNzTileSize, kNzTileSize}, elemType);
-    auto resh2 = b.create<tensor::ReshapeOp>(loc, nzType, transp->getResult(0),
+    auto resh2 = b.create<tensor::ReshapeOp>(loc, nzType, packedTensor,
                                              s4.getResult());
     // to_memref + cast to UB
     auto memT = MemRefType::get({N16, M16, kNzTileSize, kNzTileSize}, elemType);
@@ -836,12 +1086,1711 @@ rebuildVectorToCubePacks(ArrayRef<VectorToCubePack> packs, Value sbidx,
   return success();
 }
 
+static FailureOr<Value>
+materializeVectorLaneRegion(VectorToCubePack &pack, unsigned lane) {
+  Operation *probabilityProducer = pack.pSrc.getDefiningOp();
+  Operation *anchor = pack.anchor;
+  if (!probabilityProducer || !anchor ||
+      probabilityProducer->getBlock() != anchor->getBlock() ||
+      !probabilityProducer->isBeforeInBlock(anchor))
+    return failure();
+
+  Operation *precedingWait = nullptr;
+  for (Operation *cursor = probabilityProducer->getPrevNode(); cursor;
+       cursor = cursor->getPrevNode()) {
+    if (isa<hivm::SyncBlockWaitOp>(cursor)) {
+      precedingWait = cursor;
+      break;
+    }
+  }
+  if (!precedingWait || !precedingWait->getNextNode() ||
+      precedingWait->getNextNode() == anchor)
+    return failure();
+
+  Operation *first = precedingWait->getNextNode();
+  SmallVector<Operation *> operations;
+  DenseSet<Operation *> operationSet;
+  bool containsProbabilityProducer = false;
+  for (Operation *cursor = first; cursor && cursor != anchor;
+       cursor = cursor->getNextNode()) {
+    if (cursor->hasTrait<OpTrait::IsTerminator>() ||
+        isa<hivm::SyncBlockWaitOp, hivm::SyncBlockSetOp>(cursor))
+      return failure();
+    bool hasShapedResult = llvm::any_of(cursor->getResultTypes(), [](Type type) {
+      return isa<ShapedType>(type);
+    });
+    if (!hasShapedResult)
+      continue;
+    operations.push_back(cursor);
+    operationSet.insert(cursor);
+    containsProbabilityProducer |= cursor == probabilityProducer;
+  }
+  if (!containsProbabilityProducer || operations.empty())
+    return failure();
+
+  SetVector<Value> outputs;
+  outputs.insert(pack.pSrc);
+  for (Operation *operation : operations) {
+    for (Value result : operation->getResults()) {
+      bool usedOutside = llvm::any_of(result.getUses(), [&](OpOperand &use) {
+        return !operationSet.contains(use.getOwner());
+      });
+      if (usedOutside)
+        outputs.insert(result);
+    }
+  }
+
+  SmallVector<Type> resultTypes;
+  for (Value output : outputs)
+    resultTypes.push_back(output.getType());
+  Location loc = probabilityProducer->getLoc();
+  MLIRContext *context = probabilityProducer->getContext();
+  OpBuilder builder(first);
+  auto simdScope = builder.create<scope::ScopeOp>(loc, resultTypes);
+  simdScope.getBodyRegion().emplaceBlock();
+  simdScope->setAttr("noinline", UnitAttr::get(context));
+  simdScope->setAttr("outline", BoolAttr::get(context, true));
+  simdScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
+  setOpEngineTypeAttr(simdScope, EngineType::VECTOR);
+
+  Block *scopeBlock = &simdScope.getBodyRegion().front();
+  for (Operation *operation : operations) {
+    operation->remove();
+    scopeBlock->push_back(operation);
+  }
+  OpBuilder syncBuilder(probabilityProducer);
+  auto syncToken = syncBuilder.create<arith::ConstantIntOp>(loc, 0, 64);
+  auto syncMark =
+      syncBuilder.create<annotation::MarkOp>(loc, syncToken.getResult());
+  syncMark->setAttr("SYNC_IN_VF", StringAttr::get(context, "VST_VLD"));
+  setOpEngineTypeAttr(syncToken, EngineType::VECTOR);
+  setOpEngineTypeAttr(syncMark, EngineType::VECTOR);
+  OpBuilder returnBuilder(scopeBlock, scopeBlock->end());
+  auto returnOp =
+      returnBuilder.create<scope::ReturnOp>(loc, outputs.getArrayRef());
+
+  Value outlinedProbability;
+  for (auto [index, output] : llvm::enumerate(outputs)) {
+    Value replacement = simdScope->getResult(index);
+    if (output == pack.pSrc)
+      outlinedProbability = replacement;
+    SmallVector<OpOperand *> outsideUses;
+    for (OpOperand &use : output.getUses()) {
+      Operation *owner = use.getOwner();
+      if (owner != returnOp && !simdScope->isAncestor(owner))
+        outsideUses.push_back(&use);
+    }
+    for (OpOperand *use : outsideUses)
+      use->set(replacement);
+  }
+  if (!outlinedProbability)
+    return failure();
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] materialized-vector-lane lane=" << lane
+             << " operations=" << operations.size()
+             << " results=" << outputs.size()
+             << " vector-mode=simd publication=detached\n");
+  return outlinedProbability;
+}
+
+static RankedTensorType getRowSliceType(RankedTensorType type, int64_t rows) {
+  if (!type.hasStaticShape() || type.getRank() == 0 ||
+      type.getDimSize(0) != rows)
+    return type;
+  SmallVector<int64_t> shape(type.getShape());
+  shape[0] = 1;
+  return RankedTensorType::get(shape, type.getElementType(),
+                               type.getEncoding());
+}
+
+static FailureOr<Value>
+materializeRowwiseVectorRegion(VectorToCubePack &pack, unsigned lane) {
+  auto probabilityType = dyn_cast<RankedTensorType>(pack.pSrc.getType());
+  Operation *probabilityProducer = pack.pSrc.getDefiningOp();
+  Operation *anchor = pack.anchor;
+  if (!probabilityType || !probabilityType.hasStaticShape() ||
+      probabilityType.getRank() != 2 || probabilityType.getDimSize(0) <= 0 ||
+      !probabilityProducer || !anchor ||
+      probabilityProducer->getBlock() != anchor->getBlock() ||
+      !probabilityProducer->isBeforeInBlock(anchor))
+    return failure();
+  int64_t rows = probabilityType.getDimSize(0);
+
+  Operation *precedingWait = nullptr;
+  for (Operation *cursor = probabilityProducer->getPrevNode(); cursor;
+       cursor = cursor->getPrevNode()) {
+    if (isa<hivm::SyncBlockWaitOp>(cursor)) {
+      precedingWait = cursor;
+      break;
+    }
+  }
+  if (!precedingWait || !precedingWait->getNextNode())
+    return failure();
+
+  SmallVector<Operation *> operations;
+  DenseSet<Operation *> operationSet;
+  bool containsProbabilityProducer = false;
+  for (Operation *cursor = precedingWait->getNextNode(); cursor;
+       cursor = cursor->getNextNode()) {
+    if (cursor->hasTrait<OpTrait::IsTerminator>())
+      break;
+    if (isa<hivm::SyncBlockWaitOp, hivm::SyncBlockSetOp>(cursor))
+      continue;
+    bool hasRowTensorResult = llvm::any_of(
+        cursor->getResultTypes(), [&](Type type) {
+          auto tensor = dyn_cast<RankedTensorType>(type);
+          return tensor && tensor.hasStaticShape() && tensor.getRank() > 0 &&
+                 tensor.getDimSize(0) == rows;
+        });
+    if (!hasRowTensorResult || isa<bufferization::ToTensorOp>(cursor) ||
+        isa<arith::ConstantOp>(cursor))
+      continue;
+    operations.push_back(cursor);
+    operationSet.insert(cursor);
+    containsProbabilityProducer |= cursor == probabilityProducer;
+  }
+  if (!containsProbabilityProducer || operations.empty())
+    return failure();
+
+  SetVector<Value> outputs;
+  outputs.insert(pack.pSrc);
+  for (Operation *operation : operations)
+    for (Value result : operation->getResults()) {
+      auto tensor = dyn_cast<RankedTensorType>(result.getType());
+      if (!tensor || tensor.getRank() == 0 || tensor.getDimSize(0) != rows)
+        continue;
+      if (llvm::any_of(result.getUses(), [&](OpOperand &use) {
+            return !operationSet.contains(use.getOwner());
+          }))
+        outputs.insert(result);
+    }
+
+  SmallVector<Type> resultTypes;
+  SmallVector<Value> initValues;
+  for (Value output : outputs)
+    resultTypes.push_back(output.getType());
+  Location loc = probabilityProducer->getLoc();
+  MLIRContext *context = probabilityProducer->getContext();
+  OpBuilder builder(operations.front());
+  auto simdScope = builder.create<scope::ScopeOp>(loc, resultTypes);
+  simdScope.getBodyRegion().emplaceBlock();
+  simdScope->setAttr("noinline", UnitAttr::get(context));
+  simdScope->setAttr("outline", BoolAttr::get(context, true));
+  simdScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
+  setOpEngineTypeAttr(simdScope, EngineType::VECTOR);
+
+  Block *scopeBlock = &simdScope.getBodyRegion().front();
+  OpBuilder scopeBuilder = OpBuilder::atBlockEnd(scopeBlock);
+  for (Value output : outputs) {
+    auto type = cast<RankedTensorType>(output.getType());
+    initValues.push_back(scopeBuilder.create<tensor::EmptyOp>(
+        loc, type.getShape(), type.getElementType(), type.getEncoding()));
+  }
+  Value lower = scopeBuilder.create<arith::ConstantIndexOp>(loc, 0);
+  Value upper = scopeBuilder.create<arith::ConstantIndexOp>(loc, rows);
+  Value step = scopeBuilder.create<arith::ConstantIndexOp>(loc, 1);
+  auto rowLoop = scopeBuilder.create<scf::ForOp>(loc, lower, upper, step,
+                                                 initValues);
+  Block *rowBody = rowLoop.getBody();
+  if (!rowBody->empty())
+    rowBody->back().erase();
+  OpBuilder rowBuilder = OpBuilder::atBlockEnd(rowBody);
+  Value row = rowLoop.getInductionVar();
+  IRMapping mapping;
+
+  auto mapExternal = [&](Value value) -> Value {
+    if (Value mapped = mapping.lookupOrNull(value))
+      return mapped;
+    auto tensor = dyn_cast<RankedTensorType>(value.getType());
+    if (!tensor || !tensor.hasStaticShape() || tensor.getRank() == 0 ||
+        tensor.getDimSize(0) != rows)
+      return value;
+    RankedTensorType rowType = getRowSliceType(tensor, rows);
+    SmallVector<OpFoldResult> offsets(tensor.getRank(),
+                                      rowBuilder.getIndexAttr(0));
+    SmallVector<OpFoldResult> sizes;
+    SmallVector<OpFoldResult> strides(tensor.getRank(),
+                                      rowBuilder.getIndexAttr(1));
+    offsets[0] = row;
+    for (int64_t size : rowType.getShape())
+      sizes.push_back(rowBuilder.getIndexAttr(size));
+    Value slice = rowBuilder
+                      .create<tensor::ExtractSliceOp>(
+                          loc, rowType, value, offsets, sizes, strides)
+                      .getResult();
+    mapping.map(value, slice);
+    return slice;
+  };
+
+  for (Operation *operation : operations) {
+    for (Value operand : operation->getOperands())
+      if (!mapping.contains(operand) &&
+          !operationSet.contains(operand.getDefiningOp()))
+        (void)mapExternal(operand);
+    if (operation == probabilityProducer) {
+      auto token = rowBuilder.create<arith::ConstantIntOp>(loc, 0, 64);
+      auto mark =
+          rowBuilder.create<annotation::MarkOp>(loc, token.getResult());
+      mark->setAttr("SYNC_IN_VF", StringAttr::get(context, "VST_VLD"));
+    }
+    if (isa<linalg::ReduceOp>(operation) &&
+        operation->getNumOperands() == 2 &&
+        operation->getNumResults() == 1) {
+      Value input = mapping.lookupOrDefault(operation->getOperand(0));
+      Value accumulator =
+          mapping.lookupOrDefault(operation->getOperand(1));
+      auto inputType = dyn_cast<RankedTensorType>(input.getType());
+      constexpr int64_t chunkWidth = 4 * kNzTileSize;
+      if (inputType && inputType.getRank() == 2 &&
+          inputType.getDimSize(0) == 1 &&
+          inputType.getDimSize(1) > chunkWidth &&
+          inputType.getDimSize(1) % chunkWidth == 0) {
+        for (int64_t chunk = 0; chunk < inputType.getDimSize(1);
+             chunk += chunkWidth) {
+          auto chunkType = RankedTensorType::get(
+              {1, chunkWidth}, inputType.getElementType(),
+              inputType.getEncoding());
+          SmallVector<OpFoldResult> offsets{
+              rowBuilder.getIndexAttr(0), rowBuilder.getIndexAttr(chunk)};
+          SmallVector<OpFoldResult> sizes{
+              rowBuilder.getIndexAttr(1),
+              rowBuilder.getIndexAttr(chunkWidth)};
+          SmallVector<OpFoldResult> strides{
+              rowBuilder.getIndexAttr(1), rowBuilder.getIndexAttr(1)};
+          Value slice = rowBuilder
+                            .create<tensor::ExtractSliceOp>(
+                                loc, chunkType, input, offsets, sizes, strides)
+                            .getResult();
+          IRMapping reductionMapping;
+          reductionMapping.map(operation->getOperand(0), slice);
+          reductionMapping.map(operation->getOperand(1), accumulator);
+          Operation *clone = rowBuilder.clone(*operation, reductionMapping);
+          Value reduced = clone->getResult(0);
+          auto originalType =
+              cast<RankedTensorType>(operation->getResult(0).getType());
+          reduced.setType(getRowSliceType(originalType, rows));
+          accumulator = reduced;
+        }
+        mapping.map(operation->getResult(0), accumulator);
+        continue;
+      }
+    }
+    Operation *clone = rowBuilder.clone(*operation, mapping);
+    for (auto [original, cloned] :
+         llvm::zip_equal(operation->getResults(), clone->getResults())) {
+      auto tensor = dyn_cast<RankedTensorType>(original.getType());
+      if (tensor)
+        cloned.setType(getRowSliceType(tensor, rows));
+    }
+  }
+
+  SmallVector<Value> yielded;
+  for (auto [index, output] : llvm::enumerate(outputs)) {
+    Value rowValue = mapping.lookupOrNull(output);
+    if (!rowValue)
+      return failure();
+    auto rowType = cast<RankedTensorType>(rowValue.getType());
+    SmallVector<OpFoldResult> offsets(rowType.getRank(),
+                                      rowBuilder.getIndexAttr(0));
+    SmallVector<OpFoldResult> sizes;
+    SmallVector<OpFoldResult> strides(rowType.getRank(),
+                                      rowBuilder.getIndexAttr(1));
+    offsets[0] = row;
+    for (int64_t size : rowType.getShape())
+      sizes.push_back(rowBuilder.getIndexAttr(size));
+    yielded.push_back(rowBuilder.create<tensor::InsertSliceOp>(
+        loc, rowValue, rowLoop.getRegionIterArgs()[index], offsets, sizes,
+        strides));
+  }
+  rowBuilder.create<scf::YieldOp>(loc, yielded);
+  scopeBuilder.create<scope::ReturnOp>(loc, rowLoop.getResults());
+
+  Value outlinedProbability;
+  for (auto [index, output] : llvm::enumerate(outputs)) {
+    Value replacement = simdScope->getResult(index);
+    if (output == pack.pSrc)
+      outlinedProbability = replacement;
+    SmallVector<OpOperand *> outsideUses;
+    for (OpOperand &use : output.getUses())
+      if (!operationSet.contains(use.getOwner()))
+        outsideUses.push_back(&use);
+    for (OpOperand *use : outsideUses)
+      use->set(replacement);
+  }
+  for (Operation *operation : llvm::reverse(operations))
+    operation->erase();
+  if (!outlinedProbability)
+    return failure();
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] materialized-rowwise-lane lane=" << lane
+             << " operations=" << operations.size() << " rows=" << rows
+             << " results=" << outputs.size()
+             << " vector-mode=simd publication=detached\n");
+  return outlinedProbability;
+}
+
+struct OnlineSoftmaxLaneState {
+  Value oldMaximum;
+  Value oldDenominator;
+  Value maximum;
+  Value sum;
+  Value packedProbability;
+  arith::SubFOp alphaDifference;
+  math::ExpOp alpha;
+  arith::MulFOp scaledDenominator;
+  arith::AddFOp newDenominator;
+  Operation *scoreReleaseAnchor = nullptr;
+};
+
+static FailureOr<OnlineSoftmaxLaneState>
+materializeOnlineSoftmaxLane(VectorToCubePack &pack, unsigned lane,
+                                      bool deferLaneSum,
+                                      Value &sharedScaleScalar,
+                                      Value &sharedScaleRow) {
+  Operation *probabilityProducer = pack.pSrc.getDefiningOp();
+  Operation *anchor = pack.anchor;
+  auto probabilityType = dyn_cast<RankedTensorType>(pack.pSrc.getType());
+  if (!probabilityProducer || !anchor || !probabilityType ||
+      !probabilityType.hasStaticShape() || probabilityType.getRank() != 2 ||
+      probabilityProducer->getBlock() != anchor->getBlock())
+    return failure();
+  int64_t rows = probabilityType.getDimSize(0);
+  int64_t width = probabilityType.getDimSize(1);
+  constexpr int64_t chunkWidth = 4 * kNzTileSize;
+  if (rows <= 0 || width <= 0 || width % chunkWidth != 0)
+    return failure();
+
+  Operation *precedingWait = nullptr;
+  for (Operation *cursor = probabilityProducer->getPrevNode(); cursor;
+       cursor = cursor->getPrevNode())
+    if (isa<hivm::SyncBlockWaitOp>(cursor)) {
+      precedingWait = cursor;
+      break;
+    }
+  if (!precedingWait)
+    return failure();
+
+  SmallVector<Operation *> operations;
+  DenseSet<Operation *> operationSet;
+  arith::MulFOp scaledScore;
+  linalg::ReduceOp maxReduce;
+  arith::MaximumFOp newMaximum;
+  math::ExpOp probabilityExp;
+  linalg::ReduceOp sumReduce;
+  math::ExpOp alpha;
+  arith::AddFOp newDenominator;
+  for (Operation *cursor = precedingWait->getNextNode(); cursor;
+       cursor = cursor->getNextNode()) {
+    if (cursor->hasTrait<OpTrait::IsTerminator>())
+      break;
+    if (isa<hivm::SyncBlockWaitOp, hivm::SyncBlockSetOp>(cursor))
+      continue;
+    bool hasRowTensorResult = llvm::any_of(
+        cursor->getResultTypes(), [&](Type type) {
+          auto tensor = dyn_cast<RankedTensorType>(type);
+          return tensor && tensor.hasStaticShape() && tensor.getRank() > 0 &&
+                 tensor.getDimSize(0) == rows;
+        });
+    if (!hasRowTensorResult || isa<bufferization::ToTensorOp>(cursor) ||
+        isa<arith::ConstantOp>(cursor))
+      continue;
+    if (auto op = dyn_cast<arith::MulFOp>(cursor)) {
+      auto result = dyn_cast<RankedTensorType>(op.getType());
+      if (result && result.getRank() == 2 && !scaledScore)
+        scaledScore = op;
+    } else if (auto op = dyn_cast<linalg::ReduceOp>(cursor)) {
+      if (!maxReduce)
+        maxReduce = op;
+      else if (!sumReduce)
+        sumReduce = op;
+    } else if (auto op = dyn_cast<arith::MaximumFOp>(cursor)) {
+      auto result = dyn_cast<RankedTensorType>(op.getType());
+      if (result && result.getRank() == 1)
+        newMaximum = op;
+    } else if (auto op = dyn_cast<math::ExpOp>(cursor)) {
+      auto result = dyn_cast<RankedTensorType>(op.getType());
+      if (result && result.getRank() == 2)
+        probabilityExp = op;
+      else if (result && result.getRank() == 1)
+        alpha = op;
+    } else if (auto op = dyn_cast<arith::AddFOp>(cursor)) {
+      auto result = dyn_cast<RankedTensorType>(op.getType());
+      if (result && result.getRank() == 1)
+        newDenominator = op;
+    }
+    if (scaledScore && maxReduce && newMaximum && probabilityExp &&
+        sumReduce && alpha && newDenominator)
+      break;
+  }
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-match lane=" << lane
+             << " scaled=" << (scaledScore ? "yes" : "no")
+             << " max-reduce=" << (maxReduce ? "yes" : "no")
+             << " maximum=" << (newMaximum ? "yes" : "no")
+             << " probability-exp=" << (probabilityExp ? "yes" : "no")
+             << " sum-reduce=" << (sumReduce ? "yes" : "no")
+             << " alpha=" << (alpha ? "yes" : "no")
+             << " denominator=" << (newDenominator ? "yes" : "no")
+             << "\n");
+  if (!scaledScore || !maxReduce || !newMaximum || !probabilityExp ||
+      !sumReduce || !alpha || !newDenominator ||
+      probabilityProducer != pack.pSrc.getDefiningOp())
+    return failure();
+
+  Value score = scaledScore.getLhs();
+  Value scale = scaledScore.getRhs();
+  Value oldMaximum = newMaximum.getLhs() == maxReduce.getResult(0)
+                         ? newMaximum.getRhs()
+                         : newMaximum.getLhs();
+  Value alphaInput = alpha.getOperand();
+  auto alphaSub = alphaInput.getDefiningOp<arith::SubFOp>();
+  if (!alphaSub)
+    return failure();
+  Value oldDenominator;
+  arith::MulFOp scaledDenominator;
+  bool addsLaneSum = false;
+  for (Value operand : newDenominator->getOperands())
+    if (auto mul = operand.getDefiningOp<arith::MulFOp>()) {
+      if (mul.getLhs() == alpha.getResult()) {
+        oldDenominator = mul.getRhs();
+        scaledDenominator = mul;
+      } else if (mul.getRhs() == alpha.getResult()) {
+        oldDenominator = mul.getLhs();
+        scaledDenominator = mul;
+      }
+    } else if (operand == sumReduce.getResult(0)) {
+      addsLaneSum = true;
+    }
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-denominator lane=" << lane
+             << " old=" << (oldDenominator ? "yes" : "no") << "\n");
+  if (!oldDenominator || !scaledDenominator || !addsLaneSum ||
+      alphaSub.getLhs() != oldMaximum ||
+      alphaSub.getRhs() != newMaximum.getResult())
+    return failure();
+
+  DenseSet<Value> externalValues{score, scale, oldMaximum, oldDenominator,
+                                 maxReduce.getDpsInits()[0],
+                                 sumReduce.getDpsInits()[0]};
+  SmallVector<Operation *> worklist{
+      scaledScore.getOperation(), maxReduce.getOperation(),
+      newMaximum.getOperation(), probabilityExp.getOperation(),
+      probabilityProducer, sumReduce.getOperation()};
+  while (!worklist.empty()) {
+    Operation *operation = worklist.pop_back_val();
+    if (!operationSet.insert(operation).second)
+      continue;
+    for (Value operand : operation->getOperands()) {
+      if (externalValues.contains(operand))
+        continue;
+      Operation *definition = operand.getDefiningOp();
+      if (!definition || definition->getBlock() != anchor->getBlock() ||
+          isa<bufferization::ToTensorOp, arith::ConstantOp>(definition))
+        continue;
+      bool hasRowTensorResult = llvm::any_of(
+          definition->getResultTypes(), [&](Type type) {
+            auto tensor = dyn_cast<RankedTensorType>(type);
+            return tensor && tensor.hasStaticShape() && tensor.getRank() > 0 &&
+                   tensor.getDimSize(0) == rows;
+          });
+      if (hasRowTensorResult)
+        worklist.push_back(definition);
+    }
+  }
+  for (Operation &operation : *anchor->getBlock())
+    if (operationSet.contains(&operation))
+      operations.push_back(&operation);
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-closure lane=" << lane
+             << " operations=" << operations.size() << "\n");
+  if (operations.empty())
+    return failure();
+
+  Location loc = probabilityProducer->getLoc();
+  MLIRContext *context = probabilityProducer->getContext();
+  Type f32 = cast<RankedTensorType>(scaledScore.getType()).getElementType();
+  Type pElement = probabilityType.getElementType();
+  auto rowVectorType = RankedTensorType::get({1, chunkWidth}, f32);
+  auto rowScalarType = RankedTensorType::get({1}, f32);
+  auto maximumType = RankedTensorType::get({rows}, f32);
+  auto scaledType = RankedTensorType::get({rows, width}, f32);
+  int64_t n16 = width / kNzTileSize;
+  auto packedType =
+      RankedTensorType::get({n16, rows, kNzTileSize}, pElement);
+
+  auto scaleFill = scale.getDefiningOp<linalg::FillOp>();
+  if (!scaleFill || scaleFill.getInputs().size() != 1 ||
+      scaleFill->getNumResults() != 1 || scaleFill.getResult(0) != scale)
+    return failure();
+  Value scaleScalar = scaleFill.getInputs()[0];
+  if (sharedScaleScalar) {
+    if (sharedScaleScalar != scaleScalar ||
+        sharedScaleRow.getType() != rowVectorType)
+      return failure();
+  } else {
+    OpBuilder scaleBuilder(scaleFill);
+    Location scaleLoc =
+        NameLoc::get(scaleBuilder.getStringAttr("cvsplit.softmax.shared-scale-row"),
+                     scaleFill.getLoc());
+    Value scaleRowInit = scaleBuilder.create<tensor::EmptyOp>(
+        scaleLoc, rowVectorType.getShape(), rowVectorType.getElementType(),
+        rowVectorType.getEncoding());
+    sharedScaleRow = scaleBuilder
+                         .create<linalg::FillOp>(
+                             scaleLoc, ValueRange{scaleScalar},
+                             ValueRange{scaleRowInit})
+                         .getResult(0);
+    sharedScaleScalar = scaleScalar;
+  }
+
+  Operation *insertionAnchor = operations.front();
+  auto createLoopStorage = [&](OpBuilder &storageBuilder,
+                               RankedTensorType tensorType,
+                               StringRef role) -> Value {
+    Location storageLoc =
+        NameLoc::get(storageBuilder.getStringAttr(role), loc);
+    auto ubAddressSpace = storageBuilder.getAttr<hivm::AddressSpaceAttr>(
+        hivm::AddressSpace::UB);
+    auto ubType = MemRefType::get(tensorType.getShape(),
+                                  tensorType.getElementType(), nullptr,
+                                  ubAddressSpace);
+    auto allocation = storageBuilder.create<memref::AllocOp>(storageLoc,
+                                                              ubType);
+    auto mark = storageBuilder.create<annotation::MarkOp>(
+        storageLoc, allocation.getResult());
+    mark->setAttr("effects",
+                  storageBuilder.getArrayAttr(
+                      {storageBuilder.getStringAttr("write"),
+                       storageBuilder.getStringAttr("read")}));
+    auto plainType = MemRefType::get(tensorType.getShape(),
+                                     tensorType.getElementType());
+    auto cast = storageBuilder.create<memref::MemorySpaceCastOp>(
+        storageLoc, plainType, allocation.getResult());
+    return storageBuilder
+        .create<bufferization::ToTensorOp>(
+            storageLoc, tensorType, cast.getResult(),
+            /*restrict=*/true, /*writable=*/true)
+        .getResult();
+  };
+  auto createReductionInit =
+      [&](OpBuilder &initBuilder, linalg::ReduceOp reduction,
+          RankedTensorType initType) -> FailureOr<Value> {
+    auto fill = reduction.getDpsInits()[0].getDefiningOp<linalg::FillOp>();
+    if (!fill || fill.getInputs().size() != 1)
+      return failure();
+    Value fillInput = fill.getInputs()[0];
+    if (Operation *definition = fillInput.getDefiningOp();
+        definition && definition->getBlock() == insertionAnchor->getBlock() &&
+        insertionAnchor->isBeforeInBlock(definition)) {
+      if (!isa<arith::ConstantOp>(definition))
+        return failure();
+      fillInput = initBuilder.clone(*definition)->getResult(0);
+    }
+    Value empty = initBuilder
+                      .create<tensor::EmptyOp>(
+                          loc, initType.getShape(), initType.getElementType(),
+                          initType.getEncoding())
+                      .getResult();
+    return initBuilder
+        .create<linalg::FillOp>(loc, ValueRange{fillInput}, ValueRange{empty})
+        .getResult(0);
+  };
+
+  OpBuilder builder(insertionAnchor);
+  Value sumRowsInit =
+      createLoopStorage(builder, maximumType, "cvsplit.softmax.sum-rows");
+  Value scaledRowsInit =
+      createLoopStorage(builder, scaledType, "cvsplit.softmax.scaled-rows");
+  Value packedRowsInit =
+      createLoopStorage(builder, packedType, "cvsplit.softmax.packed-rows");
+  Value maxRowsInit =
+      createLoopStorage(builder, maximumType, "cvsplit.softmax.max-rows");
+  Value deferredAddInit;
+  if (deferLaneSum) {
+    Location deferredLoc =
+        NameLoc::get(builder.getStringAttr("cvsplit.softmax.deferred-add-row"), loc);
+    deferredAddInit = builder.create<tensor::EmptyOp>(
+        deferredLoc, rowVectorType.getShape(), rowVectorType.getElementType(),
+        rowVectorType.getEncoding());
+  }
+  SmallVector<Type> scopeResults;
+  if (deferLaneSum)
+    scopeResults.append({scaledType, maximumType, packedType});
+  else
+    scopeResults.append({maximumType, maximumType, packedType});
+  auto simdScope = builder.create<scope::ScopeOp>(loc, scopeResults);
+  simdScope.getBodyRegion().emplaceBlock();
+  simdScope->setAttr("noinline", UnitAttr::get(context));
+  simdScope->setAttr("outline", BoolAttr::get(context, true));
+  simdScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
+  setOpEngineTypeAttr(simdScope, EngineType::VECTOR);
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-build-progress lane=" << lane
+             << " checkpoint=scope-created\n");
+  Block *scopeBlock = &simdScope.getBodyRegion().front();
+  OpBuilder b = OpBuilder::atBlockEnd(scopeBlock);
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-build-progress lane=" << lane
+             << " checkpoint=scope-builder-ready\n");
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-build-progress lane=" << lane
+             << " checkpoint=parent-loop-inits-ready\n");
+  Value lower = b.create<arith::ConstantIntOp>(loc, 0, 32);
+  Value upper = b.create<arith::ConstantIntOp>(loc, rows, 32);
+  Value step = b.create<arith::ConstantIntOp>(loc, 1, 32);
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-build-progress lane=" << lane
+             << " checkpoint=max-loop-bounds-created\n");
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-build-progress lane=" << lane
+             << " checkpoint=max-loop-create-begin\n");
+  auto maxLoop = b.create<scf::ForOp>(
+      loc, lower, upper, step,
+      ValueRange{maxRowsInit, scaledRowsInit});
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-build-progress lane=" << lane
+             << " checkpoint=max-loop-create-end\n");
+  Block *maxBody = maxLoop.getBody();
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-build-progress lane=" << lane
+             << " checkpoint=max-loop-body-ready\n");
+  if (!maxBody->empty())
+    maxBody->back().erase();
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-build-progress lane=" << lane
+             << " checkpoint=max-loop-default-yield-erased\n");
+  OpBuilder mb = OpBuilder::atBlockEnd(maxBody);
+  Value row = mb.create<arith::IndexCastOp>(
+      loc, mb.getIndexType(), maxLoop.getInductionVar());
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-build-progress lane=" << lane
+             << " checkpoint=max-loop-shell-created\n");
+
+  auto extractRowChunk = [&](OpBuilder &rb, Value tensorValue, int64_t chunk,
+                             Type elementType) {
+    auto type = RankedTensorType::get({1, chunkWidth}, elementType);
+    SmallVector<OpFoldResult> offsets{row, rb.getIndexAttr(chunk)};
+    SmallVector<OpFoldResult> sizes{rb.getIndexAttr(1),
+                                    rb.getIndexAttr(chunkWidth)};
+    SmallVector<OpFoldResult> strides{rb.getIndexAttr(1), rb.getIndexAttr(1)};
+    return rb.create<tensor::ExtractSliceOp>(loc, type, tensorValue, offsets,
+                                              sizes, strides)
+        .getResult();
+  };
+  auto insertRowChunk = [&](OpBuilder &rb, Value value, Value destination,
+                            int64_t chunk) {
+    SmallVector<OpFoldResult> offsets{row, rb.getIndexAttr(chunk)};
+    SmallVector<OpFoldResult> sizes{rb.getIndexAttr(1),
+                                    rb.getIndexAttr(chunkWidth)};
+    SmallVector<OpFoldResult> strides{rb.getIndexAttr(1), rb.getIndexAttr(1)};
+    return rb.create<tensor::InsertSliceOp>(loc, value, destination, offsets,
+                                             sizes, strides)
+        .getResult();
+  };
+  Value scaledRows = maxLoop.getRegionIterArgs()[1];
+  Value combinedMaximum;
+  for (int64_t chunk = 0; chunk < width; chunk += chunkWidth) {
+    Value scoreChunk = extractRowChunk(mb, score, chunk, f32);
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split] online-softmax-build-progress lane=" << lane
+               << " checkpoint=max-score-chunk-extracted chunk=" << chunk
+               << "\n");
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split] online-softmax-build-progress lane=" << lane
+               << " checkpoint=max-shared-scale-row-ready chunk=" << chunk
+               << "\n");
+    Value scaled =
+        mb.create<arith::MulFOp>(loc, scoreChunk, sharedScaleRow);
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split] online-softmax-build-progress lane=" << lane
+               << " checkpoint=max-chunk-scaled chunk=" << chunk << "\n");
+    scaledRows = insertRowChunk(mb, scaled, scaledRows, chunk);
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split] online-softmax-build-progress lane=" << lane
+               << " checkpoint=max-scaled-chunk-inserted chunk=" << chunk
+               << "\n");
+    combinedMaximum = combinedMaximum
+                          ? mb.create<arith::MaximumFOp>(loc, combinedMaximum,
+                                                        scaled)
+                                .getResult()
+                          : scaled;
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split] online-softmax-build-progress lane=" << lane
+               << " checkpoint=max-chunks-combined chunk=" << chunk << "\n");
+  }
+  SmallVector<OpFoldResult> scalarOffset{row};
+  SmallVector<OpFoldResult> scalarSize{mb.getIndexAttr(1)};
+  SmallVector<OpFoldResult> scalarStride{mb.getIndexAttr(1)};
+  FailureOr<Value> maxInit = createReductionInit(mb, maxReduce, rowScalarType);
+  if (failed(maxInit))
+    return failure();
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-build-progress lane=" << lane
+             << " checkpoint=max-init-materialized\n");
+  IRMapping maxMapping;
+  maxMapping.map(maxReduce.getDpsInputs()[0], combinedMaximum);
+  maxMapping.map(maxReduce.getDpsInits()[0], *maxInit);
+  Operation *maxClone = mb.clone(*maxReduce, maxMapping);
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-build-progress lane=" << lane
+             << " checkpoint=max-reduce-cloned\n");
+  maxClone->getResult(0).setType(rowScalarType);
+  Value maxRows = mb.create<tensor::InsertSliceOp>(
+      loc, maxClone->getResult(0), maxLoop.getRegionIterArgs()[0],
+      scalarOffset, scalarSize, scalarStride);
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-build-progress lane=" << lane
+             << " checkpoint=max-result-inserted\n");
+  mb.create<scf::YieldOp>(loc, ValueRange{maxRows, scaledRows});
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-build-progress lane=" << lane
+             << " checkpoint=max-loop-created\n");
+
+  Value maximum =
+      b.create<arith::MaximumFOp>(loc, oldMaximum, maxLoop.getResult(0));
+  auto syncToken = b.create<arith::ConstantIntOp>(loc, 0, 64);
+  auto syncMark = b.create<annotation::MarkOp>(loc, syncToken.getResult());
+  syncMark->setAttr("SYNC_IN_VF", StringAttr::get(context, "VST_VLD"));
+  Value expRowsInit = deferLaneSum ? maxLoop.getResult(1) : sumRowsInit;
+  auto expLoop = b.create<scf::ForOp>(
+      loc, lower, upper, step, ValueRange{expRowsInit, packedRowsInit});
+  Block *expBody = expLoop.getBody();
+  if (!expBody->empty())
+    expBody->back().erase();
+  OpBuilder eb = OpBuilder::atBlockEnd(expBody);
+  row = eb.create<arith::IndexCastOp>(loc, eb.getIndexType(),
+                                      expLoop.getInductionVar());
+  Value maximumRow = eb.create<tensor::ExtractSliceOp>(
+      loc, rowScalarType, maximum, SmallVector<OpFoldResult>{row}, scalarSize,
+      scalarStride);
+  auto broadcastInit =
+      eb.create<tensor::EmptyOp>(loc, rowVectorType.getShape(), f32);
+  auto maximumBroadcastOp = eb.create<linalg::BroadcastOp>(
+      loc, maximumRow, broadcastInit, ArrayRef<int64_t>{1});
+  Value maximumBroadcast = maximumBroadcastOp->getResult(0);
+  Value sumChunks;
+  Value expRows = expLoop.getRegionIterArgs()[0];
+  Value packedRows = expLoop.getRegionIterArgs()[1];
+  for (int64_t chunk = 0; chunk < width; chunk += chunkWidth) {
+    Value scaled = extractRowChunk(eb, maxLoop.getResult(1), chunk, f32);
+    Value shifted = eb.create<arith::SubFOp>(loc, scaled, maximumBroadcast);
+    Value exponential = eb.create<math::ExpOp>(loc, shifted);
+    if (deferLaneSum)
+      expRows = insertRowChunk(eb, exponential, expRows, chunk);
+    else
+      sumChunks = sumChunks
+                      ? eb.create<arith::AddFOp>(loc, sumChunks, exponential)
+                            .getResult()
+                      : exponential;
+    auto shapeType = RankedTensorType::get({3}, b.getI64Type());
+    auto shape = eb.create<arith::ConstantOp>(
+        loc, shapeType,
+        DenseElementsAttr::get(
+            shapeType,
+            ArrayRef<int64_t>{chunkWidth / kNzTileSize, 1, kNzTileSize}));
+    auto packedFloatChunkType = RankedTensorType::get(
+        {chunkWidth / kNzTileSize, 1, kNzTileSize}, f32);
+    Value packedFloatChunk = eb.create<tensor::ReshapeOp>(
+        loc, packedFloatChunkType, exponential, shape);
+    auto packedChunkType = RankedTensorType::get(
+        {chunkWidth / kNzTileSize, 1, kNzTileSize}, pElement);
+    Value packedChunk = eb.create<arith::TruncFOp>(
+        loc, packedChunkType, packedFloatChunk);
+    SmallVector<OpFoldResult> offsets{
+        eb.getIndexAttr(chunk / kNzTileSize), row, eb.getIndexAttr(0)};
+    SmallVector<OpFoldResult> sizes{
+        eb.getIndexAttr(chunkWidth / kNzTileSize), eb.getIndexAttr(1),
+        eb.getIndexAttr(kNzTileSize)};
+    SmallVector<OpFoldResult> strides(3, eb.getIndexAttr(1));
+    packedRows = eb.create<tensor::InsertSliceOp>(
+        loc, packedChunk, packedRows, offsets, sizes, strides);
+  }
+  if (!deferLaneSum) {
+    FailureOr<Value> sumInit =
+        createReductionInit(eb, sumReduce, rowScalarType);
+    if (failed(sumInit))
+      return failure();
+    IRMapping sumMapping;
+    sumMapping.map(sumReduce.getDpsInputs()[0], sumChunks);
+    sumMapping.map(sumReduce.getDpsInits()[0], *sumInit);
+    Operation *sumClone = eb.clone(*sumReduce, sumMapping);
+    sumClone->getResult(0).setType(rowScalarType);
+    expRows = eb.create<tensor::InsertSliceOp>(
+        loc, sumClone->getResult(0), expRows,
+        SmallVector<OpFoldResult>{row}, scalarSize, scalarStride);
+  }
+  eb.create<scf::YieldOp>(loc, ValueRange{expRows, packedRows});
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-build-progress lane=" << lane
+             << " checkpoint=exp-pack-loop-created\n");
+
+  if (deferLaneSum)
+    b.create<scope::ReturnOp>(
+        loc, ValueRange{expLoop.getResult(0), maximum, expLoop.getResult(1)});
+  else
+    b.create<scope::ReturnOp>(
+        loc, ValueRange{maximum, expLoop.getResult(0), expLoop.getResult(1)});
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] online-softmax-build-progress lane=" << lane
+             << " checkpoint=scope-return-created\n");
+
+  Value materializedMaximum =
+      simdScope->getResult(deferLaneSum ? 1 : 0);
+  Value materializedSum = simdScope->getResult(1);
+  Operation *scoreReleaseAnchor = anchor;
+  if (deferLaneSum) {
+    OpBuilder deferredBuilder(anchor);
+    deferredBuilder.setInsertionPointAfter(anchor);
+    auto deferredScope =
+        deferredBuilder.create<scope::ScopeOp>(loc, TypeRange{maximumType});
+    deferredScope.getBodyRegion().emplaceBlock();
+    deferredScope->setAttr("noinline", UnitAttr::get(context));
+    deferredScope->setAttr("outline", BoolAttr::get(context, true));
+    deferredScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
+    setOpEngineTypeAttr(deferredScope, EngineType::VECTOR);
+
+    OpBuilder db =
+        OpBuilder::atBlockEnd(&deferredScope.getBodyRegion().front());
+    Value deferredLower = db.create<arith::ConstantIntOp>(loc, 0, 32);
+    Value deferredUpper = db.create<arith::ConstantIntOp>(loc, rows, 32);
+    Value deferredStep = db.create<arith::ConstantIntOp>(loc, 1, 32);
+    auto deferredLoop = db.create<scf::ForOp>(
+        loc, deferredLower, deferredUpper, deferredStep,
+        ValueRange{sumRowsInit});
+    Block *deferredBody = deferredLoop.getBody();
+    if (!deferredBody->empty())
+      deferredBody->back().erase();
+    OpBuilder rb = OpBuilder::atBlockEnd(deferredBody);
+    Value deferredRow = rb.create<arith::IndexCastOp>(
+        loc, rb.getIndexType(), deferredLoop.getInductionVar());
+    Value deferredChunks;
+    for (int64_t chunk = 0; chunk < width; chunk += chunkWidth) {
+      SmallVector<OpFoldResult> offsets{deferredRow,
+                                        rb.getIndexAttr(chunk)};
+      SmallVector<OpFoldResult> sizes{rb.getIndexAttr(1),
+                                      rb.getIndexAttr(chunkWidth)};
+      SmallVector<OpFoldResult> strides{rb.getIndexAttr(1),
+                                        rb.getIndexAttr(1)};
+      Value probabilityChunk = rb.create<tensor::ExtractSliceOp>(
+          loc, rowVectorType, simdScope->getResult(0), offsets, sizes,
+          strides);
+      if (!deferredChunks) {
+        deferredChunks = probabilityChunk;
+      } else {
+        auto add = rb.create<linalg::AddOp>(
+            loc, ValueRange{deferredChunks, probabilityChunk},
+            ValueRange{deferredAddInit});
+        deferredChunks = add.getResult(0);
+      }
+    }
+    FailureOr<Value> deferredInit =
+        createReductionInit(rb, sumReduce, rowScalarType);
+    if (failed(deferredInit))
+      return failure();
+    IRMapping deferredMapping;
+    deferredMapping.map(sumReduce.getDpsInputs()[0], deferredChunks);
+    deferredMapping.map(sumReduce.getDpsInits()[0], *deferredInit);
+    Operation *deferredClone = rb.clone(*sumReduce, deferredMapping);
+    deferredClone->getResult(0).setType(rowScalarType);
+    Value deferredRows = rb.create<tensor::InsertSliceOp>(
+        loc, deferredClone->getResult(0), deferredLoop.getRegionIterArgs()[0],
+        SmallVector<OpFoldResult>{deferredRow}, scalarSize, scalarStride);
+    rb.create<scf::YieldOp>(loc, ValueRange{deferredRows});
+    db.create<scope::ReturnOp>(loc, deferredLoop.getResult(0));
+    materializedSum = deferredScope->getResult(0);
+    scoreReleaseAnchor = deferredScope;
+  }
+
+  SmallVector<std::pair<Value, Value>> replacements{
+      {newMaximum.getResult(), materializedMaximum},
+      {sumReduce.getResult(0), materializedSum}};
+  for (auto [oldValue, replacement] : replacements) {
+    SmallVector<OpOperand *> outsideUses;
+    for (OpOperand &use : oldValue.getUses())
+      if (!operationSet.contains(use.getOwner()))
+        outsideUses.push_back(&use);
+    for (OpOperand *use : outsideUses)
+      use->set(replacement);
+  }
+  for (Operation *operation : llvm::reverse(operations))
+    operation->erase();
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] materialized-online-softmax lane=" << lane
+             << " rows=" << rows << " chunk-width=" << chunkWidth
+             << " chunks=" << (width / chunkWidth)
+             << " direct-nz=yes sum="
+             << (deferLaneSum ? "deferred" : "inline")
+             << " publication=detached\n");
+  return OnlineSoftmaxLaneState{
+      oldMaximum,
+      oldDenominator,
+      materializedMaximum,
+      materializedSum,
+      simdScope->getResult(2),
+      alphaSub,
+      alpha,
+      scaledDenominator,
+      newDenominator,
+      scoreReleaseAnchor,
+  };
+}
+
+static LogicalResult materializeGroupedSoftmaxRecurrence(
+    ArrayRef<OnlineSoftmaxLaneState> lanes,
+    Operation *&groupedAlphaScope) {
+  if (lanes.empty())
+    return failure();
+
+  OnlineSoftmaxLaneState firstState = lanes.front();
+  OnlineSoftmaxLaneState finalState = lanes.back();
+  Block *block = firstState.alphaDifference->getBlock();
+  auto rowType = dyn_cast<RankedTensorType>(firstState.maximum.getType());
+  if (!block || !rowType || !rowType.hasStaticShape() ||
+      rowType.getRank() != 1)
+    return failure();
+
+  for (size_t lane = 0; lane < lanes.size(); ++lane) {
+    OnlineSoftmaxLaneState state = lanes[lane];
+    OnlineSoftmaxLaneState previousState =
+        lane == 0 ? firstState : lanes[lane - 1];
+    if (state.alphaDifference->getBlock() != block ||
+        state.alpha->getBlock() != block ||
+        state.scaledDenominator->getBlock() != block ||
+        state.newDenominator->getBlock() != block ||
+        state.maximum.getType() != rowType || state.sum.getType() != rowType ||
+        state.oldDenominator.getType() != rowType ||
+        state.alphaDifference.getLhs() != state.oldMaximum ||
+        state.alphaDifference.getRhs() != state.maximum ||
+        (lane != 0 && state.oldMaximum != previousState.maximum) ||
+        (lane != 0 &&
+         state.oldDenominator != previousState.newDenominator.getResult()))
+      return failure();
+  }
+
+  DenseSet<Operation *> recurrenceOperations;
+  for (OnlineSoftmaxLaneState state : lanes) {
+    recurrenceOperations.insert(state.alphaDifference);
+    recurrenceOperations.insert(state.alpha);
+    recurrenceOperations.insert(state.scaledDenominator);
+    recurrenceOperations.insert(state.newDenominator);
+  }
+
+  SmallVector<OpOperand *> finalDenominatorUses;
+  for (OpOperand &use : finalState.newDenominator.getResult().getUses())
+    if (!recurrenceOperations.contains(use.getOwner()))
+      finalDenominatorUses.push_back(&use);
+  if (finalDenominatorUses.empty())
+    return failure();
+  Operation *affineInsertion = finalDenominatorUses.front()->getOwner();
+  if (affineInsertion->getBlock() != block ||
+      llvm::any_of(finalDenominatorUses, [&](OpOperand *use) {
+        return use->getOwner() != affineInsertion;
+      }))
+    return failure();
+
+  Location loc = finalState.alphaDifference.getLoc();
+  MLIRContext *context = block->getParentOp()->getContext();
+  OpBuilder alphaBuilder(finalState.alphaDifference);
+  SmallVector<Type> alphaResultTypes(lanes.size(), rowType);
+  auto alphaScope =
+      alphaBuilder.create<scope::ScopeOp>(loc, alphaResultTypes);
+  alphaScope.getBodyRegion().emplaceBlock();
+  alphaScope->setAttr("noinline", UnitAttr::get(context));
+  alphaScope->setAttr("outline", BoolAttr::get(context, true));
+  alphaScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
+  setOpEngineTypeAttr(alphaScope, EngineType::VECTOR);
+  OpBuilder ab = OpBuilder::atBlockEnd(&alphaScope.getBodyRegion().front());
+  SmallVector<Value> groupedAlphas;
+  Value previousMaximum = firstState.oldMaximum;
+  for (OnlineSoftmaxLaneState state : lanes) {
+    Value difference =
+        ab.create<arith::SubFOp>(loc, previousMaximum, state.maximum);
+    groupedAlphas.push_back(ab.create<math::ExpOp>(loc, difference));
+    previousMaximum = state.maximum;
+  }
+  ab.create<scope::ReturnOp>(loc, groupedAlphas);
+
+  // Each lane is an affine transform l' = A*l + B. Compose adjacent
+  // transforms as a balanced tree:
+  //   (Ar, Br) o (Al, Bl) = (Ar*Al, Ar*Bl + Br).
+  // This preserves lane order while making the reduction depth logarithmic
+  // for any positive lane count, including non-power-of-two unroll factors.
+  OpBuilder affineBuilder(affineInsertion);
+  auto affineScope =
+      affineBuilder.create<scope::ScopeOp>(loc, TypeRange{rowType});
+  affineScope.getBodyRegion().emplaceBlock();
+  affineScope->setAttr("noinline", UnitAttr::get(context));
+  affineScope->setAttr("outline", BoolAttr::get(context, true));
+  affineScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
+  setOpEngineTypeAttr(affineScope, EngineType::VECTOR);
+  OpBuilder fb = OpBuilder::atBlockEnd(&affineScope.getBodyRegion().front());
+  struct AffineSegment {
+    Value scale;
+    Value offset;
+  };
+  SmallVector<AffineSegment> segments;
+  segments.reserve(lanes.size());
+  for (size_t lane = 0; lane < lanes.size(); ++lane) {
+    OnlineSoftmaxLaneState state = lanes[lane];
+    segments.push_back({alphaScope->getResult(lane), state.sum});
+  }
+  while (segments.size() > 1) {
+    SmallVector<AffineSegment> next;
+    next.reserve((segments.size() + 1) / 2);
+    for (size_t index = 0; index < segments.size(); index += 2) {
+      if (index + 1 == segments.size()) {
+        next.push_back(segments[index]);
+        continue;
+      }
+      const AffineSegment &left = segments[index];
+      const AffineSegment &right = segments[index + 1];
+      Value scale = fb.create<arith::MulFOp>(loc, left.scale, right.scale);
+      Value scaledLeft =
+          fb.create<arith::MulFOp>(loc, left.offset, right.scale);
+      Value offset = fb.create<arith::AddFOp>(loc, scaledLeft, right.offset);
+      next.push_back({scale, offset});
+    }
+    segments = std::move(next);
+  }
+  Value scaledOld = fb.create<arith::MulFOp>(
+      loc, firstState.oldDenominator, segments.front().scale);
+  Value finalDenominator =
+      fb.create<arith::AddFOp>(loc, scaledOld, segments.front().offset);
+  fb.create<scope::ReturnOp>(loc, finalDenominator);
+
+  for (size_t lane = 0; lane < lanes.size(); ++lane) {
+    OnlineSoftmaxLaneState state = lanes[lane];
+    SmallVector<OpOperand *> alphaUses;
+    for (OpOperand &use : state.alpha.getResult().getUses())
+      alphaUses.push_back(&use);
+    for (OpOperand *use : alphaUses)
+      use->set(alphaScope->getResult(lane));
+  }
+  for (OpOperand *use : finalDenominatorUses)
+    use->set(affineScope->getResult(0));
+
+  for (auto iterator = lanes.rbegin(); iterator != lanes.rend(); ++iterator) {
+    OnlineSoftmaxLaneState state = *iterator;
+    if (!state.newDenominator->use_empty())
+      return failure();
+    state.newDenominator.erase();
+    if (!state.scaledDenominator->use_empty())
+      return failure();
+    state.scaledDenominator.erase();
+    if (!state.alpha->use_empty())
+      return failure();
+    state.alpha.erase();
+    if (!state.alphaDifference->use_empty())
+      return failure();
+    state.alphaDifference.erase();
+  }
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] materialized-grouped-recurrence lanes="
+             << lanes.size() << " alpha-scope=yes affine-tree=yes\n");
+  groupedAlphaScope = alphaScope;
+  return success();
+}
+
+static LogicalResult
+materializeVectorLaneRegions(MutableArrayRef<VectorToCubePack> packs,
+                            Operation *&groupedAlphaScope) {
+  SmallVector<OnlineSoftmaxLaneState> lanes;
+  lanes.reserve(packs.size());
+  Value sharedScaleScalar;
+  Value sharedScaleRow;
+  for (auto [lane, pack] : llvm::enumerate(packs)) {
+    FailureOr<OnlineSoftmaxLaneState> result =
+        materializeOnlineSoftmaxLane(
+            pack, lane, lane + 1 == packs.size(), sharedScaleScalar,
+            sharedScaleRow);
+    if (failed(result))
+      return failure();
+    pack.pSrc = result->packedProbability;
+    pack.scoreReleaseAnchor = result->scoreReleaseAnchor;
+    lanes.push_back(*result);
+  }
+  return materializeGroupedSoftmaxRecurrence(lanes, groupedAlphaScope);
+}
+
+static FailureOr<BufferOwnershipPlan> buildBufferOwnershipPlan(
+    scf::ForOp cubeLoop, scf::ForOp vectorLoop,
+    const CrossScopeTransferInfo &transferInfo,
+    const PostCVSplitDetachedSchedule &schedule) {
+  if (schedule.status != PostCVSplitDetachedScheduleStatus::Ready ||
+      !schedule.verified || schedule.logicalLaneCount == 0 ||
+      transferInfo.cubeToVectorChains.size() !=
+          2 * schedule.logicalLaneCount)
+    return failure();
+
+  auto findCubeDrain = [&](unsigned forwardFlag) -> Operation * {
+    Operation *drain = nullptr;
+    for (Operation &operation : *cubeLoop.getBody()) {
+      auto set = dyn_cast<hivm::SyncBlockSetOp>(&operation);
+      if (!set || getStaticEventFlag(set) != forwardFlag)
+        continue;
+      if (drain || !isa_and_nonnull<hivm::FixpipeOp>(set->getPrevNode()))
+        return nullptr;
+      drain = set->getPrevNode();
+    }
+    return drain;
+  };
+
+  BufferOwnershipPlan plan;
+  DenseSet<Value> oldBufferSet;
+  DenseSet<unsigned> scoreLanes;
+  DenseSet<unsigned> productLanes;
+  for (const CubeToVectorTransferChain &chain :
+       transferInfo.cubeToVectorChains) {
+    if (!chain.wait || chain.wait->getBlock() != vectorLoop.getBody() ||
+        chain.forwardFlagId < 0)
+      return failure();
+    unsigned forwardFlag = static_cast<unsigned>(chain.forwardFlagId);
+    const PostCVSplitDetachedCommand *publish = findDetachedCommandByFlag(
+        schedule.cubeCommands, PostCVSplitDetachedCommandKind::ScorePublish,
+        forwardFlag);
+    PostCVSplitLineageRole role = PostCVSplitLineageRole::Score;
+    if (!publish) {
+      publish = findDetachedCommandByFlag(
+          schedule.cubeCommands,
+          PostCVSplitDetachedCommandKind::ProductPublish, forwardFlag);
+      role = PostCVSplitLineageRole::Product;
+    }
+    if (!publish || publish->lane >= schedule.logicalLaneCount)
+      return failure();
+    DenseSet<unsigned> &seen = role == PostCVSplitLineageRole::Score
+                                   ? scoreLanes
+                                   : productLanes;
+    if (!seen.insert(publish->lane).second)
+      return failure();
+
+    Operation *toTensor = chain.transferredValue.getDefiningOp();
+    if (!toTensor || !isa<bufferization::ToTensorOp>(toTensor) ||
+        toTensor->getNumOperands() != 1)
+      return failure();
+    Operation *vectorCast = toTensor->getOperand(0).getDefiningOp();
+    if (!vectorCast || !isa<memref::MemorySpaceCastOp>(vectorCast) ||
+        vectorCast->getNumOperands() != 1)
+      return failure();
+    Value oldBuffer = vectorCast->getOperand(0);
+    auto bufferType = dyn_cast<MemRefType>(oldBuffer.getType());
+    Operation *cubeDrain = findCubeDrain(forwardFlag);
+    if (!bufferType || !cubeDrain ||
+        !llvm::is_contained(cubeDrain->getOperands(), oldBuffer))
+      return failure();
+
+    MemRefType &roleType = role == PostCVSplitLineageRole::Score
+                               ? plan.scoreBufferType
+                               : plan.productBufferType;
+    unsigned &slotCount = role == PostCVSplitLineageRole::Score
+                              ? plan.scoreSlotCount
+                              : plan.productSlotCount;
+    if (roleType && roleType != bufferType)
+      return failure();
+    roleType = bufferType;
+    slotCount = std::max(slotCount, publish->slot + 1);
+    plan.lanes.push_back({role, publish->lane, publish->slot, oldBuffer,
+                          cubeDrain, vectorCast});
+    if (oldBufferSet.insert(oldBuffer).second)
+      plan.oldBuffers.push_back(oldBuffer);
+  }
+  if (scoreLanes.size() != schedule.logicalLaneCount ||
+      productLanes.size() != schedule.logicalLaneCount ||
+      !plan.scoreBufferType || !plan.productBufferType ||
+      plan.scoreSlotCount == 0 || plan.productSlotCount == 0)
+    return failure();
+
+  auto cubeScope = cubeLoop->getParentOfType<scope::ScopeOp>();
+  if (!cubeScope)
+    return failure();
+  for (Value oldBuffer : plan.oldBuffers) {
+    auto allocation = oldBuffer.getDefiningOp<memref::AllocOp>();
+    if (!allocation || allocation->getBlock() != cubeScope->getBlock())
+      return failure();
+  }
+  return plan;
+}
+
+static LogicalResult materializeBufferOwnership(
+    scf::ForOp cubeLoop, scf::ForOp vectorLoop,
+    const CrossScopeTransferInfo &transferInfo,
+    const PostCVSplitDetachedSchedule &schedule) {
+  FailureOr<BufferOwnershipPlan> plan = buildBufferOwnershipPlan(
+      cubeLoop, vectorLoop, transferInfo, schedule);
+  if (failed(plan))
+    return failure();
+
+  auto cubeScope = cubeLoop->getParentOfType<scope::ScopeOp>();
+  if (!cubeScope)
+    return failure();
+  MLIRContext *context = cubeLoop.getContext();
+  Location loc = cubeLoop.getLoc();
+  OpBuilder builder(cubeScope);
+  auto createSlots = [&](MemRefType type, unsigned count, StringRef role) {
+    SmallVector<Value> slots;
+    slots.reserve(count);
+    for (unsigned slot = 0; slot < count; ++slot) {
+      Location slotLoc = NameLoc::get(
+          builder.getStringAttr((role + "-slot").str()), loc);
+      auto allocation = builder.create<memref::AllocOp>(slotLoc, type);
+      auto mark =
+          builder.create<annotation::MarkOp>(slotLoc, allocation.getResult());
+      mark->setAttr("effects",
+                    builder.getArrayAttr({builder.getStringAttr("write"),
+                                          builder.getStringAttr("read")}));
+      slots.push_back(allocation.getResult());
+    }
+    return slots;
+  };
+  SmallVector<Value> scoreSlots = createSlots(
+      plan->scoreBufferType, plan->scoreSlotCount, "cvsplit.schedule.score");
+  SmallVector<Value> productSlots = createSlots(
+      plan->productBufferType, plan->productSlotCount, "cvsplit.schedule.product");
+
+  for (const OwnershipLanePlan &lane : plan->lanes) {
+    ArrayRef<Value> slots = lane.role == PostCVSplitLineageRole::Score
+                                ? ArrayRef<Value>(scoreSlots)
+                                : ArrayRef<Value>(productSlots);
+    if (lane.slot >= slots.size())
+      return failure();
+    Value replacement = slots[lane.slot];
+    lane.cubeDrain->replaceUsesOfWith(lane.oldBuffer, replacement);
+    lane.vectorCast->setOperand(0, replacement);
+  }
+
+  for (Value oldBuffer : plan->oldBuffers) {
+    SmallVector<Operation *> marks;
+    for (Operation *user : oldBuffer.getUsers()) {
+      if (!isa<annotation::MarkOp>(user))
+        return failure();
+      marks.push_back(user);
+    }
+    for (Operation *mark : marks)
+      mark->erase();
+    auto allocation = oldBuffer.getDefiningOp<memref::AllocOp>();
+    if (!allocation || !allocation->use_empty())
+      return failure();
+    allocation.erase();
+  }
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] materialized-buffer-ownership lanes="
+             << schedule.logicalLaneCount
+             << " score-slots=" << plan->scoreSlotCount
+             << " product-slots=" << plan->productSlotCount
+             << " retired-union-buffers=" << plan->oldBuffers.size()
+             << "\n");
+  return success();
+}
+
+static FailureOr<ReleaseProtocolPlan> buildReleaseProtocolPlan(
+    scf::ForOp cubeLoop, scf::ForOp vectorLoop,
+    ArrayRef<VectorToCubePack> packs,
+    const CrossScopeTransferInfo &transferInfo,
+    const PostCVSplitDetachedSchedule &schedule) {
+  if (schedule.status != PostCVSplitDetachedScheduleStatus::Ready ||
+      !schedule.verified || schedule.logicalLaneCount == 0 ||
+      schedule.logicalLaneCount != packs.size())
+    return failure();
+
+  ReleaseProtocolPlan plan;
+  plan.lanes.reserve(schedule.logicalLaneCount);
+  auto findCubeDrain = [&](unsigned forwardFlag) -> Operation * {
+    Operation *drain = nullptr;
+    for (Operation &operation : *cubeLoop.getBody()) {
+      auto set = dyn_cast<hivm::SyncBlockSetOp>(&operation);
+      if (!set || getStaticEventFlag(set) != forwardFlag)
+        continue;
+      if (drain || !isa_and_nonnull<hivm::FixpipeOp>(set->getPrevNode()))
+        return nullptr;
+      drain = set->getPrevNode();
+    }
+    return drain;
+  };
+  auto findProductVectorRelease = [&](unsigned forwardFlag) -> Operation * {
+    const CubeToVectorTransferChain *matchingChain = nullptr;
+    for (const CubeToVectorTransferChain &chain :
+         transferInfo.cubeToVectorChains) {
+      if (chain.forwardFlagId != static_cast<int>(forwardFlag))
+        continue;
+      if (matchingChain)
+        return nullptr;
+      matchingChain = &chain;
+    }
+    if (!matchingChain || !matchingChain->wait ||
+        matchingChain->wait->getBlock() != vectorLoop.getBody())
+      return nullptr;
+    Operation *lastConsumer = nullptr;
+    for (Operation *consumer : matchingChain->consumers) {
+      if (!consumer || consumer->getBlock() != vectorLoop.getBody())
+        return nullptr;
+      if (!lastConsumer || lastConsumer->isBeforeInBlock(consumer))
+        lastConsumer = consumer;
+    }
+    return lastConsumer;
+  };
+
+  for (unsigned lane = 0; lane < schedule.logicalLaneCount; ++lane) {
+    const PostCVSplitDetachedCommand *scorePublish = findDetachedCommand(
+        schedule.cubeCommands, PostCVSplitDetachedCommandKind::ScorePublish,
+        lane);
+    const PostCVSplitDetachedCommand *scoreReleaseWait = findDetachedCommand(
+        schedule.cubeCommands,
+        PostCVSplitDetachedCommandKind::ScoreReleaseWait, lane);
+    const PostCVSplitDetachedCommand *scoreRelease = findDetachedCommand(
+        schedule.vectorCommands, PostCVSplitDetachedCommandKind::ScoreRelease,
+        lane);
+    const PostCVSplitDetachedCommand *probabilityPublish = findDetachedCommand(
+        schedule.vectorCommands,
+        PostCVSplitDetachedCommandKind::ProbabilityPublish, lane);
+    const PostCVSplitDetachedCommand *productPublish = findDetachedCommand(
+        schedule.cubeCommands, PostCVSplitDetachedCommandKind::ProductPublish,
+        lane);
+    const PostCVSplitDetachedCommand *productReleaseWait = findDetachedCommand(
+        schedule.cubeCommands,
+        PostCVSplitDetachedCommandKind::ProductReleaseWait, lane);
+    const PostCVSplitDetachedCommand *productRelease = findDetachedCommand(
+        schedule.vectorCommands,
+        PostCVSplitDetachedCommandKind::ProductRelease, lane);
+    if (!scorePublish || !scoreReleaseWait || !scoreRelease ||
+        !probabilityPublish || !productPublish || !productReleaseWait ||
+        !productRelease || !scorePublish->hasEvent ||
+        !scoreReleaseWait->hasEvent || !scoreRelease->hasEvent ||
+        !probabilityPublish->hasEvent || !productPublish->hasEvent ||
+        !productReleaseWait->hasEvent || !productRelease->hasEvent ||
+        scoreReleaseWait->logicalFlagId != scoreRelease->logicalFlagId ||
+        productReleaseWait->logicalFlagId != productRelease->logicalFlagId ||
+        scoreReleaseWait->slot != scoreRelease->slot ||
+        productReleaseWait->slot != productRelease->slot)
+      return failure();
+
+    VectorToCubePack pack = packs[lane];
+    if (!pack.anchor || !pack.scoreReleaseAnchor ||
+        getStaticEventFlag(pack.anchor) !=
+            probabilityPublish->logicalFlagId)
+      return failure();
+
+    ReleaseLanePlan lanePlan;
+    lanePlan.lane = lane;
+    lanePlan.scoreReleaseFlag = scoreRelease->logicalFlagId;
+    lanePlan.productReleaseFlag = productRelease->logicalFlagId;
+    lanePlan.scoreSignalingResource = scoreRelease->resource;
+    lanePlan.scoreWaitingResource = scoreReleaseWait->resource;
+    lanePlan.productSignalingResource = productRelease->resource;
+    lanePlan.productWaitingResource = productReleaseWait->resource;
+    lanePlan.scoreCubeDrain = findCubeDrain(scorePublish->logicalFlagId);
+    lanePlan.scoreVectorRelease = pack.scoreReleaseAnchor;
+    lanePlan.productCubeDrain = findCubeDrain(productPublish->logicalFlagId);
+    lanePlan.productVectorRelease =
+        findProductVectorRelease(productPublish->logicalFlagId);
+    if (!lanePlan.scoreCubeDrain || !lanePlan.scoreVectorRelease ||
+        !lanePlan.productCubeDrain || !lanePlan.productVectorRelease)
+      return failure();
+    plan.lanes.push_back(lanePlan);
+  }
+
+  auto appendInitial = [&](PostCVSplitLineageRole role, unsigned slot,
+                           unsigned flag, PrincipalResource signaling,
+                           PrincipalResource waiting) {
+    for (const InitialReleaseSignal &existing : plan.initialSignals) {
+      if (existing.flag != flag)
+        continue;
+      return existing.role == role && existing.slot == slot &&
+             existing.signalingResource == signaling &&
+             existing.waitingResource == waiting;
+    }
+    plan.initialSignals.push_back({role, slot, flag, signaling, waiting});
+    return true;
+  };
+  for (PostCVSplitLineageRole role : {PostCVSplitLineageRole::Score,
+                                      PostCVSplitLineageRole::Product}) {
+    for (unsigned lane = 0; lane < schedule.logicalLaneCount; ++lane) {
+      PostCVSplitDetachedCommandKind kind =
+          role == PostCVSplitLineageRole::Score
+              ? PostCVSplitDetachedCommandKind::ScoreRelease
+              : PostCVSplitDetachedCommandKind::ProductRelease;
+      const PostCVSplitDetachedCommand *release =
+          findDetachedCommand(schedule.vectorCommands, kind, lane);
+      const PostCVSplitDetachedCommand *wait = findDetachedCommand(
+          schedule.cubeCommands,
+          role == PostCVSplitLineageRole::Score
+              ? PostCVSplitDetachedCommandKind::ScoreReleaseWait
+              : PostCVSplitDetachedCommandKind::ProductReleaseWait,
+          lane);
+      if (!release || !wait ||
+          !appendInitial(role, release->slot, release->logicalFlagId,
+                         release->resource, wait->resource))
+        return failure();
+    }
+  }
+
+  DenseSet<unsigned> productReleaseFlags;
+  for (const InitialReleaseSignal &initial : plan.initialSignals)
+    if (initial.role == PostCVSplitLineageRole::Product)
+      productReleaseFlags.insert(initial.flag);
+  MLIRContext *context = cubeLoop.getContext();
+  auto pipeV = hivm::PipeAttr::get(context, hivm::PIPE::PIPE_V);
+  auto pipeFix = hivm::PipeAttr::get(context, hivm::PIPE::PIPE_FIX);
+  for (Operation &operation : *cubeLoop.getBody()) {
+    auto wait = dyn_cast<hivm::SyncBlockWaitOp>(&operation);
+    if (!wait || wait.getTpipe() != pipeV || wait.getPipe() != pipeFix)
+      continue;
+    std::optional<unsigned> flag = getStaticEventFlag(wait);
+    if (!flag || productReleaseFlags.contains(*flag))
+      continue;
+    if (plan.legacyCubeWait)
+      return failure();
+    plan.legacyCubeWait = wait;
+  }
+  for (Operation &operation : *vectorLoop.getBody()) {
+    auto set = dyn_cast<hivm::SyncBlockSetOp>(&operation);
+    if (!set || set.getTpipe() != pipeV || set.getPipe() != pipeFix)
+      continue;
+    std::optional<unsigned> flag = getStaticEventFlag(set);
+    if (!flag || productReleaseFlags.contains(*flag))
+      continue;
+    if (plan.legacyVectorSet)
+      return failure();
+    plan.legacyVectorSet = set;
+  }
+  if (!plan.legacyCubeWait || !plan.legacyVectorSet ||
+      getStaticEventFlag(plan.legacyCubeWait) !=
+          getStaticEventFlag(plan.legacyVectorSet))
+    return failure();
+  return plan;
+}
+
+static LogicalResult materializeReleaseProtocol(
+    scf::ForOp cubeLoop, scf::ForOp vectorLoop,
+    ArrayRef<VectorToCubePack> packs,
+    const CrossScopeTransferInfo &transferInfo,
+    const PostCVSplitDetachedSchedule &schedule) {
+  FailureOr<ReleaseProtocolPlan> plan =
+      buildReleaseProtocolPlan(cubeLoop, vectorLoop, packs,
+                                      transferInfo, schedule);
+  if (failed(plan))
+    return failure();
+
+  plan->legacyVectorSet->erase();
+  plan->legacyCubeWait->erase();
+
+  MLIRContext *context = cubeLoop.getContext();
+  Location loc = cubeLoop.getLoc();
+  auto cubeCore =
+      hivm::TCoreTypeAttr::get(context, hivm::TCoreType::CUBE);
+  auto vectorCore =
+      hivm::TCoreTypeAttr::get(context, hivm::TCoreType::VECTOR);
+  scf::ForOp cubeOuterLoop = cubeLoop->getParentOfType<scf::ForOp>();
+  scf::ForOp vectorOuterLoop = vectorLoop->getParentOfType<scf::ForOp>();
+  if (!cubeOuterLoop || !vectorOuterLoop ||
+      cubeOuterLoop.getOperation() != vectorOuterLoop.getOperation() ||
+      vectorOuterLoop.getInductionVar().getType() !=
+          vectorOuterLoop.getLowerBound().getType())
+    return failure();
+
+  OpBuilder initialBuilder(vectorLoop);
+  auto firstOuterIteration = initialBuilder.create<arith::CmpIOp>(
+      loc, arith::CmpIPredicate::eq, vectorOuterLoop.getInductionVar(),
+      vectorOuterLoop.getLowerBound());
+  auto seedIf = initialBuilder.create<scf::IfOp>(
+      loc, firstOuterIteration, /*withElseRegion=*/false);
+  OpBuilder seedBuilder = seedIf.getThenBodyBuilder();
+  for (const InitialReleaseSignal &initial : plan->initialSignals) {
+    hivm::PipeAttr signaling =
+        pipeForResource(context, initial.signalingResource);
+    hivm::PipeAttr waiting =
+        pipeForResource(context, initial.waitingResource);
+    if (!signaling || !waiting)
+      return failure();
+    auto set = seedBuilder.create<hivm::SyncBlockSetOp>(
+        loc, vectorCore, signaling, waiting,
+        OpFoldResult(seedBuilder.getI64IntegerAttr(initial.flag)));
+    setOpEngineTypeAttr(set, EngineType::VECTOR);
+  }
+
+  for (const ReleaseLanePlan &lane : plan->lanes) {
+    hivm::PipeAttr scoreSignaling =
+        pipeForResource(context, lane.scoreSignalingResource);
+    hivm::PipeAttr scoreWaiting =
+        pipeForResource(context, lane.scoreWaitingResource);
+    hivm::PipeAttr productSignaling =
+        pipeForResource(context, lane.productSignalingResource);
+    hivm::PipeAttr productWaiting =
+        pipeForResource(context, lane.productWaitingResource);
+    if (!scoreSignaling || !scoreWaiting || !productSignaling ||
+        !productWaiting)
+      return failure();
+
+    OpBuilder scoreCubeBuilder(lane.scoreCubeDrain);
+    auto scoreWait = scoreCubeBuilder.create<hivm::SyncBlockWaitOp>(
+        loc, cubeCore, scoreSignaling, scoreWaiting,
+        OpFoldResult(
+            scoreCubeBuilder.getI64IntegerAttr(lane.scoreReleaseFlag)));
+    setOpEngineTypeAttr(scoreWait, EngineType::CUBE);
+
+    OpBuilder scoreVectorBuilder(lane.scoreVectorRelease);
+    scoreVectorBuilder.setInsertionPointAfter(lane.scoreVectorRelease);
+    auto scoreSet = scoreVectorBuilder.create<hivm::SyncBlockSetOp>(
+        loc, vectorCore, scoreSignaling, scoreWaiting,
+        OpFoldResult(
+            scoreVectorBuilder.getI64IntegerAttr(lane.scoreReleaseFlag)));
+    setOpEngineTypeAttr(scoreSet, EngineType::VECTOR);
+
+    OpBuilder productCubeBuilder(lane.productCubeDrain);
+    auto productWait = productCubeBuilder.create<hivm::SyncBlockWaitOp>(
+        loc, cubeCore, productSignaling, productWaiting,
+        OpFoldResult(
+            productCubeBuilder.getI64IntegerAttr(lane.productReleaseFlag)));
+    setOpEngineTypeAttr(productWait, EngineType::CUBE);
+
+    OpBuilder productVectorBuilder(lane.productVectorRelease);
+    productVectorBuilder.setInsertionPointAfter(lane.productVectorRelease);
+    auto productSet = productVectorBuilder.create<hivm::SyncBlockSetOp>(
+        loc, vectorCore, productSignaling, productWaiting,
+        OpFoldResult(
+            productVectorBuilder.getI64IntegerAttr(lane.productReleaseFlag)));
+    setOpEngineTypeAttr(productSet, EngineType::VECTOR);
+  }
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] materialized-release-protocol lanes="
+             << plan->lanes.size()
+             << " initial=" << plan->initialSignals.size()
+             << " cube-waits=" << (2 * plan->lanes.size())
+             << " vector-sets=" << (2 * plan->lanes.size())
+             << " initial-once-per-outer-loop=yes"
+             << " legacy-pairs-replaced=1\n");
+  return success();
+}
+
+static LogicalResult orderGroupedAlphaBeforeProductWait(
+    scf::ForOp vectorLoop, Operation *groupedAlphaScope,
+    const PostCVSplitDetachedSchedule &schedule) {
+  const PostCVSplitDetachedCommand *firstProductWait = nullptr;
+  for (const PostCVSplitDetachedCommand &command : schedule.vectorCommands) {
+    if (command.kind == PostCVSplitDetachedCommandKind::ProductWait) {
+      firstProductWait = &command;
+      break;
+    }
+  }
+  if (!groupedAlphaScope || !firstProductWait ||
+      !firstProductWait->hasEvent ||
+      groupedAlphaScope->getBlock() != vectorLoop.getBody())
+    return failure();
+
+  Operation *waitOperation = nullptr;
+  for (Operation &operation : *vectorLoop.getBody()) {
+    auto wait = dyn_cast<hivm::SyncBlockWaitOp>(&operation);
+    if (!wait ||
+        getStaticEventFlag(wait) != firstProductWait->logicalFlagId)
+      continue;
+    if (waitOperation)
+      return failure();
+    waitOperation = wait;
+  }
+  if (!waitOperation)
+    return failure();
+  bool moved = waitOperation->isBeforeInBlock(groupedAlphaScope);
+  if (moved)
+    groupedAlphaScope->moveBefore(waitOperation);
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] ordered-grouped-alpha-before-product-wait"
+             << " moved=" << (moved ? "yes" : "no") << "\n");
+  return success();
+}
+
+static LogicalResult orderCubeDrainsBySchedule(
+    scf::ForOp cubeLoop, const PostCVSplitDetachedSchedule &schedule) {
+  DenseMap<unsigned, unsigned> ordinalByForwardFlag;
+  for (auto [ordinal, command] : llvm::enumerate(schedule.cubeCommands)) {
+    if (!command.hasEvent ||
+        (command.kind != PostCVSplitDetachedCommandKind::ScorePublish &&
+         command.kind != PostCVSplitDetachedCommandKind::ProductPublish))
+      continue;
+    if (!ordinalByForwardFlag
+             .try_emplace(command.logicalFlagId,
+                          static_cast<unsigned>(ordinal))
+             .second)
+      return failure();
+  }
+
+  struct DrainGroup {
+    Operation *releaseWait;
+    Operation *drain;
+    Operation *publish;
+    unsigned ordinal;
+  };
+  SmallVector<DrainGroup> groups;
+  for (Operation &operation : *cubeLoop.getBody()) {
+    auto publish = dyn_cast<hivm::SyncBlockSetOp>(&operation);
+    if (!publish)
+      continue;
+    std::optional<unsigned> flag = getStaticEventFlag(publish);
+    if (!flag || !ordinalByForwardFlag.contains(*flag))
+      continue;
+    Operation *drain = publish->getPrevNode();
+    Operation *releaseWait = drain ? drain->getPrevNode() : nullptr;
+    if (!isa_and_nonnull<hivm::FixpipeOp>(drain) ||
+        !isa_and_nonnull<hivm::SyncBlockWaitOp>(releaseWait))
+      return failure();
+    groups.push_back(
+        {releaseWait, drain, publish, ordinalByForwardFlag.lookup(*flag)});
+  }
+  if (groups.size() != 2 * schedule.logicalLaneCount)
+    return failure();
+
+  unsigned reorderedClusters = 0;
+  for (size_t begin = 0; begin < groups.size();) {
+    size_t end = begin + 1;
+    while (end < groups.size() &&
+           groups[end - 1].publish->getNextNode() ==
+               groups[end].releaseWait)
+      ++end;
+    if (end - begin > 1) {
+      SmallVector<DrainGroup> ordered(groups.begin() + begin,
+                                      groups.begin() + end);
+      llvm::sort(ordered, [](const DrainGroup &left, const DrainGroup &right) {
+        return left.ordinal < right.ordinal;
+      });
+      bool changed = false;
+      for (size_t index = 0; index < ordered.size(); ++index)
+        changed |= ordered[index].publish != groups[begin + index].publish;
+      if (changed) {
+        Operation *afterCluster = groups[end - 1].publish->getNextNode();
+        if (!afterCluster)
+          return failure();
+        for (const DrainGroup &group : ordered) {
+          group.releaseWait->moveBefore(afterCluster);
+          group.drain->moveBefore(afterCluster);
+          group.publish->moveBefore(afterCluster);
+        }
+        ++reorderedClusters;
+      }
+    }
+    begin = end;
+  }
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] ordered-cube-drain-clusters groups="
+             << groups.size() << " reordered=" << reorderedClusters
+             << "\n");
+  return success();
+}
+
 // Re-tile the VECTOR scope for ROW_SPLIT so both veccores do useful work (2x
 // vector throughput): M/2 rows per veccore, addressed by get_sub_block_idx,
 // matching the target IR. Runs the six steps in order; see each helper.
 static LogicalResult
-retileVectorScopeForRowSplit(scope::ScopeOp vecScope,
-                             const CrossScopeTransferInfo &transferInfo) {
+retileVectorScopeForRowSplit(scope::ScopeOp vecScope, scf::ForOp cubeLoop,
+                             scf::ForOp vectorLoop,
+                             const CrossScopeTransferInfo &transferInfo,
+                             bool materializePostSplitSchedule,
+                             const PostCVSplitDetachedSchedule *
+                                 detachedSchedule) {
   Location loc = vecScope.getLoc();
   MLIRContext *ctx = vecScope.getContext();
   auto ubAddrSpace = hivm::AddressSpaceAttr::get(ctx, hivm::AddressSpace::UB);
@@ -849,16 +2798,32 @@ retileVectorScopeForRowSplit(scope::ScopeOp vecScope,
 
   SmallVector<VectorToCubePack> packs =
       detachVectorToCubePacks(vecScope, transferInfo.vectorToCubeChains);
+  Operation *groupedAlphaScope = nullptr;
 
   Value sbidx = emitSubBlockIndex(vecScope, loc);
   unsigned clonedCount = cloneExternalInitsAsHalfHeight(vecScope, loc, blockM);
   if (failed(retileVectorScopeOps(vecScope, blockM)))
+    return failure();
+  if (materializePostSplitSchedule &&
+      failed(materializeVectorLaneRegions(packs, groupedAlphaScope)))
     return failure();
   FailureOr<unsigned> nStores =
       retileOutputStores(vecScope, sbidx, loc, blockM);
   if (failed(nStores))
     return failure();
   if (failed(rebuildVectorToCubePacks(packs, sbidx, ubAddrSpace, loc)))
+    return failure();
+  if (materializePostSplitSchedule &&
+      (!detachedSchedule ||
+       failed(materializeBufferOwnership(
+           cubeLoop, vectorLoop, transferInfo, *detachedSchedule)) ||
+       failed(materializeReleaseProtocol(
+           cubeLoop, vectorLoop, packs, transferInfo,
+           *detachedSchedule)) ||
+       failed(orderGroupedAlphaBeforeProductWait(
+           vectorLoop, groupedAlphaScope, *detachedSchedule)) ||
+       failed(orderCubeDrainsBySchedule(cubeLoop,
+                                            *detachedSchedule))))
     return failure();
 
   LLVM_DEBUG(llvm::dbgs() << "[cv-split]   ROW_SPLIT re-tile (BLOCK_M="
@@ -873,7 +2838,12 @@ retileVectorScopeForRowSplit(scope::ScopeOp vecScope,
 
 LogicalResult
 createScopeSeparation(func::FuncOp funcOp, scf::ForOp innerLoop,
-                      const CrossScopeTransferInfo &transferInfo) {
+                      const CrossScopeTransferInfo &transferInfo,
+                      bool materializePostSplitSchedule,
+                      const PostCVSplitDetachedSchedule *
+                          detachedSchedule,
+                      const CrossCoreScheduleCandidate *
+                          scheduleCandidate) {
 
   MLIRContext *ctx = funcOp.getContext();
   Location loc = innerLoop.getLoc();
@@ -1017,11 +2987,24 @@ createScopeSeparation(func::FuncOp funcOp, scf::ForOp innerLoop,
   // simulator's dmamov_decode_to_fb path rejects. Interleaving the loads (the
   // manual kernel allocates one K tile right before each matmul) keeps only the
   // in-flight operands live -> low static offsets -> immediate offset mode.
-  sinkCubeLoadChainsToMatmul(cubeLoop.getBody());
+  unsigned productOperandPrefetchDepth = 1;
+  if (materializePostSplitSchedule) {
+    if (!detachedSchedule || !scheduleCandidate ||
+        scheduleCandidate->logicalLaneCount !=
+            detachedSchedule->logicalLaneCount ||
+        scheduleCandidate->prefetchLimit == 0)
+      return failure();
+    productOperandPrefetchDepth = scheduleCandidate->prefetchLimit;
+  }
+  if (failed(sinkCubeLoadChainsToMatmul(
+          cubeLoop.getBody(), productOperandPrefetchDepth)))
+    return failure();
 
   // Step 7: ROW_SPLIT re-tile of the VECTOR scope (BLOCK_M/2 rows per veccore,
   // both veccores active). Replaces the single-veccore NO_DUAL guard.
-  if (failed(retileVectorScopeForRowSplit(vecScope, transferInfo)))
+  if (failed(retileVectorScopeForRowSplit(
+          vecScope, cubeLoop, innerLoop, transferInfo,
+          materializePostSplitSchedule, detachedSchedule)))
     return failure();
 
   LLVM_DEBUG(

@@ -55,19 +55,15 @@ def maximum_live(commands: list[tuple[str, int]], compute: str,
     return maximum
 
 
-def test_option_is_default_off_and_fully_propagated() -> None:
-    passes = read(INCLUDE / "Passes.td")
+def test_analyze_mode_builds_detached_schedule_without_materialization() -> None:
     cpp = read(LIB / "CVSplitScheduling.cpp")
-    backend = read(BACKEND)
-    pybind = read(PYBIND)
-    assert 'Option<"enableDetachedScheduleDiagnostics"' in passes
-    option = passes.split(
-        'Option<"enableDetachedScheduleDiagnostics"', 1)[1]
-    assert '"bool", /*default*/"false"' in option.split('>,', 1)[0]
-    assert "options.enableDetachedScheduleDiagnostics" in cpp
-    assert "opts.enableDetachedScheduleDiagnostics" in pybind
-    assert "cv_split_enable_detached_schedule_diagnostics: bool = False" in backend
-    assert '"cv_split_enable_detached_schedule_diagnostics"' in backend
+    assert "analyzePostSplitSchedule" in cpp
+    assert "buildPostCVSplitDetachedSchedule(postSplitPlan)" in cpp
+    assert "logPostCVSplitDetachedSchedule(detachedSchedule)" in cpp
+    analyze = cpp.index("if (analyzePostSplitSchedule)")
+    detached = cpp.index("buildPostCVSplitDetachedSchedule(", analyze)
+    materialize = cpp.index("if (materializePostSplitSchedule", detached)
+    assert analyze < detached < materialize
 
 
 def test_builder_is_paired_parameterized_and_non_mutating() -> None:
@@ -99,8 +95,11 @@ def test_builder_is_paired_parameterized_and_non_mutating() -> None:
             "verifyGeometryAndReduction",
             "publicationEligible = false",
             "mutationPerformed = false",
+            "plan.backend.enableGraphSync",
+            "graph-sync=on",
     ):
         assert token in source
+    assert "disableGraphSync" not in source
     assert "PostCVSplitDetachedSchedule.cpp" in cmake
     lowered = source.lower()
     for forbidden in (
@@ -142,14 +141,15 @@ def test_integration_precedes_live_transfer_mutation() -> None:
     detachedBuildPosition = cpp.index("buildPostCVSplitDetachedSchedule(")
     transfer = cpp.index("insertCrossScopeTransfers(", detachedBuildPosition)
     assert planBuildPosition < detachedBuildPosition < transfer
-    assert "if (enableDetachedScheduleDiagnostics)" in cpp
-    assert "detached-schedule unavailable" in cpp
+    assert "if (analyzePostSplitSchedule)" in cpp
+    assert "logPostCVSplitDetachedSchedule(detachedSchedule)" in cpp
     assert "mutation=no" in read(LIB / "PostCVSplitDetachedSchedule.cpp")
-    assert "kPreserveExplicitScheduleAttr" not in cpp
+    before_atomic = cpp.split("if (materializePostSplitSchedule) {", 1)[0]
+    assert "kPreserveExplicitScheduleAttr" not in before_atomic
 
 
 if __name__ == "__main__":
-    test_option_is_default_off_and_fully_propagated()
+    test_analyze_mode_builds_detached_schedule_without_materialization()
     test_builder_is_paired_parameterized_and_non_mutating()
     test_reference_streams_are_depth_bounded()
     test_integration_precedes_live_transfer_mutation()
