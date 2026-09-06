@@ -315,7 +315,8 @@ retileVectorScopeForRowSplit(
     const CrossScopeTransferInfo &transferInfo,
     bool materializeStage94SimdRegions,
     const PostCVSplitDetachedSchedule *stage94DetachedSchedule);
-static void sinkCubeLoadChainsToMatmul(Block *body);
+static LogicalResult sinkCubeLoadChainsToMatmul(
+    Block *body, unsigned productOperandPrefetchDepth);
 
 // Sink each cube matmul's operand load chain to immediately before the matmul.
 // See the call site (createScopeSeparation step 6b) for the rationale.
@@ -329,7 +330,9 @@ static void sinkCubeLoadChainsToMatmul(Block *body);
 // consumed by all PV matmuls, accumulator fill tensors) in place while moving
 // private portions of each chain. Movable ops retain their existing relative
 // order and are placed immediately before their matmul.
-static void sinkCubeLoadChainsToMatmul(Block *body) {
+static LogicalResult
+sinkCubeLoadChainsToMatmul(Block *body,
+                           unsigned productOperandPrefetchDepth) {
   auto isChainType = [](Operation *o) {
     return isa<memref::ReinterpretCastOp, memref::AllocOp, memref::CopyOp,
                bufferization::ToTensorOp, linalg::TransposeOp>(o);
@@ -426,6 +429,137 @@ static void sinkCubeLoadChainsToMatmul(Block *body) {
     for (Operation *op : movable)
       op->moveBefore(mm);
   }
+
+  if (productOperandPrefetchDepth == 0)
+    return failure();
+  if (productOperandPrefetchDepth == 1)
+    return success();
+
+  MLIRContext *context = body->getParentOp()->getContext();
+  auto pipeMte3 = hivm::PipeAttr::get(context, hivm::PIPE::PIPE_MTE3);
+  auto pipeMte1 = hivm::PipeAttr::get(context, hivm::PIPE::PIPE_MTE1);
+  SmallVector<Operation *> probabilityWaits;
+  SmallVector<Operation *> productMatmuls;
+  for (Operation &operation : *body) {
+    auto wait = dyn_cast<hivm::SyncBlockWaitOp>(&operation);
+    if (!wait || wait.getTpipe() != pipeMte3 || wait.getPipe() != pipeMte1)
+      continue;
+    Operation *matmul = nullptr;
+    for (Operation *cursor = operation.getNextNode(); cursor;
+         cursor = cursor->getNextNode()) {
+      if (isa<linalg::MatmulOp, linalg::MatmulTransposeBOp>(cursor)) {
+        matmul = cursor;
+        break;
+      }
+      if (auto laterWait = dyn_cast<hivm::SyncBlockWaitOp>(cursor);
+          laterWait && laterWait.getTpipe() == pipeMte3 &&
+          laterWait.getPipe() == pipeMte1)
+        return failure();
+      if (cursor->hasTrait<OpTrait::IsTerminator>())
+        break;
+    }
+    if (!matmul)
+      return failure();
+    probabilityWaits.push_back(wait);
+    productMatmuls.push_back(matmul);
+  }
+  if (productMatmuls.empty() ||
+      productOperandPrefetchDepth > productMatmuls.size())
+    return failure();
+
+  Operation *lastScoreMatmul = nullptr;
+  for (MatmulChain &chain : chains)
+    if (chain.matmul->isBeforeInBlock(probabilityWaits.front()))
+      lastScoreMatmul = chain.matmul;
+  if (!lastScoreMatmul || !lastScoreMatmul->getNextNode())
+    return failure();
+
+  auto findMatmulChain = [&](Operation *matmul) -> MatmulChain * {
+    for (MatmulChain &chain : chains)
+      if (chain.matmul == matmul)
+        return &chain;
+    return nullptr;
+  };
+  auto collectOperandChain = [&](Value root) {
+    SetVector<Operation *> chain;
+    SmallVector<Value> worklist{root};
+    while (!worklist.empty()) {
+      Value value = worklist.pop_back_val();
+      Operation *definition = value.getDefiningOp();
+      if (!definition || definition->getBlock() != body ||
+          !isChainType(definition) || !chain.insert(definition))
+        continue;
+      for (Value operand : definition->getOperands())
+        worklist.push_back(operand);
+      if (isa<memref::AllocOp>(definition))
+        for (Operation *user : definition->getResult(0).getUsers())
+          if (auto copy = dyn_cast<memref::CopyOp>(user);
+              copy && copy->getBlock() == body &&
+              copy.getTarget() == definition->getResult(0) &&
+              chain.insert(copy))
+            for (Value operand : copy->getOperands())
+              worklist.push_back(operand);
+    }
+    return chain;
+  };
+
+  SmallVector<SmallVector<Operation *>> productOperandLoadChains;
+  productOperandLoadChains.reserve(productMatmuls.size());
+  for (Operation *matmul : productMatmuls) {
+    MatmulChain *fullChain = findMatmulChain(matmul);
+    if (!fullChain)
+      return failure();
+    SmallVector<Operation *> selected;
+    unsigned copiedOperandChains = 0;
+    for (Value operand : matmul->getOperands()) {
+      SetVector<Operation *> operandChain = collectOperandChain(operand);
+      unsigned copyCount = llvm::count_if(operandChain, [](Operation *op) {
+        return isa<memref::CopyOp>(op);
+      });
+      if (copyCount == 0)
+        continue;
+      if (copyCount != 1 || copiedOperandChains++ != 0)
+        return failure();
+      for (Operation *operation : operandChain) {
+        if (!safeToMove(operation, matmul, fullChain->ops))
+          return failure();
+        selected.push_back(operation);
+      }
+    }
+    if (copiedOperandChains != 1 || selected.empty())
+      return failure();
+    llvm::sort(selected, [](Operation *lhs, Operation *rhs) {
+      return lhs->isBeforeInBlock(rhs);
+    });
+    productOperandLoadChains.push_back(std::move(selected));
+  }
+
+  const unsigned prefetchDistance = productOperandPrefetchDepth - 1;
+  for (auto [lane, loadChain] :
+       llvm::enumerate(productOperandLoadChains)) {
+    Operation *anchor =
+        lane < prefetchDistance
+            ? lastScoreMatmul->getNextNode()
+            : productMatmuls[lane - prefetchDistance];
+    DenseSet<Operation *> moving;
+    moving.insert(loadChain.begin(), loadChain.end());
+    for (Operation *operation : loadChain)
+      for (Value operand : operation->getOperands())
+        if (Operation *definition = operand.getDefiningOp();
+            definition && definition->getBlock() == body &&
+            !moving.contains(definition) &&
+            (definition == anchor || anchor->isBeforeInBlock(definition)))
+          return failure();
+    for (Operation *operation : loadChain)
+      operation->moveBefore(anchor);
+  }
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-product-operand-prefetch depth="
+             << productOperandPrefetchDepth
+             << " distance=" << prefetchDistance
+             << " lanes=" << productOperandLoadChains.size() << "\n");
+  return success();
 }
 
 // ============================================================================
@@ -2707,7 +2841,9 @@ createScopeSeparation(func::FuncOp funcOp, scf::ForOp innerLoop,
                       const CrossScopeTransferInfo &transferInfo,
                       bool materializeStage94SimdRegions,
                       const PostCVSplitDetachedSchedule *
-                          stage94DetachedSchedule) {
+                          stage94DetachedSchedule,
+                      const CrossCoreScheduleCandidate *
+                          stage94ScheduleCandidate) {
 
   MLIRContext *ctx = funcOp.getContext();
   Location loc = innerLoop.getLoc();
@@ -2851,7 +2987,18 @@ createScopeSeparation(func::FuncOp funcOp, scf::ForOp innerLoop,
   // simulator's dmamov_decode_to_fb path rejects. Interleaving the loads (the
   // manual kernel allocates one K tile right before each matmul) keeps only the
   // in-flight operands live -> low static offsets -> immediate offset mode.
-  sinkCubeLoadChainsToMatmul(cubeLoop.getBody());
+  unsigned productOperandPrefetchDepth = 1;
+  if (materializeStage94SimdRegions) {
+    if (!stage94DetachedSchedule || !stage94ScheduleCandidate ||
+        stage94ScheduleCandidate->logicalLaneCount !=
+            stage94DetachedSchedule->logicalLaneCount ||
+        stage94ScheduleCandidate->prefetchLimit == 0)
+      return failure();
+    productOperandPrefetchDepth = stage94ScheduleCandidate->prefetchLimit;
+  }
+  if (failed(sinkCubeLoadChainsToMatmul(
+          cubeLoop.getBody(), productOperandPrefetchDepth)))
+    return failure();
 
   // Step 7: ROW_SPLIT re-tile of the VECTOR scope (BLOCK_M/2 rows per veccore,
   // both veccores active). Replaces the single-veccore NO_DUAL guard.

@@ -1334,7 +1334,8 @@ private:
                << "[cv-split] === Stage 9: scope separation ===\n");
     if (failed(cv_split::createScopeSeparation(
             funcOp, loop, *transferInfo, enableStage94AtomicRewrite,
-            stage94DetachedSchedule ? &*stage94DetachedSchedule : nullptr))) {
+            stage94DetachedSchedule ? &*stage94DetachedSchedule : nullptr,
+            forcedScheduleCandidate))) {
       return failure();
     }
     if (enableStage94AtomicRewrite) {

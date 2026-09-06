@@ -158,6 +158,52 @@ def test_full_scale_fill_is_narrowed_once_and_shared_across_lanes() -> None:
     assert "sharedScaleScalar,\n            sharedScaleRow" in caller
 
 
+def test_product_operand_prefetch_consumes_the_structural_candidate_limit() -> None:
+    source = read(LIB / "ScopeSeparation.cpp")
+    header = read(INCLUDE / "ScopeSeparation.h")
+    cpp = read(LIB / "CVSplitScheduling.cpp")
+    for text in (header, source):
+        assert "const CrossCoreScheduleCandidate *" in text
+        assert "stage94ScheduleCandidate" in text
+    assert "forcedScheduleCandidate" in cpp.split(
+        "createScopeSeparation(", 1)[1]
+
+    prefetch = source.split("sinkCubeLoadChainsToMatmul", 2)[2]
+    prefetch = prefetch.split("ROW_SPLIT vector re-tile", 1)[0]
+    for token in (
+            "productOperandPrefetchDepth",
+            "hivm::PIPE::PIPE_MTE3",
+            "hivm::PIPE::PIPE_MTE1",
+            "probabilityWaits",
+            "productMatmuls",
+            "lastScoreMatmul",
+            "collectOperandChain",
+            "memref::CopyOp",
+            "copiedOperandChains != 1",
+            "prefetchDistance = productOperandPrefetchDepth - 1",
+            "lane < prefetchDistance",
+            "productMatmuls[lane - prefetchDistance]",
+            "anchor->isBeforeInBlock(definition)",
+            "operation->moveBefore(anchor)",
+            "stage94-product-operand-prefetch",
+    ):
+        assert token in prefetch
+    for forbidden in ("lane == 0", "lane == 3", "flag == 4", "flag == 7"):
+        assert forbidden not in prefetch
+
+    callsite = source.split("// Step 6b:", 1)[1]
+    callsite = callsite.split("// Step 7:", 1)[0]
+    for token in (
+            "materializeStage94SimdRegions",
+            "stage94ScheduleCandidate->logicalLaneCount",
+            "stage94DetachedSchedule->logicalLaneCount",
+            "stage94ScheduleCandidate->prefetchLimit",
+            "productOperandPrefetchDepth",
+            "failed(sinkCubeLoadChainsToMatmul(",
+    ):
+        assert token in callsite
+
+
 def test_online_softmax_marks_the_inter_loop_vector_dependency() -> None:
     source = read(LIB / "ScopeSeparation.cpp")
     online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
@@ -395,6 +441,7 @@ if __name__ == "__main__":
     test_row_reduction_identities_are_materialized_inside_simd_scope()
     test_loop_storage_is_explicitly_ub_backed_before_the_simd_scope()
     test_full_scale_fill_is_narrowed_once_and_shared_across_lanes()
+    test_product_operand_prefetch_consumes_the_structural_candidate_limit()
     test_online_softmax_marks_the_inter_loop_vector_dependency()
     test_final_maximum_preserves_original_tensor_semantics()
     test_direct_nz_pack_reshapes_f32_before_truncation()

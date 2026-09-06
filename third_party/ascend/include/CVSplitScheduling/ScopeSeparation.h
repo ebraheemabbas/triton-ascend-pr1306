@@ -36,7 +36,9 @@ LogicalResult createScopeSeparation(func::FuncOp funcOp, scf::ForOp innerLoop,
                                     const CrossScopeTransferInfo &transferInfo,
                                     bool materializeStage94SimdRegions = false,
                                     const PostCVSplitDetachedSchedule *
-                                        stage94DetachedSchedule = nullptr);
+                                        stage94DetachedSchedule = nullptr,
+                                    const CrossCoreScheduleCandidate *
+                                        stage94ScheduleCandidate = nullptr);
 
 } // namespace mlir::triton::cv_split
 
