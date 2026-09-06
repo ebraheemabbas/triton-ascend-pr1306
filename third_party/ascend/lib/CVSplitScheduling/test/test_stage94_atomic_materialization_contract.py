@@ -91,26 +91,39 @@ def test_row_reduction_identities_are_materialized_inside_simd_scope() -> None:
     assert "createReductionInit(eb, sumReduce, rowScalarType)" in online
 
 
-def test_loop_storage_follows_escape_lifetimes() -> None:
+def test_loop_storage_is_explicitly_ub_backed_before_the_simd_scope() -> None:
     source = read(LIB / "ScopeSeparation.cpp")
     online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
     scope = online.index("builder.create<scope::ScopeOp>")
-    for token in ("sumRowsInit", "scaledRowsInit", "packedRowsInit"):
-        assert online.index(token) < scope
-    sum_storage = 'createLoopStorage(builder, maximumType, "stage94.sum-rows")'
-    max_storage = 'createLoopStorage(b, maximumType, "stage94.max-rows")'
-    assert sum_storage in online
-    assert max_storage in online
-    assert online.index(sum_storage) < scope < online.index(max_storage)
     for token in (
-            "createLoopStorage",
-            "tensor::EmptyOp",
+            "sumRowsInit",
+            "scaledRowsInit",
+            "packedRowsInit",
+            "maxRowsInit",
             '"stage94.max-rows"',
             '"stage94.sum-rows"',
             '"stage94.scaled-rows"',
             '"stage94.packed-rows"',
     ):
-        assert token in online
+        assert online.index(token) < scope
+    storage = online.split("auto createLoopStorage", 1)[1]
+    storage = storage.split("auto createReductionInit", 1)[0]
+    for token in (
+            "hivm::AddressSpace::UB",
+            "MemRefType::get",
+            "memref::AllocOp",
+            "annotation::MarkOp",
+            'mark->setAttr("effects"',
+            'getStringAttr("write")',
+            'getStringAttr("read")',
+            "memref::MemorySpaceCastOp",
+            "bufferization::ToTensorOp",
+            "/*restrict=*/true",
+            "/*writable=*/true",
+    ):
+        assert token in storage
+    assert "tensor::EmptyOp" not in storage
+    assert "createLoopStorage(b," not in online
 
 
 def test_online_softmax_marks_the_inter_loop_vector_dependency() -> None:
@@ -348,7 +361,7 @@ if __name__ == "__main__":
     test_no_textual_or_shape_identity_policy()
     test_generated_row_loops_handle_empty_scf_bodies()
     test_row_reduction_identities_are_materialized_inside_simd_scope()
-    test_loop_storage_follows_escape_lifetimes()
+    test_loop_storage_is_explicitly_ub_backed_before_the_simd_scope()
     test_online_softmax_marks_the_inter_loop_vector_dependency()
     test_final_maximum_preserves_original_tensor_semantics()
     test_direct_nz_pack_reshapes_f32_before_truncation()

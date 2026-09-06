@@ -1490,10 +1490,27 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane,
                                StringRef role) -> Value {
     Location storageLoc =
         NameLoc::get(storageBuilder.getStringAttr(role), loc);
+    auto ubAddressSpace = storageBuilder.getAttr<hivm::AddressSpaceAttr>(
+        hivm::AddressSpace::UB);
+    auto ubType = MemRefType::get(tensorType.getShape(),
+                                  tensorType.getElementType(), nullptr,
+                                  ubAddressSpace);
+    auto allocation = storageBuilder.create<memref::AllocOp>(storageLoc,
+                                                              ubType);
+    auto mark = storageBuilder.create<annotation::MarkOp>(
+        storageLoc, allocation.getResult());
+    mark->setAttr("effects",
+                  storageBuilder.getArrayAttr(
+                      {storageBuilder.getStringAttr("write"),
+                       storageBuilder.getStringAttr("read")}));
+    auto plainType = MemRefType::get(tensorType.getShape(),
+                                     tensorType.getElementType());
+    auto cast = storageBuilder.create<memref::MemorySpaceCastOp>(
+        storageLoc, plainType, allocation.getResult());
     return storageBuilder
-        .create<tensor::EmptyOp>(storageLoc, tensorType.getShape(),
-                                 tensorType.getElementType(),
-                                 tensorType.getEncoding())
+        .create<bufferization::ToTensorOp>(
+            storageLoc, tensorType, cast.getResult(),
+            /*restrict=*/true, /*writable=*/true)
         .getResult();
   };
   auto createReductionInit =
@@ -1527,6 +1544,8 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane,
       createLoopStorage(builder, scaledType, "stage94.scaled-rows");
   Value packedRowsInit =
       createLoopStorage(builder, packedType, "stage94.packed-rows");
+  Value maxRowsInit =
+      createLoopStorage(builder, maximumType, "stage94.max-rows");
   Value deferredAddInit;
   if (deferLaneSum)
     deferredAddInit = createLoopStorage(
@@ -1547,11 +1566,6 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane,
              << " checkpoint=scope-created\n");
   Block *scopeBlock = &simdScope.getBodyRegion().front();
   OpBuilder b = OpBuilder::atBlockEnd(scopeBlock);
-  // The row maxima are scratch, not a scope result. Keep their lifetime inside
-  // the SIMD scope so SCF bufferization cannot confuse them with the same-shaped
-  // sum result and insert a cross-boundary copy.
-  Value maxRowsInit =
-      createLoopStorage(b, maximumType, "stage94.max-rows");
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=scope-builder-ready\n");
