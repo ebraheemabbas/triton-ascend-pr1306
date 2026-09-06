@@ -1177,6 +1177,8 @@ private:
     bool stage94BindingReady = false;
     bool stage94StructuralCandidateReady = false;
     bool stage94SymmetricGeometryReady = false;
+    std::optional<cv_split::PostCVSplitDetachedSchedule>
+        stage94DetachedSchedule;
     if (enableCostModelDiagnostics) {
       if (!materializedPlan || !materializedResources ||
           !scheduleCandidateSet) {
@@ -1247,6 +1249,8 @@ private:
                             return lineage.inFlightLimit >= requiredDepth;
                           });
                 }
+                if (enableStage94AtomicRewrite && detachedSchedule.verified)
+                  stage94DetachedSchedule.emplace(detachedSchedule);
               }
             }
           }
@@ -1287,6 +1291,8 @@ private:
                  << " mutation=no\n");
       return failure();
     }
+    if (enableStage94AtomicRewrite && !stage94DetachedSchedule)
+      return failure();
 
     // Stage 8: Insert cross-scope transfers (BEFORE scope separation)
     LLVM_DEBUG(llvm::dbgs()
@@ -1327,7 +1333,8 @@ private:
     LLVM_DEBUG(llvm::dbgs()
                << "[cv-split] === Stage 9: scope separation ===\n");
     if (failed(cv_split::createScopeSeparation(
-            funcOp, loop, *transferInfo, enableStage94AtomicRewrite))) {
+            funcOp, loop, *transferInfo, enableStage94AtomicRewrite,
+            stage94DetachedSchedule ? &*stage94DetachedSchedule : nullptr))) {
       return failure();
     }
     if (enableStage94AtomicRewrite) {

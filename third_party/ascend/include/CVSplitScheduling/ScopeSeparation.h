@@ -24,6 +24,7 @@
 #define TRITON_ASCEND_CV_SPLIT_SCHEDULING_SCOPE_SEPARATION_H
 
 #include "ascend/include/CVSplitScheduling/CrossScopeTransfers.h"
+#include "ascend/include/CVSplitScheduling/PostCVSplitDetachedSchedule.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -33,7 +34,9 @@ namespace mlir::triton::cv_split {
 
 LogicalResult createScopeSeparation(func::FuncOp funcOp, scf::ForOp innerLoop,
                                     const CrossScopeTransferInfo &transferInfo,
-                                    bool materializeStage94SimdRegions = false);
+                                    bool materializeStage94SimdRegions = false,
+                                    const PostCVSplitDetachedSchedule *
+                                        stage94DetachedSchedule = nullptr);
 
 } // namespace mlir::triton::cv_split
 

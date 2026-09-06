@@ -24,6 +24,7 @@ def test_forced_option_is_default_off_and_atomic() -> None:
     assert "cv_split_enable_stage94_atomic_rewrite: bool = False" in backend
     assert "stage94BindingReady" in cpp
     assert "stage94StructuralCandidateReady" in cpp
+    assert "stage94DetachedSchedule" in cpp
     assert "kPreserveExplicitScheduleAttr" in cpp
     assert "cube=yes vector=yes" in cpp
     assert "OwningOpRef<ModuleOp> transformedModule = moduleOp.clone()" in cpp
@@ -216,6 +217,47 @@ def test_grouped_recurrence_replaces_alpha_and_final_denominator_atomically() ->
     assert "return materializeStage94GroupedRecurrence(lanes);" in outline
 
 
+def test_release_protocol_is_driven_by_detached_schedule_roles_and_slots() -> None:
+    header = read(INCLUDE / "ScopeSeparation.h")
+    source = read(LIB / "ScopeSeparation.cpp")
+    cpp = read(LIB / "CVSplitScheduling.cpp")
+    assert "const PostCVSplitDetachedSchedule *" in header
+    assert "stage94DetachedSchedule" in header
+    assert "stage94DetachedSchedule.emplace(detachedSchedule)" in cpp
+    assert "stage94DetachedSchedule ? &*stage94DetachedSchedule : nullptr" in cpp
+    protocol = source.split("buildStage94ReleaseProtocolPlan", 1)[1]
+    protocol = protocol.split("retileVectorScopeForRowSplit", 1)[0]
+    for token in (
+            "PostCVSplitDetachedCommandKind::ScorePublish",
+            "PostCVSplitDetachedCommandKind::ScoreReleaseWait",
+            "PostCVSplitDetachedCommandKind::ScoreRelease",
+            "PostCVSplitDetachedCommandKind::ProbabilityPublish",
+            "PostCVSplitDetachedCommandKind::ProductPublish",
+            "PostCVSplitDetachedCommandKind::ProductReleaseWait",
+            "PostCVSplitDetachedCommandKind::ProductRelease",
+            "release->slot",
+            "release->logicalFlagId",
+            "initial.signalingResource",
+            "initial.waitingResource",
+            "stage94PipeForResource",
+            "legacyVectorSet->erase()",
+            "legacyCubeWait->erase()",
+            "scoreCubeBuilder.create<hivm::SyncBlockWaitOp>",
+            "scoreVectorBuilder.create<hivm::SyncBlockSetOp>",
+            "productCubeBuilder.create<hivm::SyncBlockWaitOp>",
+            "productVectorBuilder.create<hivm::SyncBlockSetOp>",
+            "stage94-materialized-release-protocol",
+    ):
+        assert token in protocol
+    for forbidden in (
+            "scoreReleaseFlag = 12",
+            "scoreReleaseFlag = 13",
+            "productReleaseFlag = 14",
+            "productReleaseFlag = 15",
+    ):
+        assert forbidden not in protocol
+
+
 if __name__ == "__main__":
     test_forced_option_is_default_off_and_atomic()
     test_materializer_outlines_all_probability_regions()
@@ -229,4 +271,5 @@ if __name__ == "__main__":
     test_lane_scope_defers_only_the_last_logical_lane_sum()
     test_grouped_recurrence_is_lane_count_driven_and_balanced()
     test_grouped_recurrence_replaces_alpha_and_final_denominator_atomically()
+    test_release_protocol_is_driven_by_detached_schedule_roles_and_slots()
     print("Stage 9.4b/c atomic materialization source contract: PASS")

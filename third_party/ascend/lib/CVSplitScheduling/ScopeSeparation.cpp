@@ -46,6 +46,8 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <optional>
+
 using namespace mlir;
 using namespace mlir::triton;
 
@@ -308,8 +310,11 @@ static scf::ForOp removeUnusedLoopCarriedValues(scf::ForOp loop) {
 }
 
 static LogicalResult
-retileVectorScopeForRowSplit(scope::ScopeOp vecScope,
-                             const CrossScopeTransferInfo &transferInfo);
+retileVectorScopeForRowSplit(
+    scope::ScopeOp vecScope, scf::ForOp cubeLoop, scf::ForOp vectorLoop,
+    const CrossScopeTransferInfo &transferInfo,
+    bool materializeStage94SimdRegions,
+    const PostCVSplitDetachedSchedule *stage94DetachedSchedule);
 static void sinkCubeLoadChainsToMatmul(Block *body);
 
 // Sink each cube matmul's operand load chain to immediately before the matmul.
@@ -474,7 +479,74 @@ struct VectorToCubePack {
   Value pSrc;
   Value l1Alloc;
   Operation *anchor;
+  Operation *scoreReleaseAnchor = nullptr;
 };
+
+struct Stage94ReleaseLanePlan {
+  unsigned lane = 0;
+  unsigned scoreReleaseFlag = 0;
+  unsigned productReleaseFlag = 0;
+  PrincipalResource scoreSignalingResource =
+      PrincipalResource::ScalarControl;
+  PrincipalResource scoreWaitingResource = PrincipalResource::ScalarControl;
+  PrincipalResource productSignalingResource =
+      PrincipalResource::ScalarControl;
+  PrincipalResource productWaitingResource =
+      PrincipalResource::ScalarControl;
+  Operation *scoreCubeDrain = nullptr;
+  Operation *scoreVectorRelease = nullptr;
+  Operation *productCubeDrain = nullptr;
+  Operation *productVectorRelease = nullptr;
+};
+
+struct Stage94ReleaseInit {
+  PostCVSplitLineageRole role = PostCVSplitLineageRole::Score;
+  unsigned slot = 0;
+  unsigned flag = 0;
+  PrincipalResource signalingResource = PrincipalResource::ScalarControl;
+  PrincipalResource waitingResource = PrincipalResource::ScalarControl;
+};
+
+struct Stage94ReleaseProtocolPlan {
+  SmallVector<Stage94ReleaseLanePlan> lanes;
+  SmallVector<Stage94ReleaseInit> initialSignals;
+  Operation *legacyCubeWait = nullptr;
+  Operation *legacyVectorSet = nullptr;
+};
+
+static std::optional<unsigned> getStage94StaticFlag(Operation *operation) {
+  std::optional<IntegerAttr> flag;
+  if (auto set = dyn_cast<hivm::SyncBlockSetOp>(operation))
+    flag = set.getStaticFlagId();
+  else if (auto wait = dyn_cast<hivm::SyncBlockWaitOp>(operation))
+    flag = wait.getStaticFlagId();
+  if (!flag || (*flag).getInt() < 0)
+    return std::nullopt;
+  return static_cast<unsigned>((*flag).getInt());
+}
+
+static const PostCVSplitDetachedCommand *findStage94Command(
+    ArrayRef<PostCVSplitDetachedCommand> commands,
+    PostCVSplitDetachedCommandKind kind, unsigned lane) {
+  auto command = llvm::find_if(commands, [&](const auto &candidate) {
+    return candidate.kind == kind && candidate.lane == lane;
+  });
+  return command == commands.end() ? nullptr : &*command;
+}
+
+static hivm::PipeAttr stage94PipeForResource(MLIRContext *context,
+                                             PrincipalResource resource) {
+  switch (resource) {
+  case PrincipalResource::Fixpipe:
+    return hivm::PipeAttr::get(context, hivm::PIPE::PIPE_FIX);
+  case PrincipalResource::Vector:
+    return hivm::PipeAttr::get(context, hivm::PIPE::PIPE_V);
+  case PrincipalResource::Mte3:
+    return hivm::PipeAttr::get(context, hivm::PIPE::PIPE_MTE3);
+  default:
+    return nullptr;
+  }
+}
 
 // Step 1: emit get_sub_block_idx at the top of the scope and return it as an
 // index value (0 or 1 — which of the core's two veccores is executing).
@@ -1209,6 +1281,7 @@ struct Stage94OnlineSoftmaxLane {
   math::ExpOp alpha;
   arith::MulFOp scaledDenominator;
   arith::AddFOp newDenominator;
+  Operation *scoreReleaseAnchor = nullptr;
 };
 
 static FailureOr<Stage94OnlineSoftmaxLane>
@@ -1659,6 +1732,7 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane,
   Value materializedMaximum =
       simdScope->getResult(deferLaneSum ? 1 : 0);
   Value materializedSum = simdScope->getResult(1);
+  Operation *scoreReleaseAnchor = anchor;
   if (deferLaneSum) {
     OpBuilder deferredBuilder(anchor);
     deferredBuilder.setInsertionPointAfter(anchor);
@@ -1718,6 +1792,7 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane,
     rb.create<scf::YieldOp>(loc, ValueRange{deferredRows});
     db.create<scope::ReturnOp>(loc, deferredLoop.getResult(0));
     materializedSum = deferredScope->getResult(0);
+    scoreReleaseAnchor = deferredScope;
   }
 
   SmallVector<std::pair<Value, Value>> replacements{
@@ -1751,6 +1826,7 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane,
       alpha,
       scaledDenominator,
       newDenominator,
+      scoreReleaseAnchor,
   };
 }
 
@@ -1922,18 +1998,287 @@ outlineStage94VectorRegions(MutableArrayRef<VectorToCubePack> packs) {
     if (failed(result))
       return failure();
     pack.pSrc = result->packedProbability;
+    pack.scoreReleaseAnchor = result->scoreReleaseAnchor;
     lanes.push_back(*result);
   }
   return materializeStage94GroupedRecurrence(lanes);
+}
+
+static FailureOr<Stage94ReleaseProtocolPlan> buildStage94ReleaseProtocolPlan(
+    scf::ForOp cubeLoop, scf::ForOp vectorLoop,
+    ArrayRef<VectorToCubePack> packs,
+    const CrossScopeTransferInfo &transferInfo,
+    const PostCVSplitDetachedSchedule &schedule) {
+  if (schedule.status != PostCVSplitDetachedScheduleStatus::Ready ||
+      !schedule.verified || schedule.logicalLaneCount == 0 ||
+      schedule.logicalLaneCount != packs.size())
+    return failure();
+
+  Stage94ReleaseProtocolPlan plan;
+  plan.lanes.reserve(schedule.logicalLaneCount);
+  auto findCubeDrain = [&](unsigned forwardFlag) -> Operation * {
+    Operation *drain = nullptr;
+    for (Operation &operation : *cubeLoop.getBody()) {
+      auto set = dyn_cast<hivm::SyncBlockSetOp>(&operation);
+      if (!set || getStage94StaticFlag(set) != forwardFlag)
+        continue;
+      if (drain || !isa_and_nonnull<hivm::FixpipeOp>(set->getPrevNode()))
+        return nullptr;
+      drain = set->getPrevNode();
+    }
+    return drain;
+  };
+  auto findProductVectorRelease = [&](unsigned forwardFlag) -> Operation * {
+    const CubeToVectorTransferChain *matchingChain = nullptr;
+    for (const CubeToVectorTransferChain &chain :
+         transferInfo.cubeToVectorChains) {
+      if (chain.forwardFlagId != static_cast<int>(forwardFlag))
+        continue;
+      if (matchingChain)
+        return nullptr;
+      matchingChain = &chain;
+    }
+    if (!matchingChain || !matchingChain->wait ||
+        matchingChain->wait->getBlock() != vectorLoop.getBody())
+      return nullptr;
+    Operation *lastConsumer = nullptr;
+    for (Operation *consumer : matchingChain->consumers) {
+      if (!consumer || consumer->getBlock() != vectorLoop.getBody())
+        return nullptr;
+      if (!lastConsumer || lastConsumer->isBeforeInBlock(consumer))
+        lastConsumer = consumer;
+    }
+    return lastConsumer;
+  };
+
+  for (unsigned lane = 0; lane < schedule.logicalLaneCount; ++lane) {
+    const PostCVSplitDetachedCommand *scorePublish = findStage94Command(
+        schedule.cubeCommands, PostCVSplitDetachedCommandKind::ScorePublish,
+        lane);
+    const PostCVSplitDetachedCommand *scoreReleaseWait = findStage94Command(
+        schedule.cubeCommands,
+        PostCVSplitDetachedCommandKind::ScoreReleaseWait, lane);
+    const PostCVSplitDetachedCommand *scoreRelease = findStage94Command(
+        schedule.vectorCommands, PostCVSplitDetachedCommandKind::ScoreRelease,
+        lane);
+    const PostCVSplitDetachedCommand *probabilityPublish = findStage94Command(
+        schedule.vectorCommands,
+        PostCVSplitDetachedCommandKind::ProbabilityPublish, lane);
+    const PostCVSplitDetachedCommand *productPublish = findStage94Command(
+        schedule.cubeCommands, PostCVSplitDetachedCommandKind::ProductPublish,
+        lane);
+    const PostCVSplitDetachedCommand *productReleaseWait = findStage94Command(
+        schedule.cubeCommands,
+        PostCVSplitDetachedCommandKind::ProductReleaseWait, lane);
+    const PostCVSplitDetachedCommand *productRelease = findStage94Command(
+        schedule.vectorCommands,
+        PostCVSplitDetachedCommandKind::ProductRelease, lane);
+    if (!scorePublish || !scoreReleaseWait || !scoreRelease ||
+        !probabilityPublish || !productPublish || !productReleaseWait ||
+        !productRelease || !scorePublish->hasEvent ||
+        !scoreReleaseWait->hasEvent || !scoreRelease->hasEvent ||
+        !probabilityPublish->hasEvent || !productPublish->hasEvent ||
+        !productReleaseWait->hasEvent || !productRelease->hasEvent ||
+        scoreReleaseWait->logicalFlagId != scoreRelease->logicalFlagId ||
+        productReleaseWait->logicalFlagId != productRelease->logicalFlagId ||
+        scoreReleaseWait->slot != scoreRelease->slot ||
+        productReleaseWait->slot != productRelease->slot)
+      return failure();
+
+    VectorToCubePack pack = packs[lane];
+    if (!pack.anchor || !pack.scoreReleaseAnchor ||
+        getStage94StaticFlag(pack.anchor) !=
+            probabilityPublish->logicalFlagId)
+      return failure();
+
+    Stage94ReleaseLanePlan lanePlan;
+    lanePlan.lane = lane;
+    lanePlan.scoreReleaseFlag = scoreRelease->logicalFlagId;
+    lanePlan.productReleaseFlag = productRelease->logicalFlagId;
+    lanePlan.scoreSignalingResource = scoreRelease->resource;
+    lanePlan.scoreWaitingResource = scoreReleaseWait->resource;
+    lanePlan.productSignalingResource = productRelease->resource;
+    lanePlan.productWaitingResource = productReleaseWait->resource;
+    lanePlan.scoreCubeDrain = findCubeDrain(scorePublish->logicalFlagId);
+    lanePlan.scoreVectorRelease = pack.scoreReleaseAnchor;
+    lanePlan.productCubeDrain = findCubeDrain(productPublish->logicalFlagId);
+    lanePlan.productVectorRelease =
+        findProductVectorRelease(productPublish->logicalFlagId);
+    if (!lanePlan.scoreCubeDrain || !lanePlan.scoreVectorRelease ||
+        !lanePlan.productCubeDrain || !lanePlan.productVectorRelease)
+      return failure();
+    plan.lanes.push_back(lanePlan);
+  }
+
+  auto appendInitial = [&](PostCVSplitLineageRole role, unsigned slot,
+                           unsigned flag, PrincipalResource signaling,
+                           PrincipalResource waiting) {
+    for (const Stage94ReleaseInit &existing : plan.initialSignals) {
+      if (existing.flag != flag)
+        continue;
+      return existing.role == role && existing.slot == slot &&
+             existing.signalingResource == signaling &&
+             existing.waitingResource == waiting;
+    }
+    plan.initialSignals.push_back({role, slot, flag, signaling, waiting});
+    return true;
+  };
+  for (PostCVSplitLineageRole role : {PostCVSplitLineageRole::Score,
+                                      PostCVSplitLineageRole::Product}) {
+    for (unsigned lane = 0; lane < schedule.logicalLaneCount; ++lane) {
+      PostCVSplitDetachedCommandKind kind =
+          role == PostCVSplitLineageRole::Score
+              ? PostCVSplitDetachedCommandKind::ScoreRelease
+              : PostCVSplitDetachedCommandKind::ProductRelease;
+      const PostCVSplitDetachedCommand *release =
+          findStage94Command(schedule.vectorCommands, kind, lane);
+      const PostCVSplitDetachedCommand *wait = findStage94Command(
+          schedule.cubeCommands,
+          role == PostCVSplitLineageRole::Score
+              ? PostCVSplitDetachedCommandKind::ScoreReleaseWait
+              : PostCVSplitDetachedCommandKind::ProductReleaseWait,
+          lane);
+      if (!release || !wait ||
+          !appendInitial(role, release->slot, release->logicalFlagId,
+                         release->resource, wait->resource))
+        return failure();
+    }
+  }
+
+  DenseSet<unsigned> productReleaseFlags;
+  for (const Stage94ReleaseInit &initial : plan.initialSignals)
+    if (initial.role == PostCVSplitLineageRole::Product)
+      productReleaseFlags.insert(initial.flag);
+  MLIRContext *context = cubeLoop.getContext();
+  auto pipeV = hivm::PipeAttr::get(context, hivm::PIPE::PIPE_V);
+  auto pipeFix = hivm::PipeAttr::get(context, hivm::PIPE::PIPE_FIX);
+  for (Operation &operation : *cubeLoop.getBody()) {
+    auto wait = dyn_cast<hivm::SyncBlockWaitOp>(&operation);
+    if (!wait || wait.getTpipe() != pipeV || wait.getPipe() != pipeFix)
+      continue;
+    std::optional<unsigned> flag = getStage94StaticFlag(wait);
+    if (!flag || productReleaseFlags.contains(*flag))
+      continue;
+    if (plan.legacyCubeWait)
+      return failure();
+    plan.legacyCubeWait = wait;
+  }
+  for (Operation &operation : *vectorLoop.getBody()) {
+    auto set = dyn_cast<hivm::SyncBlockSetOp>(&operation);
+    if (!set || set.getTpipe() != pipeV || set.getPipe() != pipeFix)
+      continue;
+    std::optional<unsigned> flag = getStage94StaticFlag(set);
+    if (!flag || productReleaseFlags.contains(*flag))
+      continue;
+    if (plan.legacyVectorSet)
+      return failure();
+    plan.legacyVectorSet = set;
+  }
+  if (!plan.legacyCubeWait || !plan.legacyVectorSet ||
+      getStage94StaticFlag(plan.legacyCubeWait) !=
+          getStage94StaticFlag(plan.legacyVectorSet))
+    return failure();
+  return plan;
+}
+
+static LogicalResult materializeStage94ReleaseProtocol(
+    scf::ForOp cubeLoop, scf::ForOp vectorLoop,
+    ArrayRef<VectorToCubePack> packs,
+    const CrossScopeTransferInfo &transferInfo,
+    const PostCVSplitDetachedSchedule &schedule) {
+  FailureOr<Stage94ReleaseProtocolPlan> plan =
+      buildStage94ReleaseProtocolPlan(cubeLoop, vectorLoop, packs,
+                                      transferInfo, schedule);
+  if (failed(plan))
+    return failure();
+
+  plan->legacyVectorSet->erase();
+  plan->legacyCubeWait->erase();
+
+  MLIRContext *context = cubeLoop.getContext();
+  Location loc = cubeLoop.getLoc();
+  auto cubeCore =
+      hivm::TCoreTypeAttr::get(context, hivm::TCoreType::CUBE);
+  auto vectorCore =
+      hivm::TCoreTypeAttr::get(context, hivm::TCoreType::VECTOR);
+  OpBuilder initialBuilder(vectorLoop);
+  for (const Stage94ReleaseInit &initial : plan->initialSignals) {
+    hivm::PipeAttr signaling =
+        stage94PipeForResource(context, initial.signalingResource);
+    hivm::PipeAttr waiting =
+        stage94PipeForResource(context, initial.waitingResource);
+    if (!signaling || !waiting)
+      return failure();
+    auto set = initialBuilder.create<hivm::SyncBlockSetOp>(
+        loc, vectorCore, signaling, waiting,
+        OpFoldResult(initialBuilder.getI64IntegerAttr(initial.flag)));
+    setOpEngineTypeAttr(set, EngineType::VECTOR);
+  }
+
+  for (const Stage94ReleaseLanePlan &lane : plan->lanes) {
+    hivm::PipeAttr scoreSignaling =
+        stage94PipeForResource(context, lane.scoreSignalingResource);
+    hivm::PipeAttr scoreWaiting =
+        stage94PipeForResource(context, lane.scoreWaitingResource);
+    hivm::PipeAttr productSignaling =
+        stage94PipeForResource(context, lane.productSignalingResource);
+    hivm::PipeAttr productWaiting =
+        stage94PipeForResource(context, lane.productWaitingResource);
+    if (!scoreSignaling || !scoreWaiting || !productSignaling ||
+        !productWaiting)
+      return failure();
+
+    OpBuilder scoreCubeBuilder(lane.scoreCubeDrain);
+    auto scoreWait = scoreCubeBuilder.create<hivm::SyncBlockWaitOp>(
+        loc, cubeCore, scoreSignaling, scoreWaiting,
+        OpFoldResult(
+            scoreCubeBuilder.getI64IntegerAttr(lane.scoreReleaseFlag)));
+    setOpEngineTypeAttr(scoreWait, EngineType::CUBE);
+
+    OpBuilder scoreVectorBuilder(lane.scoreVectorRelease);
+    scoreVectorBuilder.setInsertionPointAfter(lane.scoreVectorRelease);
+    auto scoreSet = scoreVectorBuilder.create<hivm::SyncBlockSetOp>(
+        loc, vectorCore, scoreSignaling, scoreWaiting,
+        OpFoldResult(
+            scoreVectorBuilder.getI64IntegerAttr(lane.scoreReleaseFlag)));
+    setOpEngineTypeAttr(scoreSet, EngineType::VECTOR);
+
+    OpBuilder productCubeBuilder(lane.productCubeDrain);
+    auto productWait = productCubeBuilder.create<hivm::SyncBlockWaitOp>(
+        loc, cubeCore, productSignaling, productWaiting,
+        OpFoldResult(
+            productCubeBuilder.getI64IntegerAttr(lane.productReleaseFlag)));
+    setOpEngineTypeAttr(productWait, EngineType::CUBE);
+
+    OpBuilder productVectorBuilder(lane.productVectorRelease);
+    productVectorBuilder.setInsertionPointAfter(lane.productVectorRelease);
+    auto productSet = productVectorBuilder.create<hivm::SyncBlockSetOp>(
+        loc, vectorCore, productSignaling, productWaiting,
+        OpFoldResult(
+            productVectorBuilder.getI64IntegerAttr(lane.productReleaseFlag)));
+    setOpEngineTypeAttr(productSet, EngineType::VECTOR);
+  }
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-materialized-release-protocol lanes="
+             << plan->lanes.size()
+             << " initial=" << plan->initialSignals.size()
+             << " cube-waits=" << (2 * plan->lanes.size())
+             << " vector-sets=" << (2 * plan->lanes.size())
+             << " legacy-pairs-replaced=1\n");
+  return success();
 }
 
 // Re-tile the VECTOR scope for ROW_SPLIT so both veccores do useful work (2x
 // vector throughput): M/2 rows per veccore, addressed by get_sub_block_idx,
 // matching the target IR. Runs the six steps in order; see each helper.
 static LogicalResult
-retileVectorScopeForRowSplit(scope::ScopeOp vecScope,
+retileVectorScopeForRowSplit(scope::ScopeOp vecScope, scf::ForOp cubeLoop,
+                             scf::ForOp vectorLoop,
                              const CrossScopeTransferInfo &transferInfo,
-                             bool materializeStage94SimdRegions) {
+                             bool materializeStage94SimdRegions,
+                             const PostCVSplitDetachedSchedule *
+                                 stage94DetachedSchedule) {
   Location loc = vecScope.getLoc();
   MLIRContext *ctx = vecScope.getContext();
   auto ubAddrSpace = hivm::AddressSpaceAttr::get(ctx, hivm::AddressSpace::UB);
@@ -1955,6 +2300,12 @@ retileVectorScopeForRowSplit(scope::ScopeOp vecScope,
     return failure();
   if (failed(rebuildVectorToCubePacks(packs, sbidx, ubAddrSpace, loc)))
     return failure();
+  if (materializeStage94SimdRegions &&
+      (!stage94DetachedSchedule ||
+       failed(materializeStage94ReleaseProtocol(
+           cubeLoop, vectorLoop, packs, transferInfo,
+           *stage94DetachedSchedule))))
+    return failure();
 
   LLVM_DEBUG(llvm::dbgs() << "[cv-split]   ROW_SPLIT re-tile (BLOCK_M="
                           << blockM << " -> " << (blockM / 2)
@@ -1969,7 +2320,9 @@ retileVectorScopeForRowSplit(scope::ScopeOp vecScope,
 LogicalResult
 createScopeSeparation(func::FuncOp funcOp, scf::ForOp innerLoop,
                       const CrossScopeTransferInfo &transferInfo,
-                      bool materializeStage94SimdRegions) {
+                      bool materializeStage94SimdRegions,
+                      const PostCVSplitDetachedSchedule *
+                          stage94DetachedSchedule) {
 
   MLIRContext *ctx = funcOp.getContext();
   Location loc = innerLoop.getLoc();
@@ -2118,7 +2471,8 @@ createScopeSeparation(func::FuncOp funcOp, scf::ForOp innerLoop,
   // Step 7: ROW_SPLIT re-tile of the VECTOR scope (BLOCK_M/2 rows per veccore,
   // both veccores active). Replaces the single-veccore NO_DUAL guard.
   if (failed(retileVectorScopeForRowSplit(
-          vecScope, transferInfo, materializeStage94SimdRegions)))
+          vecScope, cubeLoop, innerLoop, transferInfo,
+          materializeStage94SimdRegions, stage94DetachedSchedule)))
     return failure();
 
   LLVM_DEBUG(
