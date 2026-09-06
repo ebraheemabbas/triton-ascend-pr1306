@@ -1859,7 +1859,8 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane,
 }
 
 static LogicalResult materializeStage94GroupedRecurrence(
-    ArrayRef<Stage94OnlineSoftmaxLane> lanes) {
+    ArrayRef<Stage94OnlineSoftmaxLane> lanes,
+    Operation *&groupedAlphaScope) {
   if (lanes.empty())
     return failure();
 
@@ -2012,11 +2013,13 @@ static LogicalResult materializeStage94GroupedRecurrence(
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-materialized-grouped-recurrence lanes="
              << lanes.size() << " alpha-scope=yes affine-tree=yes\n");
+  groupedAlphaScope = alphaScope;
   return success();
 }
 
 static LogicalResult
-outlineStage94VectorRegions(MutableArrayRef<VectorToCubePack> packs) {
+outlineStage94VectorRegions(MutableArrayRef<VectorToCubePack> packs,
+                            Operation *&groupedAlphaScope) {
   SmallVector<Stage94OnlineSoftmaxLane> lanes;
   lanes.reserve(packs.size());
   for (auto [lane, pack] : llvm::enumerate(packs)) {
@@ -2029,7 +2032,7 @@ outlineStage94VectorRegions(MutableArrayRef<VectorToCubePack> packs) {
     pack.scoreReleaseAnchor = result->scoreReleaseAnchor;
     lanes.push_back(*result);
   }
-  return materializeStage94GroupedRecurrence(lanes);
+  return materializeStage94GroupedRecurrence(lanes, groupedAlphaScope);
 }
 
 static FailureOr<Stage94OwnershipPlan> buildStage94OwnershipPlan(
@@ -2467,6 +2470,42 @@ static LogicalResult materializeStage94ReleaseProtocol(
   return success();
 }
 
+static LogicalResult orderStage94GroupedAlphaBeforeProductWait(
+    scf::ForOp vectorLoop, Operation *groupedAlphaScope,
+    const PostCVSplitDetachedSchedule &schedule) {
+  const PostCVSplitDetachedCommand *firstProductWait = nullptr;
+  for (const PostCVSplitDetachedCommand &command : schedule.vectorCommands) {
+    if (command.kind == PostCVSplitDetachedCommandKind::ProductWait) {
+      firstProductWait = &command;
+      break;
+    }
+  }
+  if (!groupedAlphaScope || !firstProductWait ||
+      !firstProductWait->hasEvent ||
+      groupedAlphaScope->getBlock() != vectorLoop.getBody())
+    return failure();
+
+  Operation *waitOperation = nullptr;
+  for (Operation &operation : *vectorLoop.getBody()) {
+    auto wait = dyn_cast<hivm::SyncBlockWaitOp>(&operation);
+    if (!wait ||
+        getStage94StaticFlag(wait) != firstProductWait->logicalFlagId)
+      continue;
+    if (waitOperation)
+      return failure();
+    waitOperation = wait;
+  }
+  if (!waitOperation)
+    return failure();
+  bool moved = waitOperation->isBeforeInBlock(groupedAlphaScope);
+  if (moved)
+    groupedAlphaScope->moveBefore(waitOperation);
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-ordered-grouped-alpha-before-product-wait"
+             << " moved=" << (moved ? "yes" : "no") << "\n");
+  return success();
+}
+
 static LogicalResult orderStage94CubeDrainClusters(
     scf::ForOp cubeLoop, const PostCVSplitDetachedSchedule &schedule) {
   DenseMap<unsigned, unsigned> ordinalByForwardFlag;
@@ -2562,13 +2601,14 @@ retileVectorScopeForRowSplit(scope::ScopeOp vecScope, scf::ForOp cubeLoop,
 
   SmallVector<VectorToCubePack> packs =
       detachVectorToCubePacks(vecScope, transferInfo.vectorToCubeChains);
+  Operation *groupedAlphaScope = nullptr;
 
   Value sbidx = emitSubBlockIndex(vecScope, loc);
   unsigned clonedCount = cloneExternalInitsAsHalfHeight(vecScope, loc, blockM);
   if (failed(retileVectorScopeOps(vecScope, blockM)))
     return failure();
   if (materializeStage94SimdRegions &&
-      failed(outlineStage94VectorRegions(packs)))
+      failed(outlineStage94VectorRegions(packs, groupedAlphaScope)))
     return failure();
   FailureOr<unsigned> nStores =
       retileOutputStores(vecScope, sbidx, loc, blockM);
@@ -2583,6 +2623,8 @@ retileVectorScopeForRowSplit(scope::ScopeOp vecScope, scf::ForOp cubeLoop,
        failed(materializeStage94ReleaseProtocol(
            cubeLoop, vectorLoop, packs, transferInfo,
            *stage94DetachedSchedule)) ||
+       failed(orderStage94GroupedAlphaBeforeProductWait(
+           vectorLoop, groupedAlphaScope, *stage94DetachedSchedule)) ||
        failed(orderStage94CubeDrainClusters(cubeLoop,
                                             *stage94DetachedSchedule))))
     return failure();

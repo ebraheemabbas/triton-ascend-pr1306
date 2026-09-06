@@ -214,7 +214,7 @@ def test_grouped_recurrence_replaces_alpha_and_final_denominator_atomically() ->
         assert token in grouped
     outline = source.split("outlineStage94VectorRegions", 1)[1]
     assert "SmallVector<Stage94OnlineSoftmaxLane> lanes" in outline
-    assert "return materializeStage94GroupedRecurrence(lanes);" in outline
+    assert "return materializeStage94GroupedRecurrence(lanes, groupedAlphaScope);" in outline
 
 
 def test_release_protocol_is_driven_by_detached_schedule_roles_and_slots() -> None:
@@ -309,6 +309,25 @@ def test_cube_drain_clusters_follow_detached_command_order() -> None:
         "orderStage94CubeDrainClusters(")
 
 
+def test_grouped_alpha_precedes_the_first_planned_product_wait() -> None:
+    source = read(LIB / "ScopeSeparation.cpp")
+    ordering = source.split("orderStage94GroupedAlphaBeforeProductWait", 1)[1]
+    ordering = ordering.split("orderStage94CubeDrainClusters", 1)[0]
+    for token in (
+            "schedule.vectorCommands",
+            "PostCVSplitDetachedCommandKind::ProductWait",
+            "firstProductWait->logicalFlagId",
+            "waitOperation->isBeforeInBlock(groupedAlphaScope)",
+            "groupedAlphaScope->moveBefore(waitOperation)",
+            "stage94-ordered-grouped-alpha-before-product-wait",
+    ):
+        assert token in ordering
+    assert "logicalFlagId == 8" not in ordering
+    retile = source.split("retileVectorScopeForRowSplit", 2)[2]
+    assert retile.index("materializeStage94ReleaseProtocol(") < retile.index(
+        "orderStage94GroupedAlphaBeforeProductWait(")
+
+
 if __name__ == "__main__":
     test_forced_option_is_default_off_and_atomic()
     test_materializer_outlines_all_probability_regions()
@@ -325,4 +344,5 @@ if __name__ == "__main__":
     test_release_protocol_is_driven_by_detached_schedule_roles_and_slots()
     test_buffer_ownership_is_rematerialized_by_role_and_plan_slot()
     test_cube_drain_clusters_follow_detached_command_order()
+    test_grouped_alpha_precedes_the_first_planned_product_wait()
     print("Stage 9.4b/c atomic materialization source contract: PASS")
