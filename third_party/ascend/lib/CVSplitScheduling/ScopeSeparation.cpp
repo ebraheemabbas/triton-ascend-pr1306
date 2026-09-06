@@ -2467,6 +2467,84 @@ static LogicalResult materializeStage94ReleaseProtocol(
   return success();
 }
 
+static LogicalResult orderStage94CubeDrainClusters(
+    scf::ForOp cubeLoop, const PostCVSplitDetachedSchedule &schedule) {
+  DenseMap<unsigned, unsigned> ordinalByForwardFlag;
+  for (auto [ordinal, command] : llvm::enumerate(schedule.cubeCommands)) {
+    if (!command.hasEvent ||
+        (command.kind != PostCVSplitDetachedCommandKind::ScorePublish &&
+         command.kind != PostCVSplitDetachedCommandKind::ProductPublish))
+      continue;
+    if (!ordinalByForwardFlag
+             .try_emplace(command.logicalFlagId,
+                          static_cast<unsigned>(ordinal))
+             .second)
+      return failure();
+  }
+
+  struct DrainGroup {
+    Operation *releaseWait;
+    Operation *drain;
+    Operation *publish;
+    unsigned ordinal;
+  };
+  SmallVector<DrainGroup> groups;
+  for (Operation &operation : *cubeLoop.getBody()) {
+    auto publish = dyn_cast<hivm::SyncBlockSetOp>(&operation);
+    if (!publish)
+      continue;
+    std::optional<unsigned> flag = getStage94StaticFlag(publish);
+    if (!flag || !ordinalByForwardFlag.contains(*flag))
+      continue;
+    Operation *drain = publish->getPrevNode();
+    Operation *releaseWait = drain ? drain->getPrevNode() : nullptr;
+    if (!isa_and_nonnull<hivm::FixpipeOp>(drain) ||
+        !isa_and_nonnull<hivm::SyncBlockWaitOp>(releaseWait))
+      return failure();
+    groups.push_back(
+        {releaseWait, drain, publish, ordinalByForwardFlag.lookup(*flag)});
+  }
+  if (groups.size() != 2 * schedule.logicalLaneCount)
+    return failure();
+
+  unsigned reorderedClusters = 0;
+  for (size_t begin = 0; begin < groups.size();) {
+    size_t end = begin + 1;
+    while (end < groups.size() &&
+           groups[end - 1].publish->getNextNode() ==
+               groups[end].releaseWait)
+      ++end;
+    if (end - begin > 1) {
+      SmallVector<DrainGroup> ordered(groups.begin() + begin,
+                                      groups.begin() + end);
+      llvm::sort(ordered, [](const DrainGroup &left, const DrainGroup &right) {
+        return left.ordinal < right.ordinal;
+      });
+      bool changed = false;
+      for (size_t index = 0; index < ordered.size(); ++index)
+        changed |= ordered[index].publish != groups[begin + index].publish;
+      if (changed) {
+        Operation *afterCluster = groups[end - 1].publish->getNextNode();
+        if (!afterCluster)
+          return failure();
+        for (const DrainGroup &group : ordered) {
+          group.releaseWait->moveBefore(afterCluster);
+          group.drain->moveBefore(afterCluster);
+          group.publish->moveBefore(afterCluster);
+        }
+        ++reorderedClusters;
+      }
+    }
+    begin = end;
+  }
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-ordered-cube-drain-clusters groups="
+             << groups.size() << " reordered=" << reorderedClusters
+             << "\n");
+  return success();
+}
+
 // Re-tile the VECTOR scope for ROW_SPLIT so both veccores do useful work (2x
 // vector throughput): M/2 rows per veccore, addressed by get_sub_block_idx,
 // matching the target IR. Runs the six steps in order; see each helper.
@@ -2504,7 +2582,9 @@ retileVectorScopeForRowSplit(scope::ScopeOp vecScope, scf::ForOp cubeLoop,
            cubeLoop, vectorLoop, transferInfo, *stage94DetachedSchedule)) ||
        failed(materializeStage94ReleaseProtocol(
            cubeLoop, vectorLoop, packs, transferInfo,
-           *stage94DetachedSchedule))))
+           *stage94DetachedSchedule)) ||
+       failed(orderStage94CubeDrainClusters(cubeLoop,
+                                            *stage94DetachedSchedule))))
     return failure();
 
   LLVM_DEBUG(llvm::dbgs() << "[cv-split]   ROW_SPLIT re-tile (BLOCK_M="

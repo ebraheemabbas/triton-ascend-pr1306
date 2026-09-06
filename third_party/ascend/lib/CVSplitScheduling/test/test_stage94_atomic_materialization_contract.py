@@ -285,6 +285,30 @@ def test_buffer_ownership_is_rematerialized_by_role_and_plan_slot() -> None:
         "materializeStage94ReleaseProtocol(")
 
 
+def test_cube_drain_clusters_follow_detached_command_order() -> None:
+    source = read(LIB / "ScopeSeparation.cpp")
+    ordering = source.split("orderStage94CubeDrainClusters", 1)[1]
+    ordering = ordering.split("retileVectorScopeForRowSplit", 1)[0]
+    for token in (
+            "llvm::enumerate(schedule.cubeCommands)",
+            "PostCVSplitDetachedCommandKind::ScorePublish",
+            "PostCVSplitDetachedCommandKind::ProductPublish",
+            "ordinalByForwardFlag",
+            "groups[end - 1].publish->getNextNode()",
+            "left.ordinal < right.ordinal",
+            "group.releaseWait->moveBefore(afterCluster)",
+            "group.drain->moveBefore(afterCluster)",
+            "group.publish->moveBefore(afterCluster)",
+            "stage94-ordered-cube-drain-clusters",
+    ):
+        assert token in ordering
+    for forbidden in ("lane == 2", "lane == 3", "flag == 10", "flag == 11"):
+        assert forbidden not in ordering
+    retile = source.split("retileVectorScopeForRowSplit", 2)[2]
+    assert retile.index("materializeStage94ReleaseProtocol(") < retile.index(
+        "orderStage94CubeDrainClusters(")
+
+
 if __name__ == "__main__":
     test_forced_option_is_default_off_and_atomic()
     test_materializer_outlines_all_probability_regions()
@@ -300,4 +324,5 @@ if __name__ == "__main__":
     test_grouped_recurrence_replaces_alpha_and_final_denominator_atomically()
     test_release_protocol_is_driven_by_detached_schedule_roles_and_slots()
     test_buffer_ownership_is_rematerialized_by_role_and_plan_slot()
+    test_cube_drain_clusters_follow_detached_command_order()
     print("Stage 9.4b/c atomic materialization source contract: PASS")
