@@ -1212,7 +1212,8 @@ struct Stage94OnlineSoftmaxLane {
 };
 
 static FailureOr<Stage94OnlineSoftmaxLane>
-materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
+materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane,
+                                      bool deferLaneSum) {
   Operation *probabilityProducer = pack.pSrc.getDefiningOp();
   Operation *anchor = pack.anchor;
   auto probabilityType = dyn_cast<RankedTensorType>(pack.pSrc.getType());
@@ -1427,7 +1428,11 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
       createLoopStorage(builder, scaledType, "stage94.scaled-rows");
   Value packedRowsInit =
       createLoopStorage(builder, packedType, "stage94.packed-rows");
-  SmallVector<Type> scopeResults{maximumType, maximumType, packedType};
+  SmallVector<Type> scopeResults;
+  if (deferLaneSum)
+    scopeResults.append({scaledType, maximumType, packedType});
+  else
+    scopeResults.append({maximumType, maximumType, packedType});
   auto simdScope = builder.create<scope::ScopeOp>(loc, scopeResults);
   simdScope.getBodyRegion().emplaceBlock();
   simdScope.setNoInline(true);
@@ -1568,9 +1573,9 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   auto syncToken = b.create<arith::ConstantIntOp>(loc, 0, 64);
   auto syncMark = b.create<annotation::MarkOp>(loc, syncToken.getResult());
   syncMark->setAttr("SYNC_IN_VF", StringAttr::get(context, "VST_VLD"));
+  Value expRowsInit = deferLaneSum ? maxLoop.getResult(1) : sumRowsInit;
   auto expLoop = b.create<scf::ForOp>(
-      loc, lower, upper, step,
-      ValueRange{sumRowsInit, packedRowsInit});
+      loc, lower, upper, step, ValueRange{expRowsInit, packedRowsInit});
   Block *expBody = expLoop.getBody();
   if (!expBody->empty())
     expBody->back().erase();
@@ -1586,15 +1591,19 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
       loc, maximumRow, broadcastInit, ArrayRef<int64_t>{1});
   Value maximumBroadcast = maximumBroadcastOp->getResult(0);
   Value sumChunks;
+  Value expRows = expLoop.getRegionIterArgs()[0];
   Value packedRows = expLoop.getRegionIterArgs()[1];
   for (int64_t chunk = 0; chunk < width; chunk += chunkWidth) {
     Value scaled = extractRowChunk(eb, maxLoop.getResult(1), chunk, f32);
     Value shifted = eb.create<arith::SubFOp>(loc, scaled, maximumBroadcast);
     Value exponential = eb.create<math::ExpOp>(loc, shifted);
-    sumChunks = sumChunks
-                    ? eb.create<arith::AddFOp>(loc, sumChunks, exponential)
-                          .getResult()
-                    : exponential;
+    if (deferLaneSum)
+      expRows = insertRowChunk(eb, exponential, expRows, chunk);
+    else
+      sumChunks = sumChunks
+                      ? eb.create<arith::AddFOp>(loc, sumChunks, exponential)
+                            .getResult()
+                      : exponential;
     auto shapeType = RankedTensorType::get({3}, b.getI64Type());
     auto shape = eb.create<arith::ConstantOp>(
         loc, shapeType,
@@ -1618,31 +1627,102 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
     packedRows = eb.create<tensor::InsertSliceOp>(
         loc, packedChunk, packedRows, offsets, sizes, strides);
   }
-  FailureOr<Value> sumInit = createReductionInit(eb, sumReduce, rowScalarType);
-  if (failed(sumInit))
-    return failure();
-  IRMapping sumMapping;
-  sumMapping.map(sumReduce.getDpsInputs()[0], sumChunks);
-  sumMapping.map(sumReduce.getDpsInits()[0], *sumInit);
-  Operation *sumClone = eb.clone(*sumReduce, sumMapping);
-  sumClone->getResult(0).setType(rowScalarType);
-  Value sumRows = eb.create<tensor::InsertSliceOp>(
-      loc, sumClone->getResult(0), expLoop.getRegionIterArgs()[0],
-      SmallVector<OpFoldResult>{row}, scalarSize, scalarStride);
-  eb.create<scf::YieldOp>(loc, ValueRange{sumRows, packedRows});
+  if (!deferLaneSum) {
+    FailureOr<Value> sumInit =
+        createReductionInit(eb, sumReduce, rowScalarType);
+    if (failed(sumInit))
+      return failure();
+    IRMapping sumMapping;
+    sumMapping.map(sumReduce.getDpsInputs()[0], sumChunks);
+    sumMapping.map(sumReduce.getDpsInits()[0], *sumInit);
+    Operation *sumClone = eb.clone(*sumReduce, sumMapping);
+    sumClone->getResult(0).setType(rowScalarType);
+    expRows = eb.create<tensor::InsertSliceOp>(
+        loc, sumClone->getResult(0), expRows,
+        SmallVector<OpFoldResult>{row}, scalarSize, scalarStride);
+  }
+  eb.create<scf::YieldOp>(loc, ValueRange{expRows, packedRows});
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=exp-pack-loop-created\n");
 
-  b.create<scope::ReturnOp>(
-      loc, ValueRange{maximum, expLoop.getResult(0), expLoop.getResult(1)});
+  if (deferLaneSum)
+    b.create<scope::ReturnOp>(
+        loc, ValueRange{expLoop.getResult(0), maximum, expLoop.getResult(1)});
+  else
+    b.create<scope::ReturnOp>(
+        loc, ValueRange{maximum, expLoop.getResult(0), expLoop.getResult(1)});
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-build-progress lane=" << lane
              << " checkpoint=scope-return-created\n");
 
+  Value materializedMaximum =
+      simdScope->getResult(deferLaneSum ? 1 : 0);
+  Value materializedSum = simdScope->getResult(1);
+  if (deferLaneSum) {
+    OpBuilder deferredBuilder(anchor);
+    deferredBuilder.setInsertionPointAfter(anchor);
+    auto deferredScope =
+        deferredBuilder.create<scope::ScopeOp>(loc, TypeRange{maximumType});
+    deferredScope.getBodyRegion().emplaceBlock();
+    deferredScope.setNoInline(true);
+    deferredScope->setAttr("noinline", UnitAttr::get(context));
+    deferredScope->setAttr("outline", BoolAttr::get(context, true));
+    deferredScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
+    setOpEngineTypeAttr(deferredScope, EngineType::VECTOR);
+
+    OpBuilder db =
+        OpBuilder::atBlockEnd(&deferredScope.getBodyRegion().front());
+    Value deferredLower = db.create<arith::ConstantIntOp>(loc, 0, 32);
+    Value deferredUpper = db.create<arith::ConstantIntOp>(loc, rows, 32);
+    Value deferredStep = db.create<arith::ConstantIntOp>(loc, 1, 32);
+    auto deferredLoop = db.create<scf::ForOp>(
+        loc, deferredLower, deferredUpper, deferredStep,
+        ValueRange{sumRowsInit});
+    Block *deferredBody = deferredLoop.getBody();
+    if (!deferredBody->empty())
+      deferredBody->back().erase();
+    OpBuilder rb = OpBuilder::atBlockEnd(deferredBody);
+    Value deferredRow = rb.create<arith::IndexCastOp>(
+        loc, rb.getIndexType(), deferredLoop.getInductionVar());
+    Value deferredChunks;
+    for (int64_t chunk = 0; chunk < width; chunk += chunkWidth) {
+      SmallVector<OpFoldResult> offsets{deferredRow,
+                                        rb.getIndexAttr(chunk)};
+      SmallVector<OpFoldResult> sizes{rb.getIndexAttr(1),
+                                      rb.getIndexAttr(chunkWidth)};
+      SmallVector<OpFoldResult> strides{rb.getIndexAttr(1),
+                                        rb.getIndexAttr(1)};
+      Value probabilityChunk = rb.create<tensor::ExtractSliceOp>(
+          loc, rowVectorType, simdScope->getResult(0), offsets, sizes,
+          strides);
+      deferredChunks =
+          deferredChunks
+              ? rb.create<arith::AddFOp>(loc, deferredChunks,
+                                         probabilityChunk)
+                    .getResult()
+              : probabilityChunk;
+    }
+    FailureOr<Value> deferredInit =
+        createReductionInit(rb, sumReduce, rowScalarType);
+    if (failed(deferredInit))
+      return failure();
+    IRMapping deferredMapping;
+    deferredMapping.map(sumReduce.getDpsInputs()[0], deferredChunks);
+    deferredMapping.map(sumReduce.getDpsInits()[0], *deferredInit);
+    Operation *deferredClone = rb.clone(*sumReduce, deferredMapping);
+    deferredClone->getResult(0).setType(rowScalarType);
+    Value deferredRows = rb.create<tensor::InsertSliceOp>(
+        loc, deferredClone->getResult(0), deferredLoop.getRegionIterArgs()[0],
+        SmallVector<OpFoldResult>{deferredRow}, scalarSize, scalarStride);
+    rb.create<scf::YieldOp>(loc, ValueRange{deferredRows});
+    db.create<scope::ReturnOp>(loc, deferredLoop.getResult(0));
+    materializedSum = deferredScope->getResult(0);
+  }
+
   SmallVector<std::pair<Value, Value>> replacements{
-      {newMaximum.getResult(), simdScope->getResult(0)},
-      {sumReduce.getResult(0), simdScope->getResult(1)}};
+      {newMaximum.getResult(), materializedMaximum},
+      {sumReduce.getResult(0), materializedSum}};
   for (auto [oldValue, replacement] : replacements) {
     SmallVector<OpOperand *> outsideUses;
     for (OpOperand &use : oldValue.getUses())
@@ -1658,12 +1738,14 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
              << "[cv-split] stage94-materialized-online-softmax lane=" << lane
              << " rows=" << rows << " chunk-width=" << chunkWidth
              << " chunks=" << (width / chunkWidth)
-             << " direct-nz=yes publication=detached\n");
+             << " direct-nz=yes sum="
+             << (deferLaneSum ? "deferred" : "inline")
+             << " publication=detached\n");
   return Stage94OnlineSoftmaxLane{
       oldMaximum,
       oldDenominator,
-      simdScope->getResult(0),
-      simdScope->getResult(1),
+      materializedMaximum,
+      materializedSum,
       simdScope->getResult(2),
       alphaSub,
       alpha,
@@ -1835,7 +1917,8 @@ outlineStage94VectorRegions(MutableArrayRef<VectorToCubePack> packs) {
   lanes.reserve(packs.size());
   for (auto [lane, pack] : llvm::enumerate(packs)) {
     FailureOr<Stage94OnlineSoftmaxLane> result =
-        materializeStage94OnlineSoftmaxRegion(pack, lane);
+        materializeStage94OnlineSoftmaxRegion(
+            pack, lane, lane + 1 == packs.size());
     if (failed(result))
       return failure();
     pack.pSrc = result->packedProbability;

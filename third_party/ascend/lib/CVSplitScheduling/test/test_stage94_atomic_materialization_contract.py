@@ -141,14 +141,23 @@ def test_direct_nz_pack_reshapes_f32_before_truncation() -> None:
     assert "packedChunkType, packedFloatChunk" in online
 
 
-def test_lane_scope_returns_only_maximum_sum_and_packed_probability() -> None:
+def test_lane_scope_defers_only_the_last_logical_lane_sum() -> None:
     source = read(LIB / "ScopeSeparation.cpp")
     online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
     assert "struct Stage94OnlineSoftmaxLane" in source
-    result_types = "SmallVector<Type> scopeResults{maximumType, maximumType, packedType};"
-    returned = "ValueRange{maximum, expLoop.getResult(0), expLoop.getResult(1)}"
-    assert result_types in online
-    assert returned in online
+    for token in (
+            "bool deferLaneSum",
+            "deferLaneSum ? maxLoop.getResult(1) : sumRowsInit",
+            "if (deferLaneSum)",
+            "simdScope->getResult(deferLaneSum ? 1 : 0)",
+            "deferredBuilder.setInsertionPointAfter(anchor)",
+            "deferredScope",
+            "deferredLoop",
+            'deferLaneSum ? "deferred" : "inline"',
+    ):
+        assert token in online
+    assert "ValueRange{expLoop.getResult(0), maximum, expLoop.getResult(1)}" in online
+    assert "ValueRange{maximum, expLoop.getResult(0), expLoop.getResult(1)}" in online
     scope = online.index("builder.create<scope::ScopeOp>")
     assert scope < online.index("simdScope.setNoInline(true)")
     assert online.index("simdScope.setNoInline(true)") < online.index(
@@ -162,6 +171,8 @@ def test_lane_scope_returns_only_maximum_sum_and_packed_probability() -> None:
     assert "sumReduce.getResult(0)" in replacements
     assert "newDenominator.getResult()" not in replacements
     assert "alpha.getResult()" not in replacements
+    outline = source.split("outlineStage94VectorRegions", 1)[1]
+    assert "lane + 1 == packs.size()" in outline
 
 
 def test_grouped_recurrence_is_lane_count_driven_and_balanced() -> None:
@@ -215,7 +226,7 @@ if __name__ == "__main__":
     test_online_softmax_marks_the_inter_loop_vector_dependency()
     test_final_maximum_preserves_original_tensor_semantics()
     test_direct_nz_pack_reshapes_f32_before_truncation()
-    test_lane_scope_returns_only_maximum_sum_and_packed_probability()
+    test_lane_scope_defers_only_the_last_logical_lane_sum()
     test_grouped_recurrence_is_lane_count_driven_and_balanced()
     test_grouped_recurrence_replaces_alpha_and_final_denominator_atomically()
     print("Stage 9.4b/c atomic materialization source contract: PASS")
