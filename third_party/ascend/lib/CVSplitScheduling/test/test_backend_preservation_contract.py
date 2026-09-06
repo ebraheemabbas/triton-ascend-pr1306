@@ -30,11 +30,16 @@ def test_preservation_overrides_conflicting_user_policy() -> None:
     auto_bind = backend.split("def get_auto_bind_sub_block_option", 1)[1]
     auto_bind = auto_bind.split("def get_graph_sync_solver_option", 1)[0]
     graph_sync = backend.split("def get_graph_sync_solver_option", 1)[1]
-    graph_sync = graph_sync.split("def _save_npuir_debug_output", 1)[0]
+    graph_sync = graph_sync.split("def get_mixed_cv_option", 1)[0]
+    mixed_cv = backend.split("def get_mixed_cv_option", 1)[1]
+    mixed_cv = mixed_cv.split("def _save_npuir_debug_output", 1)[0]
     assert "_preserves_explicit_cv_split_schedule(metadata)" in auto_bind
     assert "return False" in auto_bind
     assert "_preserves_explicit_cv_split_schedule(metadata)" in graph_sync
     assert "return True" in graph_sync
+    assert "_preserves_explicit_cv_split_schedule(metadata)" in mixed_cv
+    assert "return None" in mixed_cv
+    assert "enable_mixed_cv = get_mixed_cv_option(metadata)" in backend
     assert backend.count(
         "sync_solver = get_graph_sync_solver_option(metadata)") == 2
 
@@ -45,6 +50,7 @@ def test_option_helper_semantics() -> None:
         "_preserves_explicit_cv_split_schedule",
         "get_auto_bind_sub_block_option",
         "get_graph_sync_solver_option",
+        "get_mixed_cv_option",
     }
     functions = [node for node in tree.body
                  if isinstance(node, ast.FunctionDef) and node.name in names]
@@ -57,12 +63,15 @@ def test_option_helper_semantics() -> None:
         "auto_tile_and_bind_subblock": False,
         "enable_auto_bind_sub_block": True,
         "sync_solver": False,
+        "enable_mixed_cv": True,
     }
     assert namespace["get_auto_bind_sub_block_option"](metadata) is True
     assert namespace["get_graph_sync_solver_option"](metadata) is False
+    assert namespace["get_mixed_cv_option"](metadata) is True
     metadata["cv_split_preserve_explicit_schedule"] = True
     assert namespace["get_auto_bind_sub_block_option"](metadata) is False
     assert namespace["get_graph_sync_solver_option"](metadata) is True
+    assert namespace["get_mixed_cv_option"](metadata) is None
 
 
 def test_preservation_is_emitted_only_by_stage94_atomic_publication() -> None:

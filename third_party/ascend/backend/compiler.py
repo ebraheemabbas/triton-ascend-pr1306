@@ -643,6 +643,12 @@ def get_graph_sync_solver_option(metadata):
     return metadata["sync_solver"]
 
 
+def get_mixed_cv_option(metadata):
+    if _preserves_explicit_cv_split_schedule(metadata):
+        return None
+    return metadata["enable_mixed_cv"]
+
+
 def _save_npuir_debug_output(stdout_bytes: bytes, stderr_bytes: bytes, tmpdir: str, metadata_hash: str):
     stdout = stdout_bytes.decode('utf-8') if stdout_bytes else ''
     stderr = stderr_bytes.decode('utf-8') if stderr_bytes else ''
@@ -801,7 +807,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += \
                 [f"--limit-auto-multi-buffer-buffer={auto_multi_buffer_buffer}"]
 
-        enable_mixed_cv = metadata["enable_mixed_cv"]
+        enable_mixed_cv = get_mixed_cv_option(metadata)
         if enable_mixed_cv is not None:
             _compile_option_list += \
                 [f"--enable-mixed-cv={enable_mixed_cv}"]
