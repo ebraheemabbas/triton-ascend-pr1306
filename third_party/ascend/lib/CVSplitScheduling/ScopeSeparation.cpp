@@ -514,6 +514,24 @@ struct Stage94ReleaseProtocolPlan {
   Operation *legacyVectorSet = nullptr;
 };
 
+struct Stage94OwnershipLanePlan {
+  PostCVSplitLineageRole role = PostCVSplitLineageRole::Score;
+  unsigned lane = 0;
+  unsigned slot = 0;
+  Value oldBuffer;
+  Operation *cubeDrain = nullptr;
+  Operation *vectorCast = nullptr;
+};
+
+struct Stage94OwnershipPlan {
+  SmallVector<Stage94OwnershipLanePlan> lanes;
+  SmallVector<Value> oldBuffers;
+  MemRefType scoreBufferType;
+  MemRefType productBufferType;
+  unsigned scoreSlotCount = 0;
+  unsigned productSlotCount = 0;
+};
+
 static std::optional<unsigned> getStage94StaticFlag(Operation *operation) {
   std::optional<IntegerAttr> flag;
   if (auto set = dyn_cast<hivm::SyncBlockSetOp>(operation))
@@ -530,6 +548,16 @@ static const PostCVSplitDetachedCommand *findStage94Command(
     PostCVSplitDetachedCommandKind kind, unsigned lane) {
   auto command = llvm::find_if(commands, [&](const auto &candidate) {
     return candidate.kind == kind && candidate.lane == lane;
+  });
+  return command == commands.end() ? nullptr : &*command;
+}
+
+static const PostCVSplitDetachedCommand *findStage94CommandByFlag(
+    ArrayRef<PostCVSplitDetachedCommand> commands,
+    PostCVSplitDetachedCommandKind kind, unsigned flag) {
+  auto command = llvm::find_if(commands, [&](const auto &candidate) {
+    return candidate.kind == kind && candidate.hasEvent &&
+           candidate.logicalFlagId == flag;
   });
   return command == commands.end() ? nullptr : &*command;
 }
@@ -2004,6 +2032,176 @@ outlineStage94VectorRegions(MutableArrayRef<VectorToCubePack> packs) {
   return materializeStage94GroupedRecurrence(lanes);
 }
 
+static FailureOr<Stage94OwnershipPlan> buildStage94OwnershipPlan(
+    scf::ForOp cubeLoop, scf::ForOp vectorLoop,
+    const CrossScopeTransferInfo &transferInfo,
+    const PostCVSplitDetachedSchedule &schedule) {
+  if (schedule.status != PostCVSplitDetachedScheduleStatus::Ready ||
+      !schedule.verified || schedule.logicalLaneCount == 0 ||
+      transferInfo.cubeToVectorChains.size() !=
+          2 * schedule.logicalLaneCount)
+    return failure();
+
+  auto findCubeDrain = [&](unsigned forwardFlag) -> Operation * {
+    Operation *drain = nullptr;
+    for (Operation &operation : *cubeLoop.getBody()) {
+      auto set = dyn_cast<hivm::SyncBlockSetOp>(&operation);
+      if (!set || getStage94StaticFlag(set) != forwardFlag)
+        continue;
+      if (drain || !isa_and_nonnull<hivm::FixpipeOp>(set->getPrevNode()))
+        return nullptr;
+      drain = set->getPrevNode();
+    }
+    return drain;
+  };
+
+  Stage94OwnershipPlan plan;
+  DenseSet<Value> oldBufferSet;
+  DenseSet<unsigned> scoreLanes;
+  DenseSet<unsigned> productLanes;
+  for (const CubeToVectorTransferChain &chain :
+       transferInfo.cubeToVectorChains) {
+    if (!chain.wait || chain.wait->getBlock() != vectorLoop.getBody() ||
+        chain.forwardFlagId < 0)
+      return failure();
+    unsigned forwardFlag = static_cast<unsigned>(chain.forwardFlagId);
+    const PostCVSplitDetachedCommand *publish = findStage94CommandByFlag(
+        schedule.cubeCommands, PostCVSplitDetachedCommandKind::ScorePublish,
+        forwardFlag);
+    PostCVSplitLineageRole role = PostCVSplitLineageRole::Score;
+    if (!publish) {
+      publish = findStage94CommandByFlag(
+          schedule.cubeCommands,
+          PostCVSplitDetachedCommandKind::ProductPublish, forwardFlag);
+      role = PostCVSplitLineageRole::Product;
+    }
+    if (!publish || publish->lane >= schedule.logicalLaneCount)
+      return failure();
+    DenseSet<unsigned> &seen = role == PostCVSplitLineageRole::Score
+                                   ? scoreLanes
+                                   : productLanes;
+    if (!seen.insert(publish->lane).second)
+      return failure();
+
+    Operation *toTensor = chain.transferredValue.getDefiningOp();
+    if (!toTensor || !isa<bufferization::ToTensorOp>(toTensor) ||
+        toTensor->getNumOperands() != 1)
+      return failure();
+    Operation *vectorCast = toTensor->getOperand(0).getDefiningOp();
+    if (!vectorCast || !isa<memref::MemorySpaceCastOp>(vectorCast) ||
+        vectorCast->getNumOperands() != 1)
+      return failure();
+    Value oldBuffer = vectorCast->getOperand(0);
+    auto bufferType = dyn_cast<MemRefType>(oldBuffer.getType());
+    Operation *cubeDrain = findCubeDrain(forwardFlag);
+    if (!bufferType || !cubeDrain ||
+        !llvm::is_contained(cubeDrain->getOperands(), oldBuffer))
+      return failure();
+
+    MemRefType &roleType = role == PostCVSplitLineageRole::Score
+                               ? plan.scoreBufferType
+                               : plan.productBufferType;
+    unsigned &slotCount = role == PostCVSplitLineageRole::Score
+                              ? plan.scoreSlotCount
+                              : plan.productSlotCount;
+    if (roleType && roleType != bufferType)
+      return failure();
+    roleType = bufferType;
+    slotCount = std::max(slotCount, publish->slot + 1);
+    plan.lanes.push_back({role, publish->lane, publish->slot, oldBuffer,
+                          cubeDrain, vectorCast});
+    if (oldBufferSet.insert(oldBuffer).second)
+      plan.oldBuffers.push_back(oldBuffer);
+  }
+  if (scoreLanes.size() != schedule.logicalLaneCount ||
+      productLanes.size() != schedule.logicalLaneCount ||
+      !plan.scoreBufferType || !plan.productBufferType ||
+      plan.scoreSlotCount == 0 || plan.productSlotCount == 0)
+    return failure();
+
+  auto cubeScope = cubeLoop->getParentOfType<scope::ScopeOp>();
+  if (!cubeScope)
+    return failure();
+  for (Value oldBuffer : plan.oldBuffers) {
+    auto allocation = oldBuffer.getDefiningOp<memref::AllocOp>();
+    if (!allocation || allocation->getBlock() != cubeScope->getBlock())
+      return failure();
+  }
+  return plan;
+}
+
+static LogicalResult materializeStage94Ownership(
+    scf::ForOp cubeLoop, scf::ForOp vectorLoop,
+    const CrossScopeTransferInfo &transferInfo,
+    const PostCVSplitDetachedSchedule &schedule) {
+  FailureOr<Stage94OwnershipPlan> plan = buildStage94OwnershipPlan(
+      cubeLoop, vectorLoop, transferInfo, schedule);
+  if (failed(plan))
+    return failure();
+
+  auto cubeScope = cubeLoop->getParentOfType<scope::ScopeOp>();
+  if (!cubeScope)
+    return failure();
+  MLIRContext *context = cubeLoop.getContext();
+  Location loc = cubeLoop.getLoc();
+  OpBuilder builder(cubeScope);
+  auto createSlots = [&](MemRefType type, unsigned count, StringRef role) {
+    SmallVector<Value> slots;
+    slots.reserve(count);
+    for (unsigned slot = 0; slot < count; ++slot) {
+      Location slotLoc = NameLoc::get(
+          builder.getStringAttr((role + "-slot").str()), loc);
+      auto allocation = builder.create<memref::AllocOp>(slotLoc, type);
+      auto mark =
+          builder.create<annotation::MarkOp>(slotLoc, allocation.getResult());
+      mark->setAttr("effects",
+                    builder.getArrayAttr({builder.getStringAttr("write"),
+                                          builder.getStringAttr("read")}));
+      slots.push_back(allocation.getResult());
+    }
+    return slots;
+  };
+  SmallVector<Value> scoreSlots = createSlots(
+      plan->scoreBufferType, plan->scoreSlotCount, "stage94.score");
+  SmallVector<Value> productSlots = createSlots(
+      plan->productBufferType, plan->productSlotCount, "stage94.product");
+
+  for (const Stage94OwnershipLanePlan &lane : plan->lanes) {
+    ArrayRef<Value> slots = lane.role == PostCVSplitLineageRole::Score
+                                ? ArrayRef<Value>(scoreSlots)
+                                : ArrayRef<Value>(productSlots);
+    if (lane.slot >= slots.size())
+      return failure();
+    Value replacement = slots[lane.slot];
+    lane.cubeDrain->replaceUsesOfWith(lane.oldBuffer, replacement);
+    lane.vectorCast->setOperand(0, replacement);
+  }
+
+  for (Value oldBuffer : plan->oldBuffers) {
+    SmallVector<Operation *> marks;
+    for (Operation *user : oldBuffer.getUsers()) {
+      if (!isa<annotation::MarkOp>(user))
+        return failure();
+      marks.push_back(user);
+    }
+    for (Operation *mark : marks)
+      mark->erase();
+    auto allocation = oldBuffer.getDefiningOp<memref::AllocOp>();
+    if (!allocation || !allocation->use_empty())
+      return failure();
+    allocation.erase();
+  }
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-materialized-buffer-ownership lanes="
+             << schedule.logicalLaneCount
+             << " score-slots=" << plan->scoreSlotCount
+             << " product-slots=" << plan->productSlotCount
+             << " retired-union-buffers=" << plan->oldBuffers.size()
+             << "\n");
+  return success();
+}
+
 static FailureOr<Stage94ReleaseProtocolPlan> buildStage94ReleaseProtocolPlan(
     scf::ForOp cubeLoop, scf::ForOp vectorLoop,
     ArrayRef<VectorToCubePack> packs,
@@ -2302,6 +2500,8 @@ retileVectorScopeForRowSplit(scope::ScopeOp vecScope, scf::ForOp cubeLoop,
     return failure();
   if (materializeStage94SimdRegions &&
       (!stage94DetachedSchedule ||
+       failed(materializeStage94Ownership(
+           cubeLoop, vectorLoop, transferInfo, *stage94DetachedSchedule)) ||
        failed(materializeStage94ReleaseProtocol(
            cubeLoop, vectorLoop, packs, transferInfo,
            *stage94DetachedSchedule))))

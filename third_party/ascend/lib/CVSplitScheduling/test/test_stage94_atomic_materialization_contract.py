@@ -258,6 +258,33 @@ def test_release_protocol_is_driven_by_detached_schedule_roles_and_slots() -> No
         assert forbidden not in protocol
 
 
+def test_buffer_ownership_is_rematerialized_by_role_and_plan_slot() -> None:
+    source = read(LIB / "ScopeSeparation.cpp")
+    ownership = source.split("buildStage94OwnershipPlan", 1)[1]
+    ownership = ownership.split("buildStage94ReleaseProtocolPlan", 1)[0]
+    for token in (
+            "transferInfo.cubeToVectorChains",
+            "PostCVSplitDetachedCommandKind::ScorePublish",
+            "PostCVSplitDetachedCommandKind::ProductPublish",
+            "publish->lane",
+            "publish->slot",
+            "plan.scoreSlotCount",
+            "plan.productSlotCount",
+            "plan->scoreBufferType, plan->scoreSlotCount",
+            "plan->productBufferType, plan->productSlotCount",
+            "lane.cubeDrain->replaceUsesOfWith",
+            "lane.vectorCast->setOperand(0, replacement)",
+            "allocation.erase()",
+            "stage94-materialized-buffer-ownership",
+    ):
+        assert token in ownership
+    assert "scoreSlotCount = 2" not in ownership
+    assert "productSlotCount = 2" not in ownership
+    retile = source.split("retileVectorScopeForRowSplit", 2)[2]
+    assert retile.index("materializeStage94Ownership(") < retile.index(
+        "materializeStage94ReleaseProtocol(")
+
+
 if __name__ == "__main__":
     test_forced_option_is_default_off_and_atomic()
     test_materializer_outlines_all_probability_regions()
@@ -272,4 +299,5 @@ if __name__ == "__main__":
     test_grouped_recurrence_is_lane_count_driven_and_balanced()
     test_grouped_recurrence_replaces_alpha_and_final_denominator_atomically()
     test_release_protocol_is_driven_by_detached_schedule_roles_and_slots()
+    test_buffer_ownership_is_rematerialized_by_role_and_plan_slot()
     print("Stage 9.4b/c atomic materialization source contract: PASS")
