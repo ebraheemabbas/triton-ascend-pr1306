@@ -1312,7 +1312,9 @@ struct Stage94OnlineSoftmaxLane {
 
 static FailureOr<Stage94OnlineSoftmaxLane>
 materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane,
-                                      bool deferLaneSum) {
+                                      bool deferLaneSum,
+                                      Value &sharedScaleScalar,
+                                      Value &sharedScaleRow) {
   Operation *probabilityProducer = pack.pSrc.getDefiningOp();
   Operation *anchor = pack.anchor;
   auto probabilityType = dyn_cast<RankedTensorType>(pack.pSrc.getType());
@@ -1484,6 +1486,31 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane,
   auto packedType =
       RankedTensorType::get({n16, rows, kNzTileSize}, pElement);
 
+  auto scaleFill = scale.getDefiningOp<linalg::FillOp>();
+  if (!scaleFill || scaleFill.getInputs().size() != 1 ||
+      scaleFill->getNumResults() != 1 || scaleFill.getResult(0) != scale)
+    return failure();
+  Value scaleScalar = scaleFill.getInputs()[0];
+  if (sharedScaleScalar) {
+    if (sharedScaleScalar != scaleScalar ||
+        sharedScaleRow.getType() != rowVectorType)
+      return failure();
+  } else {
+    OpBuilder scaleBuilder(scaleFill);
+    Location scaleLoc =
+        NameLoc::get(scaleBuilder.getStringAttr("stage94.shared-scale-row"),
+                     scaleFill.getLoc());
+    Value scaleRowInit = scaleBuilder.create<tensor::EmptyOp>(
+        scaleLoc, rowVectorType.getShape(), rowVectorType.getElementType(),
+        rowVectorType.getEncoding());
+    sharedScaleRow = scaleBuilder
+                         .create<linalg::FillOp>(
+                             scaleLoc, ValueRange{scaleScalar},
+                             ValueRange{scaleRowInit})
+                         .getResult(0);
+    sharedScaleScalar = scaleScalar;
+  }
+
   Operation *insertionAnchor = operations.front();
   auto createLoopStorage = [&](OpBuilder &storageBuilder,
                                RankedTensorType tensorType,
@@ -1637,12 +1664,12 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane,
                << "[cv-split] stage94-build-progress lane=" << lane
                << " checkpoint=max-score-chunk-extracted chunk=" << chunk
                << "\n");
-    Value scaleChunk = extractRowChunk(mb, scale, chunk, f32);
     LLVM_DEBUG(llvm::dbgs()
                << "[cv-split] stage94-build-progress lane=" << lane
-               << " checkpoint=max-scale-chunk-extracted chunk=" << chunk
+               << " checkpoint=max-shared-scale-row-ready chunk=" << chunk
                << "\n");
-    Value scaled = mb.create<arith::MulFOp>(loc, scoreChunk, scaleChunk);
+    Value scaled =
+        mb.create<arith::MulFOp>(loc, scoreChunk, sharedScaleRow);
     LLVM_DEBUG(llvm::dbgs()
                << "[cv-split] stage94-build-progress lane=" << lane
                << " checkpoint=max-chunk-scaled chunk=" << chunk << "\n");
@@ -2040,10 +2067,13 @@ outlineStage94VectorRegions(MutableArrayRef<VectorToCubePack> packs,
                             Operation *&groupedAlphaScope) {
   SmallVector<Stage94OnlineSoftmaxLane> lanes;
   lanes.reserve(packs.size());
+  Value sharedScaleScalar;
+  Value sharedScaleRow;
   for (auto [lane, pack] : llvm::enumerate(packs)) {
     FailureOr<Stage94OnlineSoftmaxLane> result =
         materializeStage94OnlineSoftmaxRegion(
-            pack, lane, lane + 1 == packs.size());
+            pack, lane, lane + 1 == packs.size(), sharedScaleScalar,
+            sharedScaleRow);
     if (failed(result))
       return failure();
     pack.pSrc = result->packedProbability;

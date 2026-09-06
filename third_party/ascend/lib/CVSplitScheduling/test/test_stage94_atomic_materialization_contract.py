@@ -128,6 +128,36 @@ def test_loop_storage_is_explicitly_ub_backed_before_the_simd_scope() -> None:
     assert "deferredAddInit = builder.create<tensor::EmptyOp>" in online
 
 
+def test_full_scale_fill_is_narrowed_once_and_shared_across_lanes() -> None:
+    source = read(LIB / "ScopeSeparation.cpp")
+    online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
+    online = online.split("outlineStage94VectorRegions", 1)[0]
+    for token in (
+            "Value &sharedScaleScalar",
+            "Value &sharedScaleRow",
+            "scale.getDefiningOp<linalg::FillOp>()",
+            "scaleFill.getInputs().size() != 1",
+            "scaleFill.getResult(0) != scale",
+            "sharedScaleScalar != scaleScalar",
+            'getStringAttr("stage94.shared-scale-row")',
+            "scaleBuilder.create<tensor::EmptyOp>",
+            "scaleBuilder",
+            ".create<linalg::FillOp>",
+            "mb.create<arith::MulFOp>(loc, scoreChunk, sharedScaleRow)",
+            "max-shared-scale-row-ready",
+    ):
+        assert token in online
+    assert "extractRowChunk(mb, scale," not in online
+
+    caller = source.split("outlineStage94VectorRegions", 1)[1]
+    caller = caller.split("buildStage94OwnershipPlan", 1)[0]
+    assert caller.index("Value sharedScaleScalar") < caller.index(
+        "for (auto [lane, pack]")
+    assert caller.index("Value sharedScaleRow") < caller.index(
+        "for (auto [lane, pack]")
+    assert "sharedScaleScalar,\n            sharedScaleRow" in caller
+
+
 def test_online_softmax_marks_the_inter_loop_vector_dependency() -> None:
     source = read(LIB / "ScopeSeparation.cpp")
     online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
@@ -364,6 +394,7 @@ if __name__ == "__main__":
     test_generated_row_loops_handle_empty_scf_bodies()
     test_row_reduction_identities_are_materialized_inside_simd_scope()
     test_loop_storage_is_explicitly_ub_backed_before_the_simd_scope()
+    test_full_scale_fill_is_narrowed_once_and_shared_across_lanes()
     test_online_softmax_marks_the_inter_loop_vector_dependency()
     test_final_maximum_preserves_original_tensor_semantics()
     test_direct_nz_pack_reshapes_f32_before_truncation()
