@@ -1014,7 +1014,6 @@ outlineStage94VectorRegion(VectorToCubePack &pack, unsigned lane) {
   OpBuilder builder(first);
   auto simdScope = builder.create<scope::ScopeOp>(loc, resultTypes);
   simdScope.getBodyRegion().emplaceBlock();
-  simdScope.setNoInline(true);
   simdScope->setAttr("noinline", UnitAttr::get(context));
   simdScope->setAttr("outline", BoolAttr::get(context, true));
   simdScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
@@ -1142,7 +1141,6 @@ materializeStage94RowwiseRegion(VectorToCubePack &pack, unsigned lane) {
   OpBuilder builder(operations.front());
   auto simdScope = builder.create<scope::ScopeOp>(loc, resultTypes);
   simdScope.getBodyRegion().emplaceBlock();
-  simdScope.setNoInline(true);
   simdScope->setAttr("noinline", UnitAttr::get(context));
   simdScope->setAttr("outline", BoolAttr::get(context, true));
   simdScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
@@ -1536,7 +1534,6 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane,
     scopeResults.append({maximumType, maximumType, packedType});
   auto simdScope = builder.create<scope::ScopeOp>(loc, scopeResults);
   simdScope.getBodyRegion().emplaceBlock();
-  simdScope.setNoInline(true);
   simdScope->setAttr("noinline", UnitAttr::get(context));
   simdScope->setAttr("outline", BoolAttr::get(context, true));
   simdScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
@@ -1767,7 +1764,6 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane,
     auto deferredScope =
         deferredBuilder.create<scope::ScopeOp>(loc, TypeRange{maximumType});
     deferredScope.getBodyRegion().emplaceBlock();
-    deferredScope.setNoInline(true);
     deferredScope->setAttr("noinline", UnitAttr::get(context));
     deferredScope->setAttr("outline", BoolAttr::get(context, true));
     deferredScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
@@ -1918,7 +1914,6 @@ static LogicalResult materializeStage94GroupedRecurrence(
   auto alphaScope =
       alphaBuilder.create<scope::ScopeOp>(loc, alphaResultTypes);
   alphaScope.getBodyRegion().emplaceBlock();
-  alphaScope.setNoInline(true);
   alphaScope->setAttr("noinline", UnitAttr::get(context));
   alphaScope->setAttr("outline", BoolAttr::get(context, true));
   alphaScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
@@ -1943,7 +1938,6 @@ static LogicalResult materializeStage94GroupedRecurrence(
   auto affineScope =
       affineBuilder.create<scope::ScopeOp>(loc, TypeRange{rowType});
   affineScope.getBodyRegion().emplaceBlock();
-  affineScope.setNoInline(true);
   affineScope->setAttr("noinline", UnitAttr::get(context));
   affineScope->setAttr("outline", BoolAttr::get(context, true));
   affineScope->setAttr("vector_mode", StringAttr::get(context, "simd"));

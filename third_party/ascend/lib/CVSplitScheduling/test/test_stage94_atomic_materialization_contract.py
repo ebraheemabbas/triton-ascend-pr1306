@@ -44,7 +44,6 @@ def test_materializer_outlines_all_probability_regions() -> None:
             "vector_mode",
             'StringAttr::get(context, "simd")',
             'BoolAttr::get(context, true)',
-            "simdScope.setNoInline(true)",
             "outputs.insert(pack.pSrc)",
             "pack.pSrc = result->packedProbability",
             "publication=detached",
@@ -160,9 +159,10 @@ def test_lane_scope_defers_only_the_last_logical_lane_sum() -> None:
     assert "ValueRange{expLoop.getResult(0), maximum, expLoop.getResult(1)}" in online
     assert "ValueRange{maximum, expLoop.getResult(0), expLoop.getResult(1)}" in online
     scope = online.index("builder.create<scope::ScopeOp>")
-    assert scope < online.index("simdScope.setNoInline(true)")
-    assert online.index("simdScope.setNoInline(true)") < online.index(
+    assert scope < online.index('simdScope->setAttr("noinline"')
+    assert online.index('simdScope->setAttr("noinline"') < online.index(
         'simdScope->setAttr("outline"')
+    assert "setNoInline(true)" not in source
     worklist = online.split("SmallVector<Operation *> worklist", 1)[1].split("};", 1)[0]
     assert "alpha.getOperation()" not in worklist
     assert "newDenominator.getOperation()" not in worklist
