@@ -249,9 +249,20 @@ def test_release_protocol_is_driven_by_detached_schedule_roles_and_slots() -> No
             "scoreVectorBuilder.create<hivm::SyncBlockSetOp>",
             "productCubeBuilder.create<hivm::SyncBlockWaitOp>",
             "productVectorBuilder.create<hivm::SyncBlockSetOp>",
+            "cubeLoop->getParentOfType<scf::ForOp>()",
+            "vectorLoop->getParentOfType<scf::ForOp>()",
+            "cubeOuterLoop.getOperation() != vectorOuterLoop.getOperation()",
+            "vectorOuterLoop.getInductionVar()",
+            "vectorOuterLoop.getLowerBound()",
+            "arith::CmpIPredicate::eq",
+            "initialBuilder.create<scf::IfOp>",
+            "seedIf.getThenBodyBuilder()",
+            "seedBuilder.create<hivm::SyncBlockSetOp>",
+            "initial-once-per-outer-loop=yes",
             "stage94-materialized-release-protocol",
     ):
         assert token in protocol
+    assert "initialBuilder.create<hivm::SyncBlockSetOp>" not in protocol
     for forbidden in (
             "scoreReleaseFlag = 12",
             "scoreReleaseFlag = 13",

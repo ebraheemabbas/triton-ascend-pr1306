@@ -2402,7 +2402,21 @@ static LogicalResult materializeStage94ReleaseProtocol(
       hivm::TCoreTypeAttr::get(context, hivm::TCoreType::CUBE);
   auto vectorCore =
       hivm::TCoreTypeAttr::get(context, hivm::TCoreType::VECTOR);
+  scf::ForOp cubeOuterLoop = cubeLoop->getParentOfType<scf::ForOp>();
+  scf::ForOp vectorOuterLoop = vectorLoop->getParentOfType<scf::ForOp>();
+  if (!cubeOuterLoop || !vectorOuterLoop ||
+      cubeOuterLoop.getOperation() != vectorOuterLoop.getOperation() ||
+      vectorOuterLoop.getInductionVar().getType() !=
+          vectorOuterLoop.getLowerBound().getType())
+    return failure();
+
   OpBuilder initialBuilder(vectorLoop);
+  auto firstOuterIteration = initialBuilder.create<arith::CmpIOp>(
+      loc, arith::CmpIPredicate::eq, vectorOuterLoop.getInductionVar(),
+      vectorOuterLoop.getLowerBound());
+  auto seedIf = initialBuilder.create<scf::IfOp>(
+      loc, firstOuterIteration, /*withElseRegion=*/false);
+  OpBuilder seedBuilder = seedIf.getThenBodyBuilder();
   for (const Stage94ReleaseInit &initial : plan->initialSignals) {
     hivm::PipeAttr signaling =
         stage94PipeForResource(context, initial.signalingResource);
@@ -2410,9 +2424,9 @@ static LogicalResult materializeStage94ReleaseProtocol(
         stage94PipeForResource(context, initial.waitingResource);
     if (!signaling || !waiting)
       return failure();
-    auto set = initialBuilder.create<hivm::SyncBlockSetOp>(
+    auto set = seedBuilder.create<hivm::SyncBlockSetOp>(
         loc, vectorCore, signaling, waiting,
-        OpFoldResult(initialBuilder.getI64IntegerAttr(initial.flag)));
+        OpFoldResult(seedBuilder.getI64IntegerAttr(initial.flag)));
     setOpEngineTypeAttr(set, EngineType::VECTOR);
   }
 
@@ -2466,6 +2480,7 @@ static LogicalResult materializeStage94ReleaseProtocol(
              << " initial=" << plan->initialSignals.size()
              << " cube-waits=" << (2 * plan->lanes.size())
              << " vector-sets=" << (2 * plan->lanes.size())
+             << " initial-once-per-outer-loop=yes"
              << " legacy-pairs-replaced=1\n");
   return success();
 }
