@@ -1677,13 +1677,18 @@ static LogicalResult materializeStage94GroupedRecurrence(
   if (lanes.empty())
     return failure();
 
-  Block *block = lanes.front().alphaDifference->getBlock();
-  auto rowType = dyn_cast<RankedTensorType>(lanes.front().maximum.getType());
+  Stage94OnlineSoftmaxLane firstState = lanes.front();
+  Stage94OnlineSoftmaxLane finalState = lanes.back();
+  Block *block = firstState.alphaDifference->getBlock();
+  auto rowType = dyn_cast<RankedTensorType>(firstState.maximum.getType());
   if (!block || !rowType || !rowType.hasStaticShape() ||
       rowType.getRank() != 1)
     return failure();
 
-  for (auto [lane, state] : llvm::enumerate(lanes)) {
+  for (size_t lane = 0; lane < lanes.size(); ++lane) {
+    Stage94OnlineSoftmaxLane state = lanes[lane];
+    Stage94OnlineSoftmaxLane previousState =
+        lane == 0 ? firstState : lanes[lane - 1];
     if (state.alphaDifference->getBlock() != block ||
         state.alpha->getBlock() != block ||
         state.scaledDenominator->getBlock() != block ||
@@ -1692,14 +1697,14 @@ static LogicalResult materializeStage94GroupedRecurrence(
         state.oldDenominator.getType() != rowType ||
         state.alphaDifference.getLhs() != state.oldMaximum ||
         state.alphaDifference.getRhs() != state.maximum ||
-        (lane != 0 && state.oldMaximum != lanes[lane - 1].maximum) ||
+        (lane != 0 && state.oldMaximum != previousState.maximum) ||
         (lane != 0 &&
-         state.oldDenominator != lanes[lane - 1].newDenominator.getResult()))
+         state.oldDenominator != previousState.newDenominator.getResult()))
       return failure();
   }
 
   DenseSet<Operation *> recurrenceOperations;
-  for (const Stage94OnlineSoftmaxLane &state : lanes) {
+  for (Stage94OnlineSoftmaxLane state : lanes) {
     recurrenceOperations.insert(state.alphaDifference);
     recurrenceOperations.insert(state.alpha);
     recurrenceOperations.insert(state.scaledDenominator);
@@ -1707,7 +1712,7 @@ static LogicalResult materializeStage94GroupedRecurrence(
   }
 
   SmallVector<OpOperand *> finalDenominatorUses;
-  for (OpOperand &use : lanes.back().newDenominator.getResult().getUses())
+  for (OpOperand &use : finalState.newDenominator.getResult().getUses())
     if (!recurrenceOperations.contains(use.getOwner()))
       finalDenominatorUses.push_back(&use);
   if (finalDenominatorUses.empty())
@@ -1719,9 +1724,9 @@ static LogicalResult materializeStage94GroupedRecurrence(
       }))
     return failure();
 
-  Location loc = lanes.back().alphaDifference.getLoc();
+  Location loc = finalState.alphaDifference.getLoc();
   MLIRContext *context = block->getParentOp()->getContext();
-  OpBuilder alphaBuilder(lanes.back().alphaDifference);
+  OpBuilder alphaBuilder(finalState.alphaDifference);
   SmallVector<Type> alphaResultTypes(lanes.size(), rowType);
   auto alphaScope =
       alphaBuilder.create<scope::ScopeOp>(loc, alphaResultTypes);
@@ -1733,8 +1738,8 @@ static LogicalResult materializeStage94GroupedRecurrence(
   setOpEngineTypeAttr(alphaScope, EngineType::VECTOR);
   OpBuilder ab = OpBuilder::atBlockEnd(&alphaScope.getBodyRegion().front());
   SmallVector<Value> groupedAlphas;
-  Value previousMaximum = lanes.front().oldMaximum;
-  for (const Stage94OnlineSoftmaxLane &state : lanes) {
+  Value previousMaximum = firstState.oldMaximum;
+  for (Stage94OnlineSoftmaxLane state : lanes) {
     Value difference =
         ab.create<arith::SubFOp>(loc, previousMaximum, state.maximum);
     groupedAlphas.push_back(ab.create<math::ExpOp>(loc, difference));
@@ -1763,8 +1768,10 @@ static LogicalResult materializeStage94GroupedRecurrence(
   };
   SmallVector<AffineSegment> segments;
   segments.reserve(lanes.size());
-  for (auto [lane, state] : llvm::enumerate(lanes))
+  for (size_t lane = 0; lane < lanes.size(); ++lane) {
+    Stage94OnlineSoftmaxLane state = lanes[lane];
     segments.push_back({alphaScope->getResult(lane), state.sum});
+  }
   while (segments.size() > 1) {
     SmallVector<AffineSegment> next;
     next.reserve((segments.size() + 1) / 2);
@@ -1784,20 +1791,24 @@ static LogicalResult materializeStage94GroupedRecurrence(
     segments = std::move(next);
   }
   Value scaledOld = fb.create<arith::MulFOp>(
-      loc, lanes.front().oldDenominator, segments.front().scale);
+      loc, firstState.oldDenominator, segments.front().scale);
   Value finalDenominator =
       fb.create<arith::AddFOp>(loc, scaledOld, segments.front().offset);
   fb.create<scope::ReturnOp>(loc, finalDenominator);
 
-  for (auto [lane, state] : llvm::enumerate(lanes)) {
-    SmallVector<OpOperand *> alphaUses(state.alpha.getResult().getUses());
+  for (size_t lane = 0; lane < lanes.size(); ++lane) {
+    Stage94OnlineSoftmaxLane state = lanes[lane];
+    SmallVector<OpOperand *> alphaUses;
+    for (OpOperand &use : state.alpha.getResult().getUses())
+      alphaUses.push_back(&use);
     for (OpOperand *use : alphaUses)
       use->set(alphaScope->getResult(lane));
   }
   for (OpOperand *use : finalDenominatorUses)
     use->set(affineScope->getResult(0));
 
-  for (const Stage94OnlineSoftmaxLane &state : llvm::reverse(lanes)) {
+  for (auto iterator = lanes.rbegin(); iterator != lanes.rend(); ++iterator) {
+    Stage94OnlineSoftmaxLane state = *iterator;
     if (!state.newDenominator->use_empty())
       return failure();
     state.newDenominator.erase();

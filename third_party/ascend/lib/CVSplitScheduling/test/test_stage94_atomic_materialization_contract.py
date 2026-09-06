@@ -170,14 +170,14 @@ def test_grouped_recurrence_is_lane_count_driven_and_balanced() -> None:
     grouped = grouped.split("outlineStage94VectorRegions", 1)[0]
     for token in (
             "alphaResultTypes(lanes.size(), rowType)",
-            "for (const Stage94OnlineSoftmaxLane &state : lanes)",
+            "for (Stage94OnlineSoftmaxLane state : lanes)",
             "previousMaximum = state.maximum",
             "while (segments.size() > 1)",
             "index + 1 == segments.size()",
             "left.scale, right.scale",
             "left.offset, right.scale",
             "scaledLeft, right.offset",
-            "lanes.front().oldDenominator",
+            "firstState.oldDenominator",
             "segments.front().scale",
             "segments.front().offset",
             "stage94-materialized-grouped-recurrence",
