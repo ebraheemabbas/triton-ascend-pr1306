@@ -1176,6 +1176,7 @@ private:
     // extraction never changes the qualified scheduling/emission path.
     bool stage94BindingReady = false;
     bool stage94StructuralCandidateReady = false;
+    bool stage94SymmetricGeometryReady = false;
     if (enableCostModelDiagnostics) {
       if (!materializedPlan || !materializedResources ||
           !scheduleCandidateSet) {
@@ -1208,6 +1209,10 @@ private:
             cv_split::PostCVSplitSchedulePlan stage9Plan =
                 cv_split::buildPostCVSplitSchedulePlan(
                     *requests, *materializedResources, *resourceLimits);
+            stage94SymmetricGeometryReady =
+                stage9Plan.recurrence.scoreWidth != 0 &&
+                stage9Plan.recurrence.headDimension ==
+                    stage9Plan.recurrence.scoreWidth;
             if (enableStage9SchedulePlanDiagnostics)
               cv_split::logPostCVSplitSchedulePlan(stage9Plan);
             if (enableStage9DetachedScheduleDiagnostics ||
@@ -1270,12 +1275,15 @@ private:
                     "mutation=no\n");
 
     if (enableStage94AtomicRewrite &&
-        (!stage94BindingReady || !stage94StructuralCandidateReady)) {
+        (!stage94BindingReady || !stage94StructuralCandidateReady ||
+         !stage94SymmetricGeometryReady)) {
       LLVM_DEBUG(llvm::dbgs()
                  << "[cv-split] stage94-atomic rejected binding-ready="
                  << (stage94BindingReady ? "yes" : "no")
                  << " structural-candidate-ready="
                  << (stage94StructuralCandidateReady ? "yes" : "no")
+                 << " symmetric-geometry-ready="
+                 << (stage94SymmetricGeometryReady ? "yes" : "no")
                  << " mutation=no\n");
       return failure();
     }

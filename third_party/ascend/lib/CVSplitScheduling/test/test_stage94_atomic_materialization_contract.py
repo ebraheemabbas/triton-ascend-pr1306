@@ -72,6 +72,18 @@ def test_no_textual_or_shape_identity_policy() -> None:
         assert forbidden not in combined
 
 
+def test_atomic_rewrite_requires_symmetric_score_product_geometry() -> None:
+    source = read(LIB / "CVSplitScheduling.cpp")
+    assert "stage94SymmetricGeometryReady" in source
+    assert "stage9Plan.recurrence.scoreWidth != 0" in source
+    assert "stage9Plan.recurrence.headDimension ==" in source
+    assert "stage9Plan.recurrence.scoreWidth" in source
+    rejection = source.split("if (enableStage94AtomicRewrite &&", 1)[1]
+    rejection = rejection.split("// Stage 8:", 1)[0]
+    assert "!stage94SymmetricGeometryReady" in rejection
+    assert '" symmetric-geometry-ready="' in rejection
+
+
 def test_generated_row_loops_handle_empty_scf_bodies() -> None:
     source = read(LIB / "ScopeSeparation.cpp")
     online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
@@ -167,6 +179,7 @@ if __name__ == "__main__":
     test_forced_option_is_default_off_and_atomic()
     test_materializer_outlines_all_probability_regions()
     test_no_textual_or_shape_identity_policy()
+    test_atomic_rewrite_requires_symmetric_score_product_geometry()
     test_generated_row_loops_handle_empty_scf_bodies()
     test_row_reduction_identities_are_materialized_inside_simd_scope()
     test_loop_storage_follows_escape_lifetimes()
