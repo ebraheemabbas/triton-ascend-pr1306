@@ -121,6 +121,20 @@ def test_reference_parameterization_and_golden_fixture() -> None:
     assert u4_hd128["events"] <= 16 < u8["events"]
 
 
+def test_release_event_resources_follow_the_last_real_consumer() -> None:
+    source = read(LIB / "PostCVSplitSchedulePlan.cpp")
+    releases = source.split(
+        "for (unsigned slot = 0; slot < plan.scoreLiveDepth; ++slot)", 1)[1]
+    score, product = releases.split(
+        "for (unsigned slot = 0; slot < plan.productLiveDepth; ++slot)", 1)
+    product = product.split("plan.forwardEventCount", 1)[0]
+    assert "PrincipalResource::Mte3" in score
+    assert "PrincipalResource::Fixpipe" in score
+    assert "PrincipalResource::Vector" not in score
+    assert "PrincipalResource::Vector" in product
+    assert "PrincipalResource::Fixpipe" in product
+
+
 def test_integration_is_after_materialization_before_transfer_mutation() -> None:
     cpp = read(LIB / "CVSplitScheduling.cpp")
     extract = cpp.index("extractCostModelRequests(")
@@ -138,5 +152,6 @@ if __name__ == "__main__":
     test_option_is_default_off_and_fully_propagated()
     test_plan_is_parameterized_verified_and_analysis_only()
     test_reference_parameterization_and_golden_fixture()
+    test_release_event_resources_follow_the_last_real_consumer()
     test_integration_is_after_materialization_before_transfer_mutation()
     print("Stage 9.2 post-CVSplit schedule plan source contract: PASS")

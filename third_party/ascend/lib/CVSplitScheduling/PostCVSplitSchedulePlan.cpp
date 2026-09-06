@@ -378,7 +378,7 @@ PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
     }
   for (unsigned slot = 0; slot < plan.scoreLiveDepth; ++slot)
     addEvent(PostCVSplitLineageRole::Score,
-             PostCVSplitEventKind::Release, slot, PrincipalResource::Vector,
+             PostCVSplitEventKind::Release, slot, PrincipalResource::Mte3,
              PrincipalResource::Fixpipe, true);
   for (unsigned slot = 0; slot < plan.productLiveDepth; ++slot)
     addEvent(PostCVSplitLineageRole::Product,
