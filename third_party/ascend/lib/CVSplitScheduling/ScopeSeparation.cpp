@@ -1199,7 +1199,19 @@ materializeStage94RowwiseRegion(VectorToCubePack &pack, unsigned lane) {
   return outlinedProbability;
 }
 
-static FailureOr<Value>
+struct Stage94OnlineSoftmaxLane {
+  Value oldMaximum;
+  Value oldDenominator;
+  Value maximum;
+  Value sum;
+  Value packedProbability;
+  arith::SubFOp alphaDifference;
+  math::ExpOp alpha;
+  arith::MulFOp scaledDenominator;
+  arith::AddFOp newDenominator;
+};
+
+static FailureOr<Stage94OnlineSoftmaxLane>
 materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   Operation *probabilityProducer = pack.pSrc.getDefiningOp();
   Operation *anchor = pack.anchor;
@@ -1301,17 +1313,26 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
   if (!alphaSub)
     return failure();
   Value oldDenominator;
+  arith::MulFOp scaledDenominator;
+  bool addsLaneSum = false;
   for (Value operand : newDenominator->getOperands())
     if (auto mul = operand.getDefiningOp<arith::MulFOp>()) {
-      if (mul.getLhs() == alpha.getResult())
+      if (mul.getLhs() == alpha.getResult()) {
         oldDenominator = mul.getRhs();
-      else if (mul.getRhs() == alpha.getResult())
+        scaledDenominator = mul;
+      } else if (mul.getRhs() == alpha.getResult()) {
         oldDenominator = mul.getLhs();
+        scaledDenominator = mul;
+      }
+    } else if (operand == sumReduce.getResult(0)) {
+      addsLaneSum = true;
     }
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] stage94-softmax-denominator lane=" << lane
              << " old=" << (oldDenominator ? "yes" : "no") << "\n");
-  if (!oldDenominator)
+  if (!oldDenominator || !scaledDenominator || !addsLaneSum ||
+      alphaSub.getLhs() != oldMaximum ||
+      alphaSub.getRhs() != newMaximum.getResult())
     return failure();
 
   DenseSet<Value> externalValues{score, scale, oldMaximum, oldDenominator,
@@ -1638,19 +1659,178 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane) {
              << " rows=" << rows << " chunk-width=" << chunkWidth
              << " chunks=" << (width / chunkWidth)
              << " direct-nz=yes publication=detached\n");
-  return simdScope->getResult(2);
+  return Stage94OnlineSoftmaxLane{
+      oldMaximum,
+      oldDenominator,
+      simdScope->getResult(0),
+      simdScope->getResult(1),
+      simdScope->getResult(2),
+      alphaSub,
+      alpha,
+      scaledDenominator,
+      newDenominator,
+  };
+}
+
+static LogicalResult materializeStage94GroupedRecurrence(
+    ArrayRef<Stage94OnlineSoftmaxLane> lanes) {
+  if (lanes.empty())
+    return failure();
+
+  Block *block = lanes.front().alphaDifference->getBlock();
+  auto rowType = dyn_cast<RankedTensorType>(lanes.front().maximum.getType());
+  if (!block || !rowType || !rowType.hasStaticShape() ||
+      rowType.getRank() != 1)
+    return failure();
+
+  for (auto [lane, state] : llvm::enumerate(lanes)) {
+    if (state.alphaDifference->getBlock() != block ||
+        state.alpha->getBlock() != block ||
+        state.scaledDenominator->getBlock() != block ||
+        state.newDenominator->getBlock() != block ||
+        state.maximum.getType() != rowType || state.sum.getType() != rowType ||
+        state.oldDenominator.getType() != rowType ||
+        state.alphaDifference.getLhs() != state.oldMaximum ||
+        state.alphaDifference.getRhs() != state.maximum ||
+        (lane != 0 && state.oldMaximum != lanes[lane - 1].maximum) ||
+        (lane != 0 &&
+         state.oldDenominator != lanes[lane - 1].newDenominator.getResult()))
+      return failure();
+  }
+
+  DenseSet<Operation *> recurrenceOperations;
+  for (const Stage94OnlineSoftmaxLane &state : lanes) {
+    recurrenceOperations.insert(state.alphaDifference);
+    recurrenceOperations.insert(state.alpha);
+    recurrenceOperations.insert(state.scaledDenominator);
+    recurrenceOperations.insert(state.newDenominator);
+  }
+
+  SmallVector<OpOperand *> finalDenominatorUses;
+  for (OpOperand &use : lanes.back().newDenominator.getResult().getUses())
+    if (!recurrenceOperations.contains(use.getOwner()))
+      finalDenominatorUses.push_back(&use);
+  if (finalDenominatorUses.empty())
+    return failure();
+  Operation *affineInsertion = finalDenominatorUses.front()->getOwner();
+  if (affineInsertion->getBlock() != block ||
+      llvm::any_of(finalDenominatorUses, [&](OpOperand *use) {
+        return use->getOwner() != affineInsertion;
+      }))
+    return failure();
+
+  Location loc = lanes.back().alphaDifference.getLoc();
+  MLIRContext *context = block->getParentOp()->getContext();
+  OpBuilder alphaBuilder(lanes.back().alphaDifference);
+  SmallVector<Type> alphaResultTypes(lanes.size(), rowType);
+  auto alphaScope =
+      alphaBuilder.create<scope::ScopeOp>(loc, alphaResultTypes);
+  alphaScope.getBodyRegion().emplaceBlock();
+  alphaScope.setNoInline(true);
+  alphaScope->setAttr("noinline", UnitAttr::get(context));
+  alphaScope->setAttr("outline", BoolAttr::get(context, true));
+  alphaScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
+  setOpEngineTypeAttr(alphaScope, EngineType::VECTOR);
+  OpBuilder ab = OpBuilder::atBlockEnd(&alphaScope.getBodyRegion().front());
+  SmallVector<Value> groupedAlphas;
+  Value previousMaximum = lanes.front().oldMaximum;
+  for (const Stage94OnlineSoftmaxLane &state : lanes) {
+    Value difference =
+        ab.create<arith::SubFOp>(loc, previousMaximum, state.maximum);
+    groupedAlphas.push_back(ab.create<math::ExpOp>(loc, difference));
+    previousMaximum = state.maximum;
+  }
+  ab.create<scope::ReturnOp>(loc, groupedAlphas);
+
+  // Each lane is an affine transform l' = A*l + B. Compose adjacent
+  // transforms as a balanced tree:
+  //   (Ar, Br) o (Al, Bl) = (Ar*Al, Ar*Bl + Br).
+  // This preserves lane order while making the reduction depth logarithmic
+  // for any positive lane count, including non-power-of-two unroll factors.
+  OpBuilder affineBuilder(affineInsertion);
+  auto affineScope =
+      affineBuilder.create<scope::ScopeOp>(loc, TypeRange{rowType});
+  affineScope.getBodyRegion().emplaceBlock();
+  affineScope.setNoInline(true);
+  affineScope->setAttr("noinline", UnitAttr::get(context));
+  affineScope->setAttr("outline", BoolAttr::get(context, true));
+  affineScope->setAttr("vector_mode", StringAttr::get(context, "simd"));
+  setOpEngineTypeAttr(affineScope, EngineType::VECTOR);
+  OpBuilder fb = OpBuilder::atBlockEnd(&affineScope.getBodyRegion().front());
+  struct AffineSegment {
+    Value scale;
+    Value offset;
+  };
+  SmallVector<AffineSegment> segments;
+  segments.reserve(lanes.size());
+  for (auto [lane, state] : llvm::enumerate(lanes))
+    segments.push_back({alphaScope->getResult(lane), state.sum});
+  while (segments.size() > 1) {
+    SmallVector<AffineSegment> next;
+    next.reserve((segments.size() + 1) / 2);
+    for (size_t index = 0; index < segments.size(); index += 2) {
+      if (index + 1 == segments.size()) {
+        next.push_back(segments[index]);
+        continue;
+      }
+      const AffineSegment &left = segments[index];
+      const AffineSegment &right = segments[index + 1];
+      Value scale = fb.create<arith::MulFOp>(loc, left.scale, right.scale);
+      Value scaledLeft =
+          fb.create<arith::MulFOp>(loc, left.offset, right.scale);
+      Value offset = fb.create<arith::AddFOp>(loc, scaledLeft, right.offset);
+      next.push_back({scale, offset});
+    }
+    segments = std::move(next);
+  }
+  Value scaledOld = fb.create<arith::MulFOp>(
+      loc, lanes.front().oldDenominator, segments.front().scale);
+  Value finalDenominator =
+      fb.create<arith::AddFOp>(loc, scaledOld, segments.front().offset);
+  fb.create<scope::ReturnOp>(loc, finalDenominator);
+
+  for (auto [lane, state] : llvm::enumerate(lanes)) {
+    SmallVector<OpOperand *> alphaUses(state.alpha.getResult().getUses());
+    for (OpOperand *use : alphaUses)
+      use->set(alphaScope->getResult(lane));
+  }
+  for (OpOperand *use : finalDenominatorUses)
+    use->set(affineScope->getResult(0));
+
+  for (const Stage94OnlineSoftmaxLane &state : llvm::reverse(lanes)) {
+    if (!state.newDenominator->use_empty())
+      return failure();
+    state.newDenominator.erase();
+    if (!state.scaledDenominator->use_empty())
+      return failure();
+    state.scaledDenominator.erase();
+    if (!state.alpha->use_empty())
+      return failure();
+    state.alpha.erase();
+    if (!state.alphaDifference->use_empty())
+      return failure();
+    state.alphaDifference.erase();
+  }
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[cv-split] stage94-materialized-grouped-recurrence lanes="
+             << lanes.size() << " alpha-scope=yes affine-tree=yes\n");
+  return success();
 }
 
 static LogicalResult
 outlineStage94VectorRegions(MutableArrayRef<VectorToCubePack> packs) {
+  SmallVector<Stage94OnlineSoftmaxLane> lanes;
+  lanes.reserve(packs.size());
   for (auto [lane, pack] : llvm::enumerate(packs)) {
-    FailureOr<Value> probability =
+    FailureOr<Stage94OnlineSoftmaxLane> result =
         materializeStage94OnlineSoftmaxRegion(pack, lane);
-    if (failed(probability))
+    if (failed(result))
       return failure();
-    pack.pSrc = *probability;
+    pack.pSrc = result->packedProbability;
+    lanes.push_back(*result);
   }
-  return success();
+  return materializeStage94GroupedRecurrence(lanes);
 }
 
 // Re-tile the VECTOR scope for ROW_SPLIT so both veccores do useful work (2x

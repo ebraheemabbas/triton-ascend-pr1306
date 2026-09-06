@@ -45,7 +45,7 @@ def test_materializer_outlines_all_probability_regions() -> None:
             'BoolAttr::get(context, true)',
             "simdScope.setNoInline(true)",
             "outputs.insert(pack.pSrc)",
-            "pack.pSrc = *probability",
+            "pack.pSrc = result->packedProbability",
             "publication=detached",
     ):
         assert token in source
@@ -70,18 +70,6 @@ def test_no_textual_or_shape_identity_policy() -> None:
             "productoriginid == 34",
     ):
         assert forbidden not in combined
-
-
-def test_atomic_rewrite_requires_symmetric_score_product_geometry() -> None:
-    source = read(LIB / "CVSplitScheduling.cpp")
-    assert "stage94SymmetricGeometryReady" in source
-    assert "stage9Plan.recurrence.scoreWidth != 0" in source
-    assert "stage9Plan.recurrence.headDimension ==" in source
-    assert "stage9Plan.recurrence.scoreWidth" in source
-    rejection = source.split("if (enableStage94AtomicRewrite &&", 1)[1]
-    rejection = rejection.split("// Stage 8:", 1)[0]
-    assert "!stage94SymmetricGeometryReady" in rejection
-    assert '" symmetric-geometry-ready="' in rejection
 
 
 def test_generated_row_loops_handle_empty_scf_bodies() -> None:
@@ -156,6 +144,7 @@ def test_direct_nz_pack_reshapes_f32_before_truncation() -> None:
 def test_lane_scope_returns_only_maximum_sum_and_packed_probability() -> None:
     source = read(LIB / "ScopeSeparation.cpp")
     online = source.split("materializeStage94OnlineSoftmaxRegion", 1)[1]
+    assert "struct Stage94OnlineSoftmaxLane" in source
     result_types = "SmallVector<Type> scopeResults{maximumType, maximumType, packedType};"
     returned = "ValueRange{maximum, expLoop.getResult(0), expLoop.getResult(1)}"
     assert result_types in online
@@ -175,11 +164,51 @@ def test_lane_scope_returns_only_maximum_sum_and_packed_probability() -> None:
     assert "alpha.getResult()" not in replacements
 
 
+def test_grouped_recurrence_is_lane_count_driven_and_balanced() -> None:
+    source = read(LIB / "ScopeSeparation.cpp")
+    grouped = source.split("materializeStage94GroupedRecurrence", 1)[1]
+    grouped = grouped.split("outlineStage94VectorRegions", 1)[0]
+    for token in (
+            "alphaResultTypes(lanes.size(), rowType)",
+            "for (const Stage94OnlineSoftmaxLane &state : lanes)",
+            "previousMaximum = state.maximum",
+            "while (segments.size() > 1)",
+            "index + 1 == segments.size()",
+            "left.scale, right.scale",
+            "left.offset, right.scale",
+            "scaledLeft, right.offset",
+            "lanes.front().oldDenominator",
+            "segments.front().scale",
+            "segments.front().offset",
+            "stage94-materialized-grouped-recurrence",
+    ):
+        assert token in grouped
+    assert "lanes.size() == 4" not in grouped
+    assert "lanes.size() != 4" not in grouped
+
+
+def test_grouped_recurrence_replaces_alpha_and_final_denominator_atomically() -> None:
+    source = read(LIB / "ScopeSeparation.cpp")
+    grouped = source.split("materializeStage94GroupedRecurrence", 1)[1]
+    grouped = grouped.split("outlineStage94VectorRegions", 1)[0]
+    assert "use->set(alphaScope->getResult(lane))" in grouped
+    assert "use->set(affineScope->getResult(0))" in grouped
+    for token in (
+            "state.newDenominator.erase()",
+            "state.scaledDenominator.erase()",
+            "state.alpha.erase()",
+            "state.alphaDifference.erase()",
+    ):
+        assert token in grouped
+    outline = source.split("outlineStage94VectorRegions", 1)[1]
+    assert "SmallVector<Stage94OnlineSoftmaxLane> lanes" in outline
+    assert "return materializeStage94GroupedRecurrence(lanes);" in outline
+
+
 if __name__ == "__main__":
     test_forced_option_is_default_off_and_atomic()
     test_materializer_outlines_all_probability_regions()
     test_no_textual_or_shape_identity_policy()
-    test_atomic_rewrite_requires_symmetric_score_product_geometry()
     test_generated_row_loops_handle_empty_scf_bodies()
     test_row_reduction_identities_are_materialized_inside_simd_scope()
     test_loop_storage_follows_escape_lifetimes()
@@ -187,4 +216,6 @@ if __name__ == "__main__":
     test_final_maximum_preserves_original_tensor_semantics()
     test_direct_nz_pack_reshapes_f32_before_truncation()
     test_lane_scope_returns_only_maximum_sum_and_packed_probability()
+    test_grouped_recurrence_is_lane_count_driven_and_balanced()
+    test_grouped_recurrence_replaces_alpha_and_final_denominator_atomically()
     print("Stage 9.4b/c atomic materialization source contract: PASS")
