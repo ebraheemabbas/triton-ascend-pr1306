@@ -124,6 +124,8 @@ def test_loop_storage_is_explicitly_ub_backed_before_the_simd_scope() -> None:
         assert token in storage
     assert "tensor::EmptyOp" not in storage
     assert "createLoopStorage(b," not in online
+    assert 'getStringAttr("stage94.deferred-add-row")' in online
+    assert "deferredAddInit = builder.create<tensor::EmptyOp>" in online
 
 
 def test_online_softmax_marks_the_inter_loop_vector_dependency() -> None:

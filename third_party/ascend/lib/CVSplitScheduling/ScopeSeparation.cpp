@@ -1547,9 +1547,13 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane,
   Value maxRowsInit =
       createLoopStorage(builder, maximumType, "stage94.max-rows");
   Value deferredAddInit;
-  if (deferLaneSum)
-    deferredAddInit = createLoopStorage(
-        builder, rowVectorType, "stage94.deferred-add-row");
+  if (deferLaneSum) {
+    Location deferredLoc =
+        NameLoc::get(builder.getStringAttr("stage94.deferred-add-row"), loc);
+    deferredAddInit = builder.create<tensor::EmptyOp>(
+        deferredLoc, rowVectorType.getShape(), rowVectorType.getElementType(),
+        rowVectorType.getEncoding());
+  }
   SmallVector<Type> scopeResults;
   if (deferLaneSum)
     scopeResults.append({scaledType, maximumType, packedType});
