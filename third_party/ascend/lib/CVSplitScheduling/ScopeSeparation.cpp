@@ -1527,6 +1527,10 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane,
       createLoopStorage(builder, scaledType, "stage94.scaled-rows");
   Value packedRowsInit =
       createLoopStorage(builder, packedType, "stage94.packed-rows");
+  Value deferredAddInit;
+  if (deferLaneSum)
+    deferredAddInit = createLoopStorage(
+        builder, rowVectorType, "stage94.deferred-add-row");
   SmallVector<Type> scopeResults;
   if (deferLaneSum)
     scopeResults.append({scaledType, maximumType, packedType});
@@ -1794,12 +1798,14 @@ materializeStage94OnlineSoftmaxRegion(VectorToCubePack &pack, unsigned lane,
       Value probabilityChunk = rb.create<tensor::ExtractSliceOp>(
           loc, rowVectorType, simdScope->getResult(0), offsets, sizes,
           strides);
-      deferredChunks =
-          deferredChunks
-              ? rb.create<arith::AddFOp>(loc, deferredChunks,
-                                         probabilityChunk)
-                    .getResult()
-              : probabilityChunk;
+      if (!deferredChunks) {
+        deferredChunks = probabilityChunk;
+      } else {
+        auto add = rb.create<linalg::AddOp>(
+            loc, ValueRange{deferredChunks, probabilityChunk},
+            ValueRange{deferredAddInit});
+        deferredChunks = add.getResult(0);
+      }
     }
     FailureOr<Value> deferredInit =
         createReductionInit(rb, sumReduce, rowScalarType);
