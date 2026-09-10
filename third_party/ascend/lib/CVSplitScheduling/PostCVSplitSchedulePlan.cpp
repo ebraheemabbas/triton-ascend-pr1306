@@ -4,6 +4,7 @@
  */
 
 #include "ascend/include/CVSplitScheduling/PostCVSplitSchedulePlan.h"
+#include "ascend/include/CVSplitScheduling/BufferSlotPlan.h"
 #include "ascend/include/CVSplitScheduling/HardwareConstants.h"
 
 #include "llvm/ADT/DenseSet.h"
@@ -25,20 +26,6 @@ namespace {
 
 constexpr uint32_t kVectorChunkElements = 4 * kNzTileSize;
 constexpr unsigned kMaximumLogicalFlagId = 15;
-
-static bool checkedAdd(uint64_t lhs, uint64_t rhs, uint64_t &result) {
-  if (lhs > std::numeric_limits<uint64_t>::max() - rhs)
-    return false;
-  result = lhs + rhs;
-  return true;
-}
-
-static bool checkedMul(uint64_t lhs, uint64_t rhs, uint64_t &result) {
-  if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs)
-    return false;
-  result = lhs * rhs;
-  return true;
-}
 
 static bool isFloatingInput(CVSplitElementType type) {
   return type == CVSplitElementType::F16 ||
@@ -167,7 +154,7 @@ static bool verifyPlan(const PostCVSplitSchedulePlan &plan) {
     if (lane.lane >= lanes || lane.rows != plan.recurrence.vectorRows ||
         lane.chunkWidth != kVectorChunkElements ||
         !lane.directNzPacking ||
-        !checkedMul(lane.chunkWidth, lane.chunkCount, covered) ||
+        !checkedBufferMultiply(lane.chunkWidth, lane.chunkCount, covered) ||
         covered != plan.recurrence.scoreWidth)
       return false;
   }
@@ -336,12 +323,14 @@ PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
   plan.probabilityBytesPerSlot = probabilityTransfer.bytes;
   plan.productBytesPerSlot = productTransfer.bytes;
   uint64_t scoreBytes, productBytes;
-  if (!checkedMul(plan.scoreUbSlotCount, plan.scoreBytesPerSlot, scoreBytes) ||
-      !checkedMul(plan.productUbSlotCount, plan.productBytesPerSlot,
-                  productBytes) ||
-      !checkedAdd(scoreBytes, productBytes, plan.allocatedUbBytes) ||
-      !checkedMul(plan.probabilitySlotCount, plan.probabilityBytesPerSlot,
-                  plan.allocatedL1Bytes)) {
+  if (!checkedBufferMultiply(plan.scoreUbSlotCount, plan.scoreBytesPerSlot,
+                             scoreBytes) ||
+      !checkedBufferMultiply(plan.productUbSlotCount, plan.productBytesPerSlot,
+                             productBytes) ||
+      !checkedBufferAdd(scoreBytes, productBytes, plan.allocatedUbBytes) ||
+      !checkedBufferMultiply(plan.probabilitySlotCount,
+                             plan.probabilityBytesPerSlot,
+                             plan.allocatedL1Bytes)) {
     plan.status = PostCVSplitSchedulePlanStatus::ArithmeticOverflow;
     return plan;
   }
@@ -352,11 +341,11 @@ PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
 
   for (unsigned lane = 0; lane < lanes; ++lane) {
     plan.slots.push_back({PostCVSplitLineageRole::Score, lane,
-                          lane % plan.scoreUbSlotCount});
+                          rotatingBufferSlot(lane, plan.scoreUbSlotCount)});
     plan.slots.push_back(
         {PostCVSplitLineageRole::Probability, lane, lane});
     plan.slots.push_back({PostCVSplitLineageRole::Product, lane,
-                          lane % plan.productUbSlotCount});
+                          rotatingBufferSlot(lane, plan.productUbSlotCount)});
     plan.vectorLanes.push_back(
         {lane, scoreTransfer.rows, kVectorChunkElements,
          scoreTransfer.columns / kVectorChunkElements, true});

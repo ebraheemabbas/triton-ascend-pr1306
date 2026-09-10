@@ -21,6 +21,7 @@
  */
 
 #include "ascend/include/CVSplitScheduling/CrossCoreResourcePlan.h"
+#include "ascend/include/CVSplitScheduling/BufferSlotPlan.h"
 #include "ascend/include/CVSplitScheduling/CrossCoreOwnershipProof.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -94,9 +95,10 @@ static bool hasFlagCapacity(const CrossCoreResourceLimits &limits,
 }
 
 static uint64_t saturatingMultiply(uint64_t lhs, uint64_t rhs) {
-  if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs)
+  uint64_t result;
+  if (!checkedBufferMultiply(lhs, rhs, result))
     return std::numeric_limits<uint64_t>::max();
-  return lhs * rhs;
+  return result;
 }
 
 static FailureOr<ResourceLineagePlan>
@@ -400,9 +402,9 @@ buildCrossCoreResourcePlan(const CrossCorePipelinePlan &pipelinePlan,
       plan.assignments.push_back(ResourceSlotAssignment{
           boundaryIndex, static_cast<unsigned>(lineageIndex),
           boundary.key.lane, lineage.physicalGroup,
-          boundary.key.lane % lineage.slotCount,
+          rotatingBufferSlot(boundary.key.lane, lineage.slotCount),
           lineageFlagBase[lineageIndex] +
-              boundary.key.lane % lineage.slotCount});
+              rotatingBufferSlot(boundary.key.lane, lineage.slotCount)});
     }
 
   for (const ResourcePhysicalGroup &group : plan.groups) {
@@ -449,9 +451,7 @@ buildCrossCoreResourcePlan(const CrossCorePipelinePlan &pipelinePlan,
                 : ResourceOwnershipOrdering::Unresolved});
       };
 
-      for (unsigned i = 1; i < uses.size(); ++i)
-        appendEdge(uses[i - 1], uses[i], /*loopCarried=*/false);
-      appendEdge(uses.back(), uses.front(), /*loopCarried=*/true);
+      forEachCyclicBufferReuse(uses, appendEdge);
     }
   }
 

@@ -21,6 +21,7 @@
  */
 
 #include "ascend/include/CVSplitScheduling/ScopeSeparation.h"
+#include "ascend/include/CVSplitScheduling/BufferSlotAllocation.h"
 #include "ascend/include/CVSplitScheduling/HardwareConstants.h"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
@@ -2336,12 +2337,8 @@ static LogicalResult materializeBufferOwnership(
     for (unsigned slot = 0; slot < count; ++slot) {
       Location slotLoc = NameLoc::get(
           builder.getStringAttr((role + "-slot").str()), loc);
-      auto allocation = builder.create<memref::AllocOp>(slotLoc, type);
-      auto mark =
-          builder.create<annotation::MarkOp>(slotLoc, allocation.getResult());
-      mark->setAttr("effects",
-                    builder.getArrayAttr({builder.getStringAttr("write"),
-                                          builder.getStringAttr("read")}));
+      auto allocation = createBufferSlotAllocation(
+          builder, slotLoc, type, BufferSlotAnnotation::CrossCoreReadWrite);
       slots.push_back(allocation.getResult());
     }
     return slots;

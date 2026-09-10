@@ -21,6 +21,8 @@
  */
 
 #include "ascend/include/CVSplitScheduling/CrossScopeTransfers.h"
+#include "ascend/include/CVSplitScheduling/BufferSlotAllocation.h"
+#include "ascend/include/CVSplitScheduling/BufferSlotPlan.h"
 #include "ascend/include/CVSplitScheduling/HardwareConstants.h"
 #include "ascend/include/CVSplitScheduling/UnrollOrigin.h"
 #include "ascend/include/DynamicCVPipeline/Common/FlagIdManager.h"
@@ -208,20 +210,6 @@ struct TransferEmitContext {
   hivm::PipeAttr pipeMte1Attr;
 };
 
-// alloc + annotation.mark{effects=["write","read"]}. One shared buffer per
-// transfer, like the reference FA kernel. (The target IR carries only
-// `effects`; the hivm.tightly_coupled_buffer<N> attribute is intentionally
-// omitted.)
-static memref::AllocOp createAnnotatedAlloc(OpBuilder &builder, Location loc,
-                                            MemRefType allocType) {
-  auto allocOp = builder.create<memref::AllocOp>(loc, allocType);
-  auto markOp = builder.create<annotation::MarkOp>(loc, allocOp.getResult());
-  auto writeAttr = builder.getStringAttr("write");
-  auto readAttr = builder.getStringAttr("read");
-  markOp->setAttr("effects", builder.getArrayAttr({writeAttr, readAttr}));
-  return allocOp;
-}
-
 // Configured ping/pong buffer pool. Transfers that share an identical buffer
 // type (e.g. all the unrolled qk_ub fixpipe targets, or all the P L1 packs)
 // reuse a rotating set of `depth` physical allocations instead of one fresh
@@ -247,7 +235,8 @@ struct BufferPool {
     auto &vec = slots[groupKey][allocType];
     if (slot < vec.size())
       return vec[slot];
-    auto allocOp = createAnnotatedAlloc(builder, loc, allocType);
+    auto allocOp = createBufferSlotAllocation(
+        builder, loc, allocType, BufferSlotAnnotation::CrossCoreReadWrite);
     vec.push_back(allocOp);
     return allocOp;
   }
@@ -1229,7 +1218,8 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
           boundary.key.lane != assignment.lane ||
           assignment.physicalGroup != lineage.physicalGroup)
         return rejectVerifiedPlan("assignment-key");
-      if (assignment.slot != assignment.lane % lineage.slotCount)
+      if (assignment.slot !=
+          rotatingBufferSlot(assignment.lane, lineage.slotCount))
         return rejectVerifiedPlan("assignment-slot");
       const unsigned expectedFlag =
           static_cast<unsigned>(flagBase) + phaseIt->second +
@@ -1355,7 +1345,7 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
     }
 
     const unsigned ordinal = laneOrdinalByOrigin[xfer.originId]++;
-    unsigned slot = ordinal % slotCountByOrigin[xfer.originId];
+    unsigned slot = rotatingBufferSlot(ordinal, slotCountByOrigin[xfer.originId]);
     unsigned forwardFlagId =
         flagBase + phaseFlagOffsetByOrigin[xfer.originId] + slot;
     int64_t groupKey = slotGroupOfOrigin[xfer.originId];
