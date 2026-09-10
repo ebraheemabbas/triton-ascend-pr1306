@@ -14,8 +14,9 @@ namespace mlir::triton::cv_split {
 
 void materializeL0CBufferPlan(const L0CBufferPlan &plan) {
   // Called only after complete read-only admission, and after fill hoisting.
-  OpBuilder builder(plan.loop);
-  Location loc = plan.loop.getLoc();
+  scf::ForOp loop = plan.loop;
+  OpBuilder builder(loop);
+  Location loc = loop.getLoc();
   Value zero = plan.zeroScalar;
   if (!zero)
     zero = builder.create<arith::ConstantOp>(loc, builder.getF32FloatAttr(0.0));
