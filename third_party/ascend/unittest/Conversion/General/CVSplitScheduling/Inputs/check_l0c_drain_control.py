@@ -25,10 +25,13 @@ def run(tool, source, candidate=2, unroll=4, mode="disabled", widening=None,
 
 
 def scope(ir, side):
-    end = ir.index(f"hivm.tcore_type = #hivm.tcore_type<{side}>")
-    start = ir.rfind("scope.scope", 0, end)
-    assert start >= 0
-    return ir[start:end]
+    end = re.search(r'(?m)^( *)\} \{hivm.tcore_type = #hivm.tcore_type<' + side + '>', ir)
+    assert end is not None
+    # Select the outer core scope, not its last nested SIMD region.
+    starts = list(re.finditer(r'(?m)^' + end.group(1) + r'scope.scope : \(\) -> \(\) \{',
+                              ir[:end.start()]))
+    assert starts
+    return ir[starts[-1].start():end.start()]
 
 
 def without_ssa(ir):
@@ -83,7 +86,7 @@ def check_pair(tool, source, mode, unroll=4):
     assert without_ssa(scope(on, "VECTOR")) == without_ssa(scope(off, "VECTOR")), \
         "VECTOR transformations changed with the drain switch"
     if mode == "materialize":
-        assert "SIMD" in scope(off, "VECTOR")
+        assert 'vector_mode = "simd"' in scope(off, "VECTOR")
         assert "tensor<64xf32>" in off
         assert "#hivm.address_space<cbuf>" in off
     print(f"PASS mode={mode} U={unroll}: default=on, live 2/2 -> 1/1; vector/resources unchanged")

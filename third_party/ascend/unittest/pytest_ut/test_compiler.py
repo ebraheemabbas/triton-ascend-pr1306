@@ -80,7 +80,9 @@ def _make_torch_npu_mock(cfg_dir):
     return mock
 
 
-def test_cv_split_l0c_drain_control_is_independent_and_cache_keyed():
+def test_cv_split_l0c_drain_control_is_independent_and_cache_keyed(monkeypatch):
+    # Test option hashing without requiring a local CANN installation.
+    monkeypatch.setattr(compiler, "get_cann_version_file_hash", lambda: "fixed-toolchain")
     defaults = compiler.NPUOptions()
     assert defaults.cv_split_enable_l0c_drain_widening is True
     explicit_on = compiler.NPUOptions(cv_split_enable_l0c_drain_widening=True)
