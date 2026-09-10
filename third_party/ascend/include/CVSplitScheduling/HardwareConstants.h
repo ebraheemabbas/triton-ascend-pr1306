@@ -29,6 +29,10 @@ namespace mlir::triton::cv_split {
 
 inline constexpr int64_t kNzTileSize = 16;
 
+// Physical Atlas A5 capacity, not a cost-model calibration. Matches the pinned
+// vendor RegBase/Cube catlass/arch/arch.hpp AtlasA5::L0C_SIZE (bytes).
+inline constexpr uint64_t kA5L0CBytes = 256 * 1024;
+
 } // namespace mlir::triton::cv_split
 
 #endif // TRITON_ASCEND_CV_SPLIT_SCHEDULING_HARDWARE_CONSTANTS_H

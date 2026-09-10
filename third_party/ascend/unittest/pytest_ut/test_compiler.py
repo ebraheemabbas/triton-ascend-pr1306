@@ -80,6 +80,33 @@ def _make_torch_npu_mock(cfg_dir):
     return mock
 
 
+def test_cv_split_l0c_storage_option_and_cache_key(monkeypatch):
+    monkeypatch.setattr(compiler, "get_cann_version_file_hash", lambda: "fixed-toolchain")
+    defaults = compiler.NPUOptions()
+    assert defaults.cv_split_l0c_buffer_mode == "backend"
+    assert defaults.hash() == compiler.NPUOptions(cv_split_l0c_buffer_mode="backend").hash()
+    for widening in (True, False):
+        backend = compiler.NPUOptions(cv_split_enable_l0c_drain_widening=widening)
+        explicit = compiler.NPUOptions(cv_split_l0c_buffer_mode="explicit",
+                                       cv_split_enable_l0c_drain_widening=widening)
+        assert explicit.cv_split_enable_l0c_drain_widening is widening
+        assert explicit.hash() != backend.hash()
+
+
+@pytest.mark.parametrize("applied", [True, False])
+def test_cv_split_l0c_application_metadata(monkeypatch, applied):
+    marker = "triton_ascend.cv_split_scheduling.explicit_l0c_applied"
+    monkeypatch.setattr(compiler, "_get_then_remove_rc",
+                        lambda mod, name: int(applied) if name == marker else -1)
+    metadata = {}
+    compiler._adjust_metadata_by_module_result(
+        None, metadata, compiler.NPUOptions(cv_split_l0c_buffer_mode="explicit"))
+    assert metadata["cv_split_l0c_buffers_applied"] is applied
+    ordinary = {}
+    compiler._adjust_metadata_by_module_result(None, ordinary, compiler.NPUOptions())
+    assert "cv_split_l0c_buffers_applied" not in ordinary
+
+
 def test_cv_split_l0c_drain_control_is_independent_and_cache_keyed(monkeypatch):
     # Test option hashing without requiring a local CANN installation.
     monkeypatch.setattr(compiler, "get_cann_version_file_hash", lambda: "fixed-toolchain")

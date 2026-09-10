@@ -60,6 +60,12 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
            "delay nonterminal L0C drains according to the selected candidate. "
            "When false, keep each FIXPIPE anchored to its own producer without "
            "changing UB ownership, V prefetch, or VECTOR materialization">,
+    Option<"l0cBufferMode", "l0c-buffer-mode",
+           "std::string", /*default*/"\"backend\"",
+           "L0C storage: 'backend' preserves existing destinations; 'explicit' "
+           "requests verified two-slot rotation per matrix family. Unsupported "
+           "plans retain the requested backend-managed schedule and report "
+           "non-application. Drain widening remains independent.">,
     Option<"promoteFullyUnrolled", "promote-fully-unrolled",
            "bool", /*default*/"true",
            "promote the scope loops left by a candidate whose unroll consumed "

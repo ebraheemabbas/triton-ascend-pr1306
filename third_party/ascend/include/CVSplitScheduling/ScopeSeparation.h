@@ -38,7 +38,8 @@ LogicalResult createScopeSeparation(func::FuncOp funcOp, scf::ForOp innerLoop,
                                     const PostCVSplitDetachedSchedule *
                                         detachedSchedule = nullptr,
                                     const CrossCoreScheduleCandidate *
-                                        scheduleCandidate = nullptr);
+                                        scheduleCandidate = nullptr,
+                                    scf::ForOp *separatedCubeLoop = nullptr);
 
 } // namespace mlir::triton::cv_split
 

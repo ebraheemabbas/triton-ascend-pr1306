@@ -2840,7 +2840,8 @@ createScopeSeparation(func::FuncOp funcOp, scf::ForOp innerLoop,
                       const PostCVSplitDetachedSchedule *
                           detachedSchedule,
                       const CrossCoreScheduleCandidate *
-                          scheduleCandidate) {
+                          scheduleCandidate,
+                      scf::ForOp *separatedCubeLoop) {
 
   MLIRContext *ctx = funcOp.getContext();
   Location loc = innerLoop.getLoc();
@@ -3008,6 +3009,8 @@ createScopeSeparation(func::FuncOp funcOp, scf::ForOp innerLoop,
       llvm::dbgs()
       << "[cv-split] Scope separation done: CUBE scope then VECTOR scope "
       << "(inside parent block, matching reference pattern)\n");
+  if (separatedCubeLoop)
+    *separatedCubeLoop = cubeLoop;
   return success();
 }
 

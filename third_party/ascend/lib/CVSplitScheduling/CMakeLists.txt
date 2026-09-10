@@ -1,5 +1,7 @@
 add_triton_library(CVSplitScheduling
   CVSplitScheduling.cpp
+  L0CBufferPlan.cpp
+  L0CBufferMaterialization.cpp
   PostCVSplitRequestExtraction.cpp
   CrossCoreOwnershipProof.cpp
   CrossCorePipelinePlan.cpp

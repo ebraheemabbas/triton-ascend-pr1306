@@ -27,6 +27,7 @@
 #include "ascend/include/CVSplitScheduling/CrossCoreResourcePlan.h"
 #include "ascend/include/CVSplitScheduling/CrossCoreScheduleCandidate.h"
 #include "ascend/include/CVSplitScheduling/CrossScopeTransfers.h"
+#include "ascend/include/CVSplitScheduling/L0CBufferPlan.h"
 #include "ascend/include/CVSplitScheduling/DependencyScheduler.h"
 #include "ascend/include/CVSplitScheduling/PreCheck.h"
 #include "ascend/include/CVSplitScheduling/PostCVSplitDetachedSchedule.h"
@@ -766,6 +767,7 @@ public:
     this->enablePlanDrivenEarlyPublish = options.enablePlanDrivenEarlyPublish;
     this->scheduleCandidateId = options.scheduleCandidateId;
     this->enableL0CDrainWidening = options.enableL0CDrainWidening;
+    this->l0cBufferMode = options.l0cBufferMode;
     this->postSplitScheduleMode = options.postSplitScheduleMode;
     this->promoteFullyUnrolled = options.promoteFullyUnrolled;
     this->privateBufferUbBudgetBytes = options.privateBufferUbBudgetBytes;
@@ -773,6 +775,13 @@ public:
 
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
+    if (l0cBufferMode.getValue() != "backend" &&
+        l0cBufferMode.getValue() != "explicit") {
+      moduleOp.emitError() << "invalid l0c-buffer-mode '" << l0cBufferMode
+                           << "'; expected backend or explicit";
+      signalPassFailure();
+      return;
+    }
     std::optional<PostSplitScheduleMode> parsedMode =
         parsePostSplitScheduleMode(postSplitScheduleMode);
     if (!parsedMode) {
@@ -836,6 +845,16 @@ public:
     // cleanup point.
     removeUnrollOriginIdAttrs(*transformedModule);
     cv_split::removeDCVPClassificationAttrs(*transformedModule);
+    // Aggregate only successful functions. A rejected function was restored
+    // before this point and cannot leak an explicit-storage success marker.
+    bool explicitL0CApplied = false;
+    for (func::FuncOp function : transformedModule->getOps<func::FuncOp>())
+      explicitL0CApplied |= static_cast<bool>(
+          function->removeAttr(cv_split::kExplicitL0CAppliedAttrName));
+    if (explicitL0CApplied)
+      transformedModule->getOperation()->setAttr(
+          cv_split::kExplicitL0CAppliedAttrName,
+          IntegerAttr::get(IntegerType::get(moduleOp.getContext(), 32), 1));
 
     // Every transformation phase is done, so the single-iteration scaffolds kept for them
     // can go.  Still ahead of verification, so a bad promotion is rejected
@@ -1259,6 +1278,17 @@ private:
     if (materializePostSplitSchedule && !materializationSchedule)
       return failure();
 
+    const bool explicitL0C = l0cBufferMode.getValue() == "explicit";
+    // Preserve logical lane identity through cloning; never rediscover it from
+    // SSA names or the position of a matmul among unrelated matrix families.
+    if (explicitL0C && materializedPlan)
+      for (const auto &boundary : materializedPlan->boundaries)
+        if (boundary.key.direction == cv_split::CrossCoreDirection::CubeToVector)
+          boundary.producer->setAttr(
+              cv_split::kL0CLaneIdAttrName,
+              IntegerAttr::get(IntegerType::get(funcOp.getContext(), 32),
+                               boundary.key.lane));
+
     // Transfer-materialization phase (before scope separation)
     LLVM_DEBUG(llvm::dbgs()
                << "[cv-split] === cross-scope transfer materialization ===\n");
@@ -1278,16 +1308,18 @@ private:
     }
     // Origin IDs are temporary unroll-lineage metadata. Transfer grouping is
     // their final consumer, so do not expose them to scope/backend passes.
-    removeUnrollOriginIdAttrs(funcOp);
+    if (!explicitL0C)
+      removeUnrollOriginIdAttrs(funcOp);
     LLVM_DEBUG(llvm::dbgs() << "[cv-split] cross-scope transfer materialization complete\n");
 
     // Scope-separation phase (like DynamicCVPipeline/SeparateCVScope)
     LLVM_DEBUG(llvm::dbgs()
                << "[cv-split] === CUBE/VECTOR scope separation ===\n");
+    scf::ForOp separatedCubeLoop;
     if (failed(cv_split::createScopeSeparation(
             funcOp, loop, *transferInfo, materializePostSplitSchedule,
             materializationSchedule ? &*materializationSchedule : nullptr,
-            forcedScheduleCandidate))) {
+            forcedScheduleCandidate, &separatedCubeLoop))) {
       return failure();
     }
     if (materializePostSplitSchedule) {
@@ -1298,6 +1330,19 @@ private:
                     "preservation-attribute=yes\n");
     }
     hoistInvariantTensorFillTemplates(outerLoop);
+    if (explicitL0C) {
+      auto l0cPlan = cv_split::buildL0CBufferPlan(
+          separatedCubeLoop, static_cast<unsigned>(unrollFactor));
+      if (succeeded(l0cPlan)) {
+        cv_split::materializeL0CBufferPlan(*l0cPlan);
+        funcOp->setAttr(cv_split::kExplicitL0CAppliedAttrName,
+                       IntegerAttr::get(IntegerType::get(funcOp.getContext(), 32), 1));
+      }
+      removeUnrollOriginIdAttrs(funcOp);
+      funcOp.walk([](Operation *operation) {
+        operation->removeAttr(cv_split::kL0CLaneIdAttrName);
+      });
+    }
     LLVM_DEBUG(llvm::dbgs() << "[cv-split] CUBE/VECTOR scope separation complete\n");
 
     // Function-metadata phase: ensure the function has a mix_mode attribute (it should already)

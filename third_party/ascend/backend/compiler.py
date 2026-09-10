@@ -130,6 +130,11 @@ def _export_coalesce_metadata(mod, metadata, *, require_row_contract=False):
 
 
 def _adjust_metadata_by_module_result(mod, metadata, opt, **kwargs):
+    if opt.cv_split_l0c_buffer_mode == "explicit":
+        metadata["cv_split_l0c_buffers_applied"] = _get_then_remove_rc(
+            mod, "triton_ascend.cv_split_scheduling.explicit_l0c_applied") == 1
+        if opt.debug:
+            print(f"CVSplit explicit L0C applied={metadata['cv_split_l0c_buffers_applied']}")
     rc = _get_then_remove_rc(mod, "triton_ascend.dynamic_cv_pipeline.rc")
     if rc == 4:
         metadata["disable_vf_operand_substitution"] = True
@@ -295,6 +300,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                 enable_plan_driven_early_publish=metadata["cv_split_enable_plan_driven_early_publish"],
                 schedule_candidate_id=metadata["cv_split_schedule_candidate_id"],
                 enable_l0c_drain_widening=metadata["cv_split_enable_l0c_drain_widening"],
+                l0c_buffer_mode=metadata["cv_split_l0c_buffer_mode"],
                 post_split_schedule_mode=metadata[
                     "cv_split_post_split_schedule_mode"])
 
@@ -1215,6 +1221,9 @@ class NPUOptions:
     # Control only candidate-driven FIXPIPE anchor widening. Buffer ownership,
     # candidate capabilities, V prefetch and full materialization are independent.
     cv_split_enable_l0c_drain_widening: bool = True
+    # Independent storage policy. Explicit mode is opt-in and reports actual
+    # application in launch metadata; it does not enable/disable drain widening.
+    cv_split_l0c_buffer_mode: str = "backend"
     # Post-split schedule policy. "disabled" keeps the generic path and
     # "materialize" verifies and publishes both scopes transactionally.
     cv_split_post_split_schedule_mode: str = "disabled"
