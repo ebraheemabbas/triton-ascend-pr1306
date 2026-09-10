@@ -136,13 +136,17 @@ static llvm::StringRef resourceName(PrincipalResource resource) {
 
 static bool verifyPlan(const PostCVSplitSchedulePlan &plan) {
   const unsigned lanes = plan.recurrence.logicalLaneCount;
-  if (lanes < 2 || plan.scoreLiveDepth == 0 ||
-      plan.productLiveDepth == 0 || plan.probabilitySlotCount != lanes ||
+  if (lanes < 2 || plan.scoreUbSlotCount == 0 ||
+      plan.productUbSlotCount == 0 || plan.probabilitySlotCount != lanes ||
+      plan.scoreUbSlotCount > lanes || plan.productUbSlotCount > lanes ||
+      plan.scoreL0CWindow == 0 || plan.productL0CWindow == 0 ||
+      plan.scoreL0CWindow > plan.scoreUbSlotCount ||
+      plan.productL0CWindow > plan.productUbSlotCount ||
       plan.slots.size() != 3 * lanes || plan.vectorLanes.size() != lanes ||
       plan.requiredEventCount != plan.events.size() ||
       plan.forwardEventCount != 3 * lanes ||
       plan.releaseEventCount !=
-          plan.scoreLiveDepth + plan.productLiveDepth ||
+          plan.scoreUbSlotCount + plan.productUbSlotCount ||
       plan.reductionSteps.size() != lanes - 1 || !plan.affineTreeRequired ||
       plan.backend.vfMergeLevel != 1 ||
       !plan.backend.disableAutoBindSubBlock ||
@@ -152,9 +156,9 @@ static bool verifyPlan(const PostCVSplitSchedulePlan &plan) {
   for (const PostCVSplitSlotAssignment &slot : plan.slots) {
     unsigned limit = plan.probabilitySlotCount;
     if (slot.role == PostCVSplitLineageRole::Score)
-      limit = plan.scoreLiveDepth;
+      limit = plan.scoreUbSlotCount;
     else if (slot.role == PostCVSplitLineageRole::Product)
-      limit = plan.productLiveDepth;
+      limit = plan.productUbSlotCount;
     if (slot.lane >= lanes || slot.slot >= limit)
       return false;
   }
@@ -182,7 +186,7 @@ static bool verifyPlan(const PostCVSplitSchedulePlan &plan) {
 PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
     const PostCVSplitRequestSet &requests,
     const CrossCoreResourcePlan &currentResources,
-    const CrossCoreResourceLimits &limits) {
+    const CrossCoreResourceLimits &limits, bool enableL0CDrainWidening) {
   PostCVSplitSchedulePlan plan;
   plan.firstLogicalFlagId = limits.firstAvailableFlagId;
   plan.maximumLogicalFlagId = kMaximumLogicalFlagId;
@@ -323,15 +327,17 @@ PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
     return plan;
   }
 
-  plan.scoreLiveDepth = std::min(2u, lanes);
-  plan.productLiveDepth = std::min(2u, lanes);
+  plan.scoreUbSlotCount = std::min(2u, lanes);
+  plan.productUbSlotCount = std::min(2u, lanes);
   plan.probabilitySlotCount = lanes;
+  plan.scoreL0CWindow = enableL0CDrainWidening ? plan.scoreUbSlotCount : 1;
+  plan.productL0CWindow = enableL0CDrainWidening ? plan.productUbSlotCount : 1;
   plan.scoreBytesPerSlot = scoreTransfer.bytes;
   plan.probabilityBytesPerSlot = probabilityTransfer.bytes;
   plan.productBytesPerSlot = productTransfer.bytes;
   uint64_t scoreBytes, productBytes;
-  if (!checkedMul(plan.scoreLiveDepth, plan.scoreBytesPerSlot, scoreBytes) ||
-      !checkedMul(plan.productLiveDepth, plan.productBytesPerSlot,
+  if (!checkedMul(plan.scoreUbSlotCount, plan.scoreBytesPerSlot, scoreBytes) ||
+      !checkedMul(plan.productUbSlotCount, plan.productBytesPerSlot,
                   productBytes) ||
       !checkedAdd(scoreBytes, productBytes, plan.allocatedUbBytes) ||
       !checkedMul(plan.probabilitySlotCount, plan.probabilityBytesPerSlot,
@@ -346,11 +352,11 @@ PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
 
   for (unsigned lane = 0; lane < lanes; ++lane) {
     plan.slots.push_back({PostCVSplitLineageRole::Score, lane,
-                          lane % plan.scoreLiveDepth});
+                          lane % plan.scoreUbSlotCount});
     plan.slots.push_back(
         {PostCVSplitLineageRole::Probability, lane, lane});
     plan.slots.push_back({PostCVSplitLineageRole::Product, lane,
-                          lane % plan.productLiveDepth});
+                          lane % plan.productUbSlotCount});
     plan.vectorLanes.push_back(
         {lane, scoreTransfer.rows, kVectorChunkElements,
          scoreTransfer.columns / kVectorChunkElements, true});
@@ -376,16 +382,16 @@ PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
                  PrincipalResource::Fixpipe, PrincipalResource::Vector,
                  false);
     }
-  for (unsigned slot = 0; slot < plan.scoreLiveDepth; ++slot)
+  for (unsigned slot = 0; slot < plan.scoreUbSlotCount; ++slot)
     addEvent(PostCVSplitLineageRole::Score,
              PostCVSplitEventKind::Release, slot, PrincipalResource::Mte3,
              PrincipalResource::Fixpipe, true);
-  for (unsigned slot = 0; slot < plan.productLiveDepth; ++slot)
+  for (unsigned slot = 0; slot < plan.productUbSlotCount; ++slot)
     addEvent(PostCVSplitLineageRole::Product,
              PostCVSplitEventKind::Release, slot, PrincipalResource::Vector,
              PrincipalResource::Fixpipe, true);
   plan.forwardEventCount = 3 * lanes;
-  plan.releaseEventCount = plan.scoreLiveDepth + plan.productLiveDepth;
+  plan.releaseEventCount = plan.scoreUbSlotCount + plan.productUbSlotCount;
   plan.requiredEventCount = plan.events.size();
   const bool flagOverflow = plan.events.empty() || nextFlag == 0 ||
                             nextFlag - 1 > plan.maximumLogicalFlagId;
@@ -463,10 +469,12 @@ void logPostCVSplitSchedulePlan(const PostCVSplitSchedulePlan &plan) {
                          ? "yes"
                          : "no")
                  << "\n";
-    llvm::dbgs() << "[cv-split] post-split-memory score-depth="
-                 << plan.scoreLiveDepth
+    llvm::dbgs() << "[cv-split] post-split-memory score-ub-slots="
+                 << plan.scoreUbSlotCount
                  << " probability-slots=" << plan.probabilitySlotCount
-                 << " product-depth=" << plan.productLiveDepth
+                 << " product-ub-slots=" << plan.productUbSlotCount
+                 << " score-l0c-window=" << plan.scoreL0CWindow
+                 << " product-l0c-window=" << plan.productL0CWindow
                  << " score-bytes=" << plan.scoreBytesPerSlot
                  << " probability-bytes=" << plan.probabilityBytesPerSlot
                  << " product-bytes=" << plan.productBytesPerSlot

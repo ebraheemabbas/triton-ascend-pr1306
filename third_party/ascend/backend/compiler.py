@@ -294,6 +294,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                 private_buffer_ub_budget_bytes=metadata["cv_split_private_buffer_ub_budget_bytes"],
                 enable_plan_driven_early_publish=metadata["cv_split_enable_plan_driven_early_publish"],
                 schedule_candidate_id=metadata["cv_split_schedule_candidate_id"],
+                enable_l0c_drain_widening=metadata["cv_split_enable_l0c_drain_widening"],
                 post_split_schedule_mode=metadata[
                     "cv_split_post_split_schedule_mode"])
 
@@ -1211,6 +1212,9 @@ class NPUOptions:
     # without selecting one; nonnegative requests a deterministic candidate ID.
     # The initial override accepts only structurally all-one behavior.
     cv_split_schedule_candidate_id: int = -1
+    # Control only candidate-driven FIXPIPE anchor widening. Buffer ownership,
+    # candidate capabilities, V prefetch and full materialization are independent.
+    cv_split_enable_l0c_drain_widening: bool = True
     # Post-split schedule policy. "disabled" keeps the generic path and
     # "materialize" verifies and publishes both scopes transactionally.
     cv_split_post_split_schedule_mode: str = "disabled"

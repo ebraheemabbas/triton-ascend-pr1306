@@ -112,7 +112,8 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
     const CrossCoreResourcePlan *resourcePlan,
     const CrossCoreScheduleCandidate *scheduleCandidate,
     unsigned interCoreBufferDepth, uint64_t privateBufferUbBudgetBytes = 0,
-    unsigned vectorToCubeSlotOverride = 0);
+    unsigned vectorToCubeSlotOverride = 0,
+    bool enableL0CDrainWidening = true);
 
 } // namespace mlir::triton::cv_split
 

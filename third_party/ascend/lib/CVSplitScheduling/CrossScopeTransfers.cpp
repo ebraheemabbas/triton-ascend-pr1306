@@ -750,7 +750,7 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
     const CrossCoreResourcePlan *resourcePlan,
     const CrossCoreScheduleCandidate *scheduleCandidate,
     unsigned interCoreBufferDepth, uint64_t privateBufferUbBudgetBytes,
-    unsigned vectorToCubeSlotOverride) {
+    unsigned vectorToCubeSlotOverride, bool enableL0CDrainWidening) {
 
   MLIRContext *ctx = loop.getContext();
   Location loc = loop.getLoc();
@@ -1295,7 +1295,8 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
       if (limit.direction != CrossCoreDirection::CubeToVector ||
           limit.inFlightLimit == 0 || limit.inFlightLimit > 2 ||
           !candidateDrainLagByOrigin
-               .try_emplace(limit.originId, limit.inFlightLimit - 1)
+               .try_emplace(limit.originId,
+                            enableL0CDrainWidening ? limit.inFlightLimit - 1 : 0)
                .second)
         return failure();
     }
@@ -1327,7 +1328,9 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
         return failure();
       LLVM_DEBUG(llvm::dbgs()
                  << "[cv-split] forced schedule drain origin=" << entry.first
-                 << " in-flight=" << (drainLag + 1) << " lag=" << drainLag
+                 << " effective-in-flight=" << (drainLag + 1)
+                 << " widening=" << (enableL0CDrainWidening ? "on" : "off")
+                 << " lag=" << drainLag
                  << " lanes=" << lanes.size() << "\n");
       if (drainLag == 0)
         continue;

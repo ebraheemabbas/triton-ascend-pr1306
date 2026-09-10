@@ -442,8 +442,8 @@ static PostCVSplitDetachedScheduleStatus verifyLiveDepths(
     }
   }
   if (scoreLive != 0 || productLive != 0 ||
-      schedule.observedMaxScoreLive > plan.scoreLiveDepth ||
-      schedule.observedMaxProductLive > plan.productLiveDepth ||
+      schedule.observedMaxScoreLive > plan.scoreL0CWindow ||
+      schedule.observedMaxProductLive > plan.productL0CWindow ||
       llvm::any_of(scorePublished, [](bool value) { return !value; }) ||
       llvm::any_of(productPublished, [](bool value) { return !value; }))
     return PostCVSplitDetachedScheduleStatus::LiveDepthExceeded;
@@ -582,7 +582,7 @@ buildPostCVSplitDetachedSchedule(const PostCVSplitSchedulePlan &plan) {
   };
 
   const unsigned lanes = plan.recurrence.logicalLaneCount;
-  for (unsigned lane = 0; lane < std::min(lanes, plan.scoreLiveDepth); ++lane)
+  for (unsigned lane = 0; lane < std::min(lanes, plan.scoreL0CWindow); ++lane)
     if (!appendScoreMatmul(lane))
       return reject(
           PostCVSplitDetachedScheduleStatus::MissingSlotAssignment);
@@ -590,7 +590,7 @@ buildPostCVSplitDetachedSchedule(const PostCVSplitSchedulePlan &plan) {
     PostCVSplitDetachedScheduleStatus status = appendScorePublication(lane);
     if (status != PostCVSplitDetachedScheduleStatus::Ready)
       return reject(status);
-    const unsigned refillLane = lane + plan.scoreLiveDepth;
+    const unsigned refillLane = lane + plan.scoreL0CWindow;
     if (refillLane < lanes && !appendScoreMatmul(refillLane))
       return reject(
           PostCVSplitDetachedScheduleStatus::MissingSlotAssignment);
@@ -638,8 +638,8 @@ buildPostCVSplitDetachedSchedule(const PostCVSplitSchedulePlan &plan) {
                PostCVSplitDetachedCommandKind::ProductMatmul,
                PostCVSplitLineageRole::Product, lane, productSlot->slot,
                PrincipalResource::Matrix);
-    if (lane + 1 >= plan.productLiveDepth) {
-      const unsigned publishLane = lane + 1 - plan.productLiveDepth;
+    if (lane + 1 >= plan.productL0CWindow) {
+      const unsigned publishLane = lane + 1 - plan.productL0CWindow;
       PostCVSplitDetachedScheduleStatus status =
           appendProductPublication(publishLane);
       if (status != PostCVSplitDetachedScheduleStatus::Ready)
@@ -647,7 +647,7 @@ buildPostCVSplitDetachedSchedule(const PostCVSplitSchedulePlan &plan) {
     }
   }
   const unsigned firstDeferredProduct =
-      lanes - std::min(lanes, plan.productLiveDepth - 1);
+      lanes - std::min(lanes, plan.productL0CWindow - 1);
   for (unsigned lane = firstDeferredProduct; lane < lanes; ++lane) {
     PostCVSplitDetachedScheduleStatus status =
         appendProductPublication(lane);

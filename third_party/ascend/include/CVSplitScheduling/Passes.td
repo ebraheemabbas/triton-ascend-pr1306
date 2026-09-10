@@ -55,6 +55,11 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
            "post-CVSplit schedule handling: 'disabled' keeps the qualified generic path and 'materialize' "
            "transactionally publishes the complete detached schedule and "
            "publishes both CUBE and VECTOR scopes after every proof passes">,
+    Option<"enableL0CDrainWidening", "enable-l0c-drain-widening",
+           "bool", /*default*/"true",
+           "delay nonterminal L0C drains according to the selected candidate. "
+           "When false, keep each FIXPIPE anchored to its own producer without "
+           "changing UB ownership, V prefetch, or VECTOR materialization">,
     Option<"promoteFullyUnrolled", "promote-fully-unrolled",
            "bool", /*default*/"true",
            "promote the scope loops left by a candidate whose unroll consumed "

@@ -765,6 +765,7 @@ public:
     this->unrollFactor = options.unrollFactor;
     this->enablePlanDrivenEarlyPublish = options.enablePlanDrivenEarlyPublish;
     this->scheduleCandidateId = options.scheduleCandidateId;
+    this->enableL0CDrainWidening = options.enableL0CDrainWidening;
     this->postSplitScheduleMode = options.postSplitScheduleMode;
     this->promoteFullyUnrolled = options.promoteFullyUnrolled;
     this->privateBufferUbBudgetBytes = options.privateBufferUbBudgetBytes;
@@ -1199,7 +1200,8 @@ private:
         if (succeeded(requests)) {
           cv_split::PostCVSplitSchedulePlan postSplitPlan =
               cv_split::buildPostCVSplitSchedulePlan(
-                  *requests, *materializedResources, *resourceLimits);
+                  *requests, *materializedResources, *resourceLimits,
+                  enableL0CDrainWidening);
           symmetricGeometryReady =
               postSplitPlan.recurrence.scoreWidth != 0 &&
               postSplitPlan.recurrence.headDimension ==
@@ -1270,7 +1272,7 @@ private:
             privateBufferUbBudgetBytes < 0
                 ? std::numeric_limits<uint64_t>::max()
                 : static_cast<uint64_t>(privateBufferUbBudgetBytes),
-            vectorToCubeSlots);
+            vectorToCubeSlots, enableL0CDrainWidening);
     if (failed(transferInfo)) {
       return failure();
     }

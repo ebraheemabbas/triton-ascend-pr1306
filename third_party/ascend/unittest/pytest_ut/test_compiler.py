@@ -80,6 +80,25 @@ def _make_torch_npu_mock(cfg_dir):
     return mock
 
 
+def test_cv_split_l0c_drain_control_is_independent_and_cache_keyed():
+    defaults = compiler.NPUOptions()
+    assert defaults.cv_split_enable_l0c_drain_widening is True
+    explicit_on = compiler.NPUOptions(cv_split_enable_l0c_drain_widening=True)
+    assert defaults.hash() == explicit_on.hash()
+    for mode in ("disabled", "materialize"):
+        on = compiler.NPUOptions(cv_split_schedule_candidate_id=2,
+                                 cv_split_post_split_schedule_mode=mode,
+                                 cv_split_enable_plan_driven_early_publish=True)
+        off = compiler.NPUOptions(cv_split_schedule_candidate_id=2,
+                                  cv_split_post_split_schedule_mode=mode,
+                                  cv_split_enable_plan_driven_early_publish=True,
+                                  cv_split_enable_l0c_drain_widening=False)
+        assert off.cv_split_schedule_candidate_id == on.cv_split_schedule_candidate_id
+        assert off.cv_split_post_split_schedule_mode == on.cv_split_post_split_schedule_mode
+        assert off.cv_split_enable_plan_driven_early_publish is True
+        assert on.hash() != off.hash()
+
+
 def _write_acl_config(cfg_dir, config):
     """Write acl_default.json into cfg_dir."""
     cfg_path = os.path.join(cfg_dir, "acl_default.json")
