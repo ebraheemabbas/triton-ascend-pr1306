@@ -40,9 +40,12 @@ FailureOr<L0CBufferPlan> buildL0CBufferPlan(scf::ForOp cubeLoop,
   bool existingL0C = false;
   bool externalMatrix = false;
   auto checkType = [&](Type type) {
-    if (auto memref = dyn_cast<MemRefType>(type))
+    if (auto memref = dyn_cast<MemRefType>(type)) {
       if (auto space = dyn_cast_or_null<hivm::AddressSpaceAttr>(memref.getMemorySpace()))
         existingL0C |= space.getAddressSpace() == hivm::AddressSpace::L0C;
+      if (auto space = dyn_cast_or_null<IntegerAttr>(memref.getMemorySpace()))
+        existingL0C |= space.getInt() == static_cast<int64_t>(hivm::AddressSpace::L0C);
+    }
   };
   for (BlockArgument argument : function.getArguments())
     checkType(argument.getType());
@@ -72,7 +75,7 @@ FailureOr<L0CBufferPlan> buildL0CBufferPlan(scf::ForOp cubeLoop,
         operation.getNumResults() != 1)
       return reject("missing or invalid typed matrix lineage/lane binding");
     auto type = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
-    if (!type || !type.hasStaticShape() || type.getRank() != 2 ||
+    if (!type || !type.hasStaticShape() || type.getRank() != 2 || type.getEncoding() ||
         !type.getElementType().isF32() || type.getDimSize(0) <= 0 ||
         type.getDimSize(1) <= 0 || type.getDimSize(0) % kNzTileSize != 0 ||
         type.getDimSize(1) % kNzTileSize != 0)
@@ -81,10 +84,10 @@ FailureOr<L0CBufferPlan> buildL0CBufferPlan(scf::ForOp cubeLoop,
     if (dps.getNumDpsInits() != 1)
       return reject("matrix does not have one DPS destination");
     Value initial = dps.getDpsInitOperand(0)->get();
-    bool zeroInitialized = matchPattern(initial, m_Zero());
+    bool zeroInitialized = matchPattern(initial, m_PosZeroFloat());
     if (auto fill = initial.getDefiningOp<linalg::FillOp>()) {
       zeroInitialized = fill.getInputs().size() == 1 &&
-                        matchPattern(fill.getInputs()[0], m_Zero());
+                        matchPattern(fill.getInputs()[0], m_PosZeroFloat());
       if (zeroInitialized && !plan.zeroScalar &&
           dominance.dominates(fill.getInputs()[0], cubeLoop.getOperation()))
         plan.zeroScalar = fill.getInputs()[0];

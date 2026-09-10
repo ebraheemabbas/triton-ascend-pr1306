@@ -67,9 +67,11 @@ for candidate in (narrow, source.replace('128', '256')):
     explicit = run(tool, candidate, mode='materialize', widening=False, extra='l0c-buffer-mode=explicit')
     assert MARKER not in explicit and explicit == ordinary
 nonzero = source.replace('arith.constant 0.000000e+00 : f32', 'arith.constant 1.000000e+00 : f32')
-ordinary = run(tool, nonzero, widening=False)
-explicit = run(tool, nonzero, widening=False, extra='l0c-buffer-mode=explicit')
-assert MARKER not in explicit and ordinary == explicit
+negative_zero = source.replace('arith.constant 0.000000e+00 : f32', 'arith.constant -0.000000e+00 : f32')
+for initial in (nonzero, negative_zero):
+    ordinary = run(tool, initial, widening=False)
+    explicit = run(tool, initial, widening=False, extra='l0c-buffer-mode=explicit')
+    assert MARKER not in explicit and ordinary == explicit
 invalid = subprocess.run([tool, '--cv_split_scheduling=compile-on-910-95=true l0c-buffer-mode=invalid'],
                          input=source, text=True, capture_output=True)
 assert invalid.returncode != 0 and 'invalid l0c-buffer-mode' in invalid.stderr
