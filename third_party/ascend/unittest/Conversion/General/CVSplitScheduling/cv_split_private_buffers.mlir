@@ -32,9 +32,11 @@
 
 // By default the merge is taken even though the roles differ in size: four
 // union slots of 4096 replace 2*2048 + 2*4096, which costs 4096 more.  With the
-// four L1 slots the VECTOR->CUBE pool already has, that is eight allocations,
-// every one owned by a single lane.
-// AUTO-COUNT-8: memref.alloc() {{.*}}address_space
+// four L1 slots the VECTOR->CUBE pool already has, that is eight transfer
+// allocations, every one owned by a single lane. The default explicit L0C
+// policy adds two score and two product accumulator slots, for twelve total.
+// AUTO: triton_ascend.cv_split_scheduling.explicit_l0c_applied = 1 : i32
+// AUTO-COUNT-12: memref.alloc() {{.*}}address_space
 // AUTO-NOT: memref.alloc() {{.*}}address_space
 
 // Each UB slot is the larger of the two roles; the smaller role's own type is
@@ -55,8 +57,10 @@
 
 // A budget of zero declines the spend: the CUBE->VECTOR pools keep the
 // inter-core buffer count and rotate, and the schedule goes back to pipelining
-// at that depth to order the reuse.  2 + 2 UB and 4 L1.
-// DECLINED-COUNT-8: memref.alloc() {{.*}}address_space
+// at that depth to order the reuse. 2 + 2 UB and 4 L1, plus four L0C slots:
+// declining UB spend does not disable the separate explicit L0C plan.
+// DECLINED: triton_ascend.cv_split_scheduling.explicit_l0c_applied = 1 : i32
+// DECLINED-COUNT-12: memref.alloc() {{.*}}address_space
 // DECLINED-NOT: memref.alloc() {{.*}}address_space
 
 // DECLINEDTYPE-DAG: memref.alloc() : memref<16x32xf32, #hivm.address_space<ub>>
@@ -69,8 +73,10 @@
 
 // At two lanes the merge is cheaper than the pools it replaces -- two slots of
 // 4096 against 2*2048 + 2*4096 -- so it happens even on a zero budget.  Two UB
-// slots and two L1 slots: four allocations, down from six.
-// NOREUSE-COUNT-4: memref.alloc() {{.*}}address_space
+// slots and two L1 slots: four transfer allocations, down from six. With the
+// two score and two product L0C slots, there are eight allocations total.
+// NOREUSE: triton_ascend.cv_split_scheduling.explicit_l0c_applied = 1 : i32
+// NOREUSE-COUNT-8: memref.alloc() {{.*}}address_space
 // NOREUSE-NOT: memref.alloc() {{.*}}address_space
 
 // NOREUSETYPE-COUNT-2: memref.alloc() : memref<16x64xf32, #hivm.address_space<ub>>
