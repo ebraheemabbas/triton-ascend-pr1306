@@ -2,6 +2,7 @@
 
 // Verify that the CUBE scope hoists an iteration-invariant L1 layout view and
 // its memory-space cast before the cloned loop.
+// Round-trip CUBE/VECTOR dataflow makes shared-slot ownership verifiable.
 
 // CHECK-LABEL: func.func @hoist_cube_layout_view
 // CHECK: scope.scope : () -> () {
@@ -36,6 +37,11 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {
           ins(%lhs, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
           outs(%init : tensor<32x16xf32>) -> tensor<32x16xf32>
       %vector = math.exp %matmul : tensor<32x16xf32>
+      %probability = arith.truncf %vector : tensor<32x16xf32> to tensor<32x16xf16>
+      %product = linalg.matmul
+          ins(%probability, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
+          outs(%init : tensor<32x16xf32>) -> tensor<32x16xf32>
+      %output = math.exp %product : tensor<32x16xf32>
     }
     return
   }

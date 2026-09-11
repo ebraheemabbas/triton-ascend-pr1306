@@ -1,13 +1,13 @@
 // RUN: triton-opt %s "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" 2>/dev/null | FileCheck %s --check-prefix=IR
 // RUN: triton-opt %s --debug-only=cv-split-scheduling "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" 2>&1 >/dev/null | FileCheck %s --check-prefix=DIAG
 
-// Candidate 1 reaches Stage 8 but has no supported cross-scope transfer.
-// Candidate 2 is valid and must still be attempted and committed.
+// Candidate 1 reaches transfer discovery but has no cross-scope transfer.
+// Candidate 2 closes the CUBE/VECTOR ownership cycle and must still commit.
 
 // DIAG-LABEL: [cv-split] Function: first_candidate_fails
 // DIAG-LABEL: [cv-split] Function: second_candidate_succeeds
 // DIAG: [cv-split] Candidate failed; restoring function and trying next function
-// DIAG: [cv-split] Stage 9 complete
+// DIAG: [cv-split] Function attributes set on second_candidate_succeeds
 
 // IR-LABEL: func.func @first_candidate_fails
 // IR: %[[FIRST_STEP:.*]] = arith.constant 1 : index
@@ -45,12 +45,17 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {
     %lhs_buffer = memref.alloc() : memref<32x16xf16>
     memref.copy %lhs_src, %lhs_buffer : memref<32x16xf16> to memref<32x16xf16>
     %lhs = bufferization.to_tensor %lhs_buffer restrict writable :
-        memref<32x16xf16>
+        memref<32x16xf16> to tensor<32x16xf16>
     scf.for %iv = %c0 to %c16 step %c1 {
       %matmul = linalg.matmul
           ins(%lhs, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
           outs(%init : tensor<32x16xf32>) -> tensor<32x16xf32>
       %vector = math.exp %matmul : tensor<32x16xf32>
+      %probability = arith.truncf %vector : tensor<32x16xf32> to tensor<32x16xf16>
+      %product = linalg.matmul
+          ins(%probability, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
+          outs(%init : tensor<32x16xf32>) -> tensor<32x16xf32>
+      %output = math.exp %product : tensor<32x16xf32>
     }
     return
   }

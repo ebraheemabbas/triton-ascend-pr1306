@@ -40,16 +40,16 @@
 // than the two rotating pools it replaces, so the merge happens even on a zero
 // budget, and a merged slot's last reader is the consumer of the *second* role
 // -- past the point the producing core last waits -- so the loop back edge needs
-// a flag of its own.  It runs consumer-to-producer on the canonical
-// vector-to-cube channel, which is why the reverse-pipe checks below still hold.
+// a flag of its own. VECTOR signals on PIPE_V after its final read; CUBE
+// waits on PIPE_FIX before another FIXPIPE write can reuse the UB slot.
 // FLAGS2-DAG: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 0
 // FLAGS2-DAG: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 1
 // FLAGS2-DAG: hivm.hir.sync_block_set[<VECTOR>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 2
 // FLAGS2-DAG: hivm.hir.sync_block_set[<VECTOR>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 3
 // FLAGS2-DAG: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 4
 // FLAGS2-DAG: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 5
-// FLAGS2-DAG: hivm.hir.sync_block_set[<VECTOR>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 6
-// FLAGS2-DAG: hivm.hir.sync_block_wait[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 6
+// FLAGS2-DAG: hivm.hir.sync_block_set[<VECTOR>, <PIPE_V>, <PIPE_FIX>] flag = 6
+// FLAGS2-DAG: hivm.hir.sync_block_wait[<CUBE>, <PIPE_V>, <PIPE_FIX>] flag = 6
 // FLAGS2-NOT: flag = 7
-// FLAGS2-NOT: sync_block{{.*}}<PIPE_V>, <PIPE_FIX>
+// FLAGS2-NOT: sync_block{{.*}}<PIPE_MTE3>, <PIPE_MTE1>] flag = 6
 // FLAGS2-NOT: sync_block{{.*}}<PIPE_MTE1>, <PIPE_MTE3>

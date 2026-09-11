@@ -4,18 +4,21 @@
 // All candidates pass classification and transfer materialization. The first is rejected by
 // scope separation because ROW_SPLIT cannot retile a non-splat shaped constant. The
 // second reaches the post-transformation verifier, which rejects the stale
-// static sizes on a generically retiled tensor.extract_slice. The third is a
-// valid candidate and must still be transformed after both earlier candidates
-// are restored. The fourth has an unsupported direct output destination and
-// must reject transactionally rather than silently retaining full-tile offsets.
-// triton-opt must exit successfully.
+// static sizes on a generically retiled tensor.extract_slice. The third has an
+// unsupported direct output destination and must reject transactionally rather
+// than retaining full-tile offsets. The final valid candidate must still commit
+// after all earlier candidates are restored. Keep it last: committed functions
+// reserve module-wide synchronization IDs, which would mask a later type guard
+// with flag-capacity rejection.
+// Each candidate has round-trip dataflow so ownership validation succeeds
+// before the intended late failure. triton-opt must exit successfully.
 
 // Candidates are enumerated first, then transformed one at a time, so all four
 // function names appear before any of the failures below.
 // DIAG: [cv-split] Function: scope_retiling_failure
 // DIAG: [cv-split] Function: verifier_rejects_retile
-// DIAG: [cv-split] Function: missing_q_staging_candidate
 // DIAG: [cv-split] Function: unsupported_output_destination
+// DIAG: [cv-split] Function: missing_q_staging_candidate
 
 // ROW_SPLIT cannot retile a non-splat shaped constant.
 // DIAG: error: VECTOR retiling only supports shaped splat constants
@@ -27,10 +30,6 @@
 // DIAG: error: expected type to be 'tensor<32x16xf32>'
 // DIAG: [cv-split] Candidate failed; restoring function and trying next function
 
-// The valid candidate is still transformed after both earlier ones are restored.
-// DIAG: [cv-split] CUBE/VECTOR scope separation complete
-// DIAG: [cv-split] Function attributes set on missing_q_staging_candidate
-
 // The unsupported output destination rejects transactionally. It trips the
 // scf.for type check rather than a destination-shape check: no such check
 // exists in the pass, though this test used to assert one. What the case
@@ -38,10 +37,17 @@
 // DIAG: error: VECTOR retiling produced mismatched scf.for init/iter_arg/result types
 // DIAG: [cv-split] Candidate failed; restoring function and trying next function
 
+// The valid candidate is still transformed after all three earlier ones are restored.
+// DIAG: [cv-split] CUBE/VECTOR scope separation complete
+// DIAG: [cv-split] Function attributes set on missing_q_staging_candidate
+
 // IR: module attributes {{.*}}hivm.disable_auto_tile_and_bind_subblock
 // IR-LABEL: func.func @scope_retiling_failure
 // IR: %[[FIRST_STEP:.*]] = arith.constant 1 : index
 // IR: scf.for %{{.*}} = %{{.*}} to %{{.*}} step %[[FIRST_STEP]] {
+// IR-NEXT: %{{.*}} = linalg.matmul
+// IR-NEXT: %{{.*}} = math.exp
+// IR-NEXT: %{{.*}} = arith.truncf
 // IR-NEXT: %{{.*}} = linalg.matmul
 // IR-NEXT: %{{.*}} = math.exp
 // IR-NEXT: %{{.*}} = arith.constant dense<
@@ -52,23 +58,27 @@
 // IR: scf.for %{{.*}} = %{{.*}} to %{{.*}} step %[[SECOND_STEP]] {
 // IR-NEXT: %{{.*}} = linalg.matmul
 // IR-NEXT: %{{.*}} = math.exp
+// IR-NEXT: %{{.*}} = arith.truncf
+// IR-NEXT: %{{.*}} = linalg.matmul
+// IR-NEXT: %{{.*}} = math.exp
 // IR-NEXT: %{{.*}} = tensor.extract_slice
 // IR-NEXT: }
 // IR-NOT: scope.scope
-// IR-LABEL: func.func @missing_q_staging_candidate
-// IR: %[[THIRD_STEP:.*]] = arith.constant 4 : index
-// IR: scope.scope
-// IR: scf.for %{{.*}} = %{{.*}} to %{{.*}} step %[[THIRD_STEP]] {
-// IR-NEXT: %{{.*}} = linalg.matmul
-// IR: } {hivm.tcore_type = #hivm.tcore_type<CUBE>, noinline}
-// IR: scope.scope
-// IR: scf.for %{{.*}} = %{{.*}} to %{{.*}} step %[[THIRD_STEP]] {
-// IR: %{{.*}} = math.exp
-// IR: } {hivm.tcore_type = #hivm.tcore_type<VECTOR>, noinline}
 // IR-LABEL: func.func @unsupported_output_destination
 // IR: scf.for
 // IR: bufferization.materialize_in_destination
 // IR-NOT: scope.scope
+// IR-LABEL: func.func @missing_q_staging_candidate
+// IR: %[[VALID_STEP:.*]] = arith.constant 4 : index
+// IR: scope.scope
+// IR: scf.for %{{.*}} = %{{.*}} to %{{.*}} step %[[VALID_STEP]] {
+// IR-NEXT: %{{.*}} = linalg.matmul
+// IR: } {hivm.tcore_type = #hivm.tcore_type<CUBE>, noinline}
+// IR: scope.scope
+// IR: scf.for %{{.*}} = %{{.*}} to %{{.*}} step %[[VALID_STEP]] {
+// IR: %{{.*}} = math.exp
+// IR: } {hivm.tcore_type = #hivm.tcore_type<VECTOR>, noinline}
+
 
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {
   func.func @scope_retiling_failure(
@@ -82,6 +92,11 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {
           ins(%lhs, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
           outs(%init : tensor<32x16xf32>) -> tensor<32x16xf32>
       %vector = math.exp %matmul : tensor<32x16xf32>
+      %probability = arith.truncf %vector : tensor<32x16xf32> to tensor<32x16xf16>
+      %product = linalg.matmul
+          ins(%probability, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
+          outs(%init : tensor<32x16xf32>) -> tensor<32x16xf32>
+      %output = math.exp %product : tensor<32x16xf32>
       %non_splat = arith.constant dense<[
           0, 1, 2, 3, 4, 5, 6, 7,
           8, 9, 10, 11, 12, 13, 14, 15,
@@ -107,23 +122,13 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {
           ins(%lhs, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
           outs(%init : tensor<32x16xf32>) -> tensor<32x16xf32>
       %vector = math.exp %matmul : tensor<32x16xf32>
+      %probability = arith.truncf %vector : tensor<32x16xf32> to tensor<32x16xf16>
+      %product = linalg.matmul
+          ins(%probability, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
+          outs(%init : tensor<32x16xf32>) -> tensor<32x16xf32>
+      %output = math.exp %product : tensor<32x16xf32>
       %slice = tensor.extract_slice %wide[0, 0] [32, 16] [1, 1]
           : tensor<64x16xf32> to tensor<32x16xf32>
-    }
-    return
-  }
-
-  func.func @missing_q_staging_candidate(
-      %lhs: tensor<32x16xf16>, %rhs: tensor<16x16xf16>,
-      %init: tensor<32x16xf32>) {
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
-    scf.for %iv = %c0 to %c16 step %c1 {
-      %matmul = linalg.matmul
-          ins(%lhs, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
-          outs(%init : tensor<32x16xf32>) -> tensor<32x16xf32>
-      %vector = math.exp %matmul : tensor<32x16xf32>
     }
     return
   }
@@ -140,10 +145,35 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {
           ins(%lhs, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
           outs(%acc : tensor<32x16xf32>) -> tensor<32x16xf32>
       %vector = math.exp %matmul : tensor<32x16xf32>
+      %probability = arith.truncf %vector : tensor<32x16xf32> to tensor<32x16xf16>
+      %product = linalg.matmul
+          ins(%probability, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
+          outs(%init : tensor<32x16xf32>) -> tensor<32x16xf32>
+      %output = math.exp %product : tensor<32x16xf32>
       scf.yield %vector : tensor<32x16xf32>
     }
     bufferization.materialize_in_destination %result in writable %dst :
         (tensor<32x16xf32>, memref<32x16xf32>) -> ()
+    return
+  }
+
+  func.func @missing_q_staging_candidate(
+      %lhs: tensor<32x16xf16>, %rhs: tensor<16x16xf16>,
+      %init: tensor<32x16xf32>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
+    scf.for %iv = %c0 to %c16 step %c1 {
+      %matmul = linalg.matmul
+          ins(%lhs, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
+          outs(%init : tensor<32x16xf32>) -> tensor<32x16xf32>
+      %vector = math.exp %matmul : tensor<32x16xf32>
+      %probability = arith.truncf %vector : tensor<32x16xf32> to tensor<32x16xf16>
+      %product = linalg.matmul
+          ins(%probability, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
+          outs(%init : tensor<32x16xf32>) -> tensor<32x16xf32>
+      %output = math.exp %product : tensor<32x16xf32>
+    }
     return
   }
 

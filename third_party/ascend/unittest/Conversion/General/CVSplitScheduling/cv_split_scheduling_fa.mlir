@@ -3,7 +3,7 @@
 // POC regression (v-split-poc / bd80cb91): line-by-line structural checks on FA
 // BM=32 BN=32 N=8192 unroll-factor=4 pass output.
 
-// CHECK: module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">, hivm.disable_auto_tile_and_bind_subblock, ssbuffer.inter_core_buf_count = 2 : i32, triton_ascend.cv_split_scheduling.applied = 1 : i32} {
+// CHECK: module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">, hivm.disable_auto_tile_and_bind_subblock, ssbuffer.inter_core_buf_count = 2 : i32, triton_ascend.cv_split_scheduling.applied = 1 : i32, triton_ascend.cv_split_scheduling.explicit_l0c_applied = 1 : i32} {
 // CHECK-LABEL: func.func @_attn_fwd
 
 // Invariant accumulator templates are materialized once, outside the physical
@@ -60,9 +60,18 @@
 // CHECK-NEXT: %{{.*}} = memref.memory_space_cast %{{.*}} : memref<32x32xf16, #hivm.address_space<cbuf>> to memref<32x32xf16>
 // CHECK-NEXT: %{{.*}} = memref.memory_space_cast %{{.*}} : memref<32x32xf16, #hivm.address_space<cbuf>> to memref<32x32xf16>
 // CHECK-NEXT: %{{.*}} = memref.memory_space_cast %{{.*}} : memref<32x32xf16, #hivm.address_space<cbuf>> to memref<32x32xf16>
+// Explicit accumulator pools are invariant inside CUBE: two score, two product.
+// CHECK-NEXT: %{{.*}} = memref.alloc() {alignment = 64 : i64} : memref<32x32xf32, #hivm.address_space<cc>>
+// CHECK-NEXT: %{{.*}} = bufferization.to_tensor %{{.*}} restrict writable : memref<32x32xf32, #hivm.address_space<cc>> to tensor<32x32xf32>
+// CHECK-NEXT: %{{.*}} = memref.alloc() {alignment = 64 : i64} : memref<32x32xf32, #hivm.address_space<cc>>
+// CHECK-NEXT: %{{.*}} = bufferization.to_tensor %{{.*}} restrict writable : memref<32x32xf32, #hivm.address_space<cc>> to tensor<32x32xf32>
+// CHECK-NEXT: %{{.*}} = memref.alloc() {alignment = 64 : i64} : memref<32x64xf32, #hivm.address_space<cc>>
+// CHECK-NEXT: %{{.*}} = bufferization.to_tensor %{{.*}} restrict writable : memref<32x64xf32, #hivm.address_space<cc>> to tensor<32x64xf32>
+// CHECK-NEXT: %{{.*}} = memref.alloc() {alignment = 64 : i64} : memref<32x64xf32, #hivm.address_space<cc>>
+// CHECK-NEXT: %{{.*}} = bufferization.to_tensor %{{.*}} restrict writable : memref<32x64xf32, #hivm.address_space<cc>> to tensor<32x64xf32>
 // CHECK-NEXT: %{{.*}}:4 = scf.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} iter_args(%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) -> (i32, i32, index, index) : i32 {
 
-// No slot is reused, so no release flag runs backwards and the schedule has
+// No transfer slot is reused within the iteration, so the schedule has
 // nothing to pipeline against: all four score tiles are produced before CUBE
 // waits on the first P hand-off.  Four QK forward flags, four P, four PV and
 // one back-edge release: thirteen.
@@ -90,7 +99,7 @@
 // CHECK-NEXT: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 11
 
 // The back edge: every slot has been read before the next trip rewrites it.
-// CHECK: hivm.hir.sync_block_wait[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 12
+// CHECK: hivm.hir.sync_block_wait[<CUBE>, <PIPE_V>, <PIPE_FIX>] flag = 12
 
 // CHECK: scope.return
 // CHECK-NEXT: } {hivm.tcore_type = #hivm.tcore_type<CUBE>, noinline}
@@ -126,7 +135,7 @@
 // CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_FIX>, <PIPE_V>] flag = 9
 // CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_FIX>, <PIPE_V>] flag = 10
 // CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_FIX>, <PIPE_V>] flag = 11
-// CHECK: hivm.hir.sync_block_set[<VECTOR>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 12
+// CHECK: hivm.hir.sync_block_set[<VECTOR>, <PIPE_V>, <PIPE_FIX>] flag = 12
 
 // Nothing runs the other way: no release flag exists in either direction.
 // CHECK-NOT: sync_block{{.*}}<PIPE_V>, <PIPE_FIX>

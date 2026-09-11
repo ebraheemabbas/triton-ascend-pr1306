@@ -3,6 +3,7 @@
 // A function may contain enclosing control loops as long as it has exactly one
 // innermost candidate loop. Verify that the inner mixed CUBE/VECTOR loop is
 // transformed while its enclosing loop remains intact.
+// The round-trip dataflow supplies the ownership proof needed for commit.
 
 // CHECK-LABEL: func.func @nested_mixed_candidate
 // CHECK: scf.for
@@ -31,6 +32,11 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {
             ins(%lhs, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
             outs(%init : tensor<32x16xf32>) -> tensor<32x16xf32>
         %vector = math.exp %matmul : tensor<32x16xf32>
+        %probability = arith.truncf %vector : tensor<32x16xf32> to tensor<32x16xf16>
+        %product = linalg.matmul
+            ins(%probability, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
+            outs(%init : tensor<32x16xf32>) -> tensor<32x16xf32>
+        %output = math.exp %product : tensor<32x16xf32>
       }
     }
     return

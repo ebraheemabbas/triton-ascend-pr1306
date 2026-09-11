@@ -34,7 +34,8 @@
 // With one slot per lane everywhere -- four union slots for the merged
 // CUBE->VECTOR roles, four L1 slots, and one back-edge release -- the schedule
 // needs thirteen IDs, so shifting past the occupied zero places them on 1..13.
-// COLLISION: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 0
+// The classifier marks pre-existing synchronization as external.
+// COLLISION: hivm.hir.sync_block_set {ssbuffer.block_id = 1 : i32, ssbuffer.external_sync = 1 : i32}[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 0
 // COLLISION: scope.scope
 // COLLISION: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 1
 // COLLISION: hivm.hir.sync_block_wait[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 5

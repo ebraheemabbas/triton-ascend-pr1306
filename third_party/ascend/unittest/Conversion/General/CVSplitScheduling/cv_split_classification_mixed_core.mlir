@@ -2,7 +2,9 @@
 // RUN: triton-opt %s --debug-only=cv-split-scheduling "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" 2>&1 >/dev/null | FileCheck %s --check-prefix=DIAG
 
 // DIAG-LABEL: [cv-split] Function: cube_and_vector
-// DIAG: [cv-split] Classification: 4C 4V
+// A complete CUBE -> VECTOR -> CUBE -> VECTOR cycle gives the resource
+// planner a provable release path; a lone matmul/exp must instead roll back.
+// DIAG: [cv-split] Classification: 8C 12V
 // DIAG-NOT: Loop must contain both CUBE and VECTOR ops, skip
 
 // IR-NOT: ssbuffer.core_type
@@ -24,6 +26,11 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {
       %matmul = linalg.matmul ins(%lhs, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
           outs(%init : tensor<32x16xf32>) -> tensor<32x16xf32>
       %result = math.exp %matmul : tensor<32x16xf32>
+      %probability = arith.truncf %result : tensor<32x16xf32> to tensor<32x16xf16>
+      %product = linalg.matmul
+          ins(%probability, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
+          outs(%init : tensor<32x16xf32>) -> tensor<32x16xf32>
+      %output = math.exp %product : tensor<32x16xf32>
     }
     return
   }

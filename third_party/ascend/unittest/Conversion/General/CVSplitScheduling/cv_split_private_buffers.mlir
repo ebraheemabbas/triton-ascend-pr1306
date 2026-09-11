@@ -48,11 +48,14 @@
 // function's parameters bufferize with an identity layout map and a strided
 // window could never be cast across that boundary.
 // AUTOVIEW-DAG: memref.reinterpret_cast %{{.*}} to offset: [0], sizes: [16, 32], strides: [32, 1] : memref<16x64xf32, #hivm.address_space<ub>> to memref<16x32xf32, #hivm.address_space<ub>>
+// The release orders the last VECTOR read before a future FIXPIPE write.
+// Check both ends of that channel, not just the presence of a flag number.
 // Four QK + four PV forward flags, four L1 flags, one back-edge release: 0..12.
-// AUTOVIEW-DAG: flag = 12
+// AUTOVIEW-DAG: hivm.hir.sync_block_wait[<CUBE>, <PIPE_V>, <PIPE_FIX>] flag = 12
+// AUTOVIEW-DAG: hivm.hir.sync_block_set[<VECTOR>, <PIPE_V>, <PIPE_FIX>] flag = 12
 // AUTOVIEW-NOT: flag = 13
-// The release must not introduce a reverse-pipe channel; both stay canonical.
-// AUTOVIEW-NOT: sync_block{{.*}}<PIPE_V>, <PIPE_FIX>
+// The release must not use the probability-transfer MTE3/MTE1 channel.
+// AUTOVIEW-NOT: sync_block{{.*}}<PIPE_MTE3>, <PIPE_MTE1>] flag = 12
 // AUTOVIEW-NOT: sync_block{{.*}}<PIPE_MTE1>, <PIPE_MTE3>
 
 // A budget of zero declines the spend: the CUBE->VECTOR pools keep the
