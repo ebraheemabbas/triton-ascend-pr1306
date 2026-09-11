@@ -147,7 +147,7 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       [](mlir::PassManager &pm, bool compileOn91095, int unrollFactor,
          bool promoteFullyUnrolled, int64_t privateBufferUbBudgetBytes,
          bool enablePlanDrivenEarlyPublish, int scheduleCandidateId,
-         const std::string &postSplitScheduleMode, bool enableL0CDrainWidening,
+         const std::string &postSplitScheduleMode,
          const std::string &l0cBufferMode) {
         CVSplitSchedulingOptions opts;
         opts.compileOn91095 = compileOn91095;
@@ -155,7 +155,6 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
         opts.enablePlanDrivenEarlyPublish = enablePlanDrivenEarlyPublish;
         opts.scheduleCandidateId = scheduleCandidateId;
         opts.postSplitScheduleMode = postSplitScheduleMode;
-        opts.enableL0CDrainWidening = enableL0CDrainWidening;
         opts.l0cBufferMode = l0cBufferMode;
         opts.promoteFullyUnrolled = promoteFullyUnrolled;
         opts.privateBufferUbBudgetBytes = privateBufferUbBudgetBytes;
@@ -167,8 +166,7 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       py::arg("enable_plan_driven_early_publish") = false,
       py::arg("schedule_candidate_id") = -1,
       py::arg("post_split_schedule_mode") = "disabled",
-      py::arg("enable_l0c_drain_widening") = true,
-      py::arg("l0c_buffer_mode") = "backend");
+      py::arg("l0c_buffer_mode") = "explicit");
 
   m.def(
       "add_graph_optimize",

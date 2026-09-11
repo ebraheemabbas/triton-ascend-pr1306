@@ -108,9 +108,6 @@ struct PostCVSplitSchedulePlan {
   unsigned scoreUbSlotCount = 0;
   unsigned probabilitySlotCount = 0;
   unsigned productUbSlotCount = 0;
-  // Maximum results awaiting FIXPIPE publication per matrix lineage.
-  unsigned scoreL0CWindow = 0;
-  unsigned productL0CWindow = 0;
   uint64_t scoreBytesPerSlot = 0;
   uint64_t probabilityBytesPerSlot = 0;
   uint64_t productBytesPerSlot = 0;
@@ -137,8 +134,7 @@ struct PostCVSplitSchedulePlan {
 PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
     const PostCVSplitRequestSet &requests,
     const CrossCoreResourcePlan &currentResources,
-    const CrossCoreResourceLimits &limits,
-    bool enableL0CDrainWidening = true);
+    const CrossCoreResourceLimits &limits);
 
 void logPostCVSplitSchedulePlan(const PostCVSplitSchedulePlan &plan);
 

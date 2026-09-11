@@ -1,6 +1,6 @@
-// RUN: %PYTHON %S/Inputs/check_l0c_drain_control.py triton-opt %s
+// RUN: %PYTHON %S/Inputs/check_l0c_storage.py triton-opt %s
 //
-// Dense attention recurrence: checks generic and full materialized drain policy.
+// Dense attention recurrence: explicit-default storage and immediate publication.
 // Locations removed from a pre-CVSplit compiler capture; no runtime data.
 
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {

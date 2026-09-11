@@ -1,4 +1,4 @@
-"""Check drain placement independently from vector code and UB ownership."""
+"""Check explicit-default storage and own-producer publication invariants."""
 import pathlib
 import re
 import subprocess
@@ -10,14 +10,14 @@ APPLIED = "triton_ascend.cv_split_scheduling.applied = 1"
 PRESERVE = "triton_ascend.cv_split_scheduling.preserve_explicit_schedule"
 
 
-def run(tool, source, candidate=2, unroll=4, mode="disabled", widening=None,
+def run(tool, source, candidate=2, unroll=4, mode="disabled", storage=None,
         extra=""):
     options = (f"compile-on-910-95=true unroll-factor={unroll} "
                f"schedule-candidate-id={candidate} "
                f"enable-plan-driven-early-publish=true "
                f"post-split-schedule-mode={mode} {extra}")
-    if widening is not None:
-        options += f" enable-l0c-drain-widening={str(widening).lower()}"
+    if storage is not None:
+        options += f" l0c-buffer-mode={storage}"
     result = subprocess.run([tool, f"--cv_split_scheduling={options}"],
                             input=source, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
@@ -74,22 +74,22 @@ def resources(ir):
 
 def check_pair(tool, source, mode, unroll=4):
     default = run(tool, source, unroll=unroll, mode=mode)
-    on = run(tool, source, unroll=unroll, mode=mode, widening=True)
-    off = run(tool, source, unroll=unroll, mode=mode, widening=False)
-    assert default == on, "default-on changed the pass output"
-    assert APPLIED in on and APPLIED in off, "unexpected CVSplit fallback"
-    assert (PRESERVE in on) == (mode == "materialize")
-    assert (PRESERVE in off) == (mode == "materialize")
-    assert live_depths(on, unroll) == [2, 2]
-    assert live_depths(off, unroll) == [1, 1]
-    assert resources(on) == resources(off), "UB allocations or event contracts changed"
-    assert without_ssa(scope(on, "VECTOR")) == without_ssa(scope(off, "VECTOR")), \
-        "VECTOR transformations changed with the drain switch"
+    explicit = run(tool, source, unroll=unroll, mode=mode, storage="explicit")
+    backend = run(tool, source, unroll=unroll, mode=mode, storage="backend")
+    assert default == explicit, "explicit pools are not the default"
+    assert APPLIED in default and APPLIED in backend, "unexpected CVSplit fallback"
+    assert (PRESERVE in default) == (mode == "materialize")
+    assert (PRESERVE in backend) == (mode == "materialize")
+    assert live_depths(default, unroll) == live_depths(backend, unroll) == [1, 1]
+    allocations, events = resources(default)
+    assert ([a for a in allocations if "address_space<cc>" not in a], events) == resources(backend)
+    assert without_ssa(scope(default, "VECTOR")) == without_ssa(scope(backend, "VECTOR")), \
+        "VECTOR transformations changed with the storage policy"
     if mode == "materialize":
-        assert 'vector_mode = "simd"' in scope(off, "VECTOR")
-        assert "tensor<64xf32>" in off
-        assert "#hivm.address_space<cbuf>" in off
-    print(f"PASS mode={mode} U={unroll}: default=on, live 2/2 -> 1/1; vector/resources unchanged")
+        assert 'vector_mode = "simd"' in scope(default, "VECTOR")
+        assert "tensor<64xf32>" in default
+        assert "#hivm.address_space<cbuf>" in default
+    print(f"PASS mode={mode} U={unroll}: explicit default, own-producer drains, vector/UB unchanged")
 
 
 def main():
@@ -100,29 +100,29 @@ def main():
     # The narrow fixture exercises a different BM/BN/HD, including HD64.
     narrow = pathlib.Path(fixture).with_name("cv_split_scheduling_fa.mlir").read_text()
     check_pair(tool, narrow, "disabled")
-    # U2 fits available flags. Larger unrolls retain the existing resource gates;
-    # disabling widening must neither bypass those gates nor change fallback IR.
+    # U2 fits available flags. Larger unrolls retain the existing resource gates.
     for unroll in (2, 8, 16):
         for candidate in (-1, 0, 1, 2):
-            on = run(tool, source, unroll=unroll, candidate=candidate, widening=True)
-            off = run(tool, source, unroll=unroll, candidate=candidate, widening=False)
-            assert (APPLIED in on) == (APPLIED in off)
-            if APPLIED in off:
-                assert live_depths(off, unroll) == [1, 1]
-                assert resources(on) == resources(off)
+            default = run(tool, source, unroll=unroll, candidate=candidate)
+            backend = run(tool, source, unroll=unroll, candidate=candidate, storage="backend")
+            assert (APPLIED in default) == (APPLIED in backend)
+            if APPLIED in default:
+                assert live_depths(default, unroll) == live_depths(backend, unroll) == [1, 1]
             else:
-                assert on == off
-    for candidate in (-1, 0):
-        assert run(tool, source, candidate=candidate, widening=True) == \
-            run(tool, source, candidate=candidate, widening=False)
+                assert default == backend
     for shape in (source, narrow):
         for extra in ("private-buffer-ub-budget-bytes=0",):
-            on = run(tool, shape, widening=True, extra=extra)
-            off = run(tool, shape, widening=False, extra=extra)
-            assert (APPLIED in on) == (APPLIED in off)
-    on = run(tool, narrow, mode="materialize", widening=True)
-    off = run(tool, narrow, mode="materialize", widening=False)
-    assert APPLIED not in on and APPLIED not in off and on == off
+            default = run(tool, shape, extra=extra)
+            backend = run(tool, shape, storage="backend", extra=extra)
+            assert (APPLIED in default) == (APPLIED in backend)
+    default = run(tool, narrow, mode="materialize")
+    backend = run(tool, narrow, mode="materialize", storage="backend")
+    assert APPLIED not in default and APPLIED not in backend and default == backend
+    for value in ("true", "false"):
+        retired = subprocess.run(
+            [tool, f"--cv_split_scheduling=compile-on-910-95=true enable-l0c-drain-widening={value}"],
+            input=source, text=True, capture_output=True)
+        assert retired.returncode != 0 and "enable-l0c-drain-widening" in retired.stderr
     print("PASS alternate candidates/unrolls and asymmetric materializer fallback")
 
 

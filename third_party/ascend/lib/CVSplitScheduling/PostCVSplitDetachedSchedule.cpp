@@ -442,8 +442,8 @@ static PostCVSplitDetachedScheduleStatus verifyLiveDepths(
     }
   }
   if (scoreLive != 0 || productLive != 0 ||
-      schedule.observedMaxScoreLive > plan.scoreL0CWindow ||
-      schedule.observedMaxProductLive > plan.productL0CWindow ||
+      schedule.observedMaxScoreLive > 1 ||
+      schedule.observedMaxProductLive > 1 ||
       llvm::any_of(scorePublished, [](bool value) { return !value; }) ||
       llvm::any_of(productPublished, [](bool value) { return !value; }))
     return PostCVSplitDetachedScheduleStatus::LiveDepthExceeded;
@@ -582,18 +582,15 @@ buildPostCVSplitDetachedSchedule(const PostCVSplitSchedulePlan &plan) {
   };
 
   const unsigned lanes = plan.recurrence.logicalLaneCount;
-  for (unsigned lane = 0; lane < std::min(lanes, plan.scoreL0CWindow); ++lane)
+  // Storage owns overlap/reuse; every logical result is published immediately
+  // after its own producer, independently of the two-slot UB/CC pool counts.
+  for (unsigned lane = 0; lane < lanes; ++lane) {
     if (!appendScoreMatmul(lane))
       return reject(
           PostCVSplitDetachedScheduleStatus::MissingSlotAssignment);
-  for (unsigned lane = 0; lane < lanes; ++lane) {
     PostCVSplitDetachedScheduleStatus status = appendScorePublication(lane);
     if (status != PostCVSplitDetachedScheduleStatus::Ready)
       return reject(status);
-    const unsigned refillLane = lane + plan.scoreL0CWindow;
-    if (refillLane < lanes && !appendScoreMatmul(refillLane))
-      return reject(
-          PostCVSplitDetachedScheduleStatus::MissingSlotAssignment);
   }
 
   auto appendProductPublication = [&](unsigned lane) {
@@ -638,17 +635,6 @@ buildPostCVSplitDetachedSchedule(const PostCVSplitSchedulePlan &plan) {
                PostCVSplitDetachedCommandKind::ProductMatmul,
                PostCVSplitLineageRole::Product, lane, productSlot->slot,
                PrincipalResource::Matrix);
-    if (lane + 1 >= plan.productL0CWindow) {
-      const unsigned publishLane = lane + 1 - plan.productL0CWindow;
-      PostCVSplitDetachedScheduleStatus status =
-          appendProductPublication(publishLane);
-      if (status != PostCVSplitDetachedScheduleStatus::Ready)
-        return reject(status);
-    }
-  }
-  const unsigned firstDeferredProduct =
-      lanes - std::min(lanes, plan.productL0CWindow - 1);
-  for (unsigned lane = firstDeferredProduct; lane < lanes; ++lane) {
     PostCVSplitDetachedScheduleStatus status =
         appendProductPublication(lane);
     if (status != PostCVSplitDetachedScheduleStatus::Ready)

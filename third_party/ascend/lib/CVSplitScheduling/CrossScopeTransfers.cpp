@@ -80,10 +80,6 @@ struct TransferSyncPlan {
 struct CrossScopeTransfer {
   Value value;
   Operation *producer;
-  /// Where the CUBE-to-VECTOR fixpipe is emitted. Normally the producer, so
-  /// the tile is drained as soon as it is formed; software pipelining moves it
-  /// past a later matmul so the drain and that matmul overlap.
-  Operation *fixpipeAnchor;
   Operation *transferInsertionAnchor;
   Operation *waitInsertionAnchor;
   SmallVector<Operation *> consumers;
@@ -150,7 +146,7 @@ static FailureOr<SmallVector<CrossScopeTransfer>> findCrossScopeValues(
           FailureOr<int64_t> originId = getUnrollOriginId(&op);
           if (failed(originId))
             return failure();
-          transfers.push_back({result, &op, /*fixpipeAnchor=*/&op, &op,
+          transfers.push_back({result, &op, &op,
                                crossUsers.front(), crossUsers,
                                CrossScopeTransfer::CUBE_TO_VECTOR, *originId});
         }
@@ -185,7 +181,7 @@ static FailureOr<SmallVector<CrossScopeTransfer>> findCrossScopeValues(
                 "VECTOR-to-CUBE producer is missing its scheduled phase end");
             return failure();
           }
-          transfers.push_back({result, &op, /*fixpipeAnchor=*/&op,
+          transfers.push_back({result, &op,
                                transferAnchor, crossUsers.front(), crossUsers,
                                CrossScopeTransfer::VECTOR_TO_CUBE, *originId});
         }
@@ -404,7 +400,7 @@ emitCubeToVectorTransfer(const TransferEmitContext &c, CrossScopeTransfer &xfer,
   // denominator reduction) in one fusible region.  Inserting the pack and
   // sync immediately after the P producer splits that region into two VFs
   // and keeps its full score tile live across the synchronization boundary.
-  builder.setInsertionPointAfter(xfer.fixpipeAnchor);
+  builder.setInsertionPointAfter(xfer.producer);
 
   Value quantScale;
   hivm::FixpipePreQuantModeAttr preQuantAttr;
@@ -739,7 +735,7 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
     const CrossCoreResourcePlan *resourcePlan,
     const CrossCoreScheduleCandidate *scheduleCandidate,
     unsigned interCoreBufferDepth, uint64_t privateBufferUbBudgetBytes,
-    unsigned vectorToCubeSlotOverride, bool enableL0CDrainWidening) {
+    unsigned vectorToCubeSlotOverride) {
 
   MLIRContext *ctx = loop.getContext();
   Location loc = loop.getLoc();
@@ -1275,61 +1271,27 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
                << requiredFlags << " flags\n");
   }
 
-  // The shared DCVP buffer-count policy controls the pool depth. Same-typed
-  // buffers (all unrolled qk_ub, all pv_ub, all P L1) rotate over that many
-  // physical allocations; absence of a frontend policy defaults to two.
-  DenseMap<int64_t, unsigned> candidateDrainLagByOrigin;
+  // Preserve the selected candidate's capability and lineage checks, without
+  // using those capabilities to move drains away from their producers.
   if (scheduleCandidate) {
+    llvm::DenseSet<int64_t> candidateMatrixOrigins;
     for (const ScheduleMatrixLineageLimit &limit :
          scheduleCandidate->matrixLineageLimits) {
       if (limit.direction != CrossCoreDirection::CubeToVector ||
           limit.inFlightLimit == 0 || limit.inFlightLimit > 2 ||
-          !candidateDrainLagByOrigin
-               .try_emplace(limit.originId,
-                            enableL0CDrainWidening ? limit.inFlightLimit - 1 : 0)
-               .second)
+          !candidateMatrixOrigins.insert(limit.originId).second)
         return failure();
     }
-  }
-
-  // Software-pipeline the L0C drain. A matmul and the fixpipe that drains it
-  // are different units, but emitting them adjacently keeps every accumulator's
-  // live range disjoint from the next one's -- so the memory planner overlays
-  // them all onto one L0C address and the resulting write-after-read ordering
-  // makes the two units take turns. Moving each drain past the following matmul
-  // makes consecutive live ranges overlap, which forces the planner to keep
-  // them apart and lets the units run at the same time. Costs one extra live
-  // accumulator per widened lineage and delays each nonterminal tile's arrival
-  // on VECTOR by one matmul. The final tile keeps its producer anchor so the
-  // finite unrolled pipeline drains completely.
-  if (scheduleCandidate) {
-    llvm::MapVector<int64_t, SmallVector<CrossScopeTransfer *>> byOrigin;
-    for (CrossScopeTransfer &xfer : transfers)
-      if (xfer.direction == CrossScopeTransfer::CUBE_TO_VECTOR)
-        byOrigin[xfer.originId].push_back(&xfer);
-    if (scheduleCandidate &&
-        byOrigin.size() != candidateDrainLagByOrigin.size())
-      return failure();
-    for (auto &entry : byOrigin) {
-      SmallVector<CrossScopeTransfer *> &lanes = entry.second;
-      const unsigned drainLag =
-          candidateDrainLagByOrigin.lookup(entry.first);
-      if (scheduleCandidate && !candidateDrainLagByOrigin.contains(entry.first))
-        return failure();
-      LLVM_DEBUG(llvm::dbgs()
-                 << "[cv-split] forced schedule drain origin=" << entry.first
-                 << " effective-in-flight=" << (drainLag + 1)
-                 << " widening=" << (enableL0CDrainWidening ? "on" : "off")
-                 << " lag=" << drainLag
-                 << " lanes=" << lanes.size() << "\n");
-      if (drainLag == 0)
+    llvm::DenseSet<int64_t> emittedMatrixOrigins;
+    for (const CrossScopeTransfer &xfer : transfers) {
+      if (xfer.direction != CrossScopeTransfer::CUBE_TO_VECTOR)
         continue;
-      for (unsigned i = 0; i + 1 < lanes.size(); ++i) {
-        const unsigned ahead =
-            std::min<unsigned>(i + drainLag, lanes.size() - 1);
-        lanes[i]->fixpipeAnchor = lanes[ahead]->producer;
-      }
+      if (!candidateMatrixOrigins.contains(xfer.originId))
+        return failure();
+      emittedMatrixOrigins.insert(xfer.originId);
     }
+    if (emittedMatrixOrigins.size() != candidateMatrixOrigins.size())
+      return failure();
   }
 
   BufferPool bufferPool;

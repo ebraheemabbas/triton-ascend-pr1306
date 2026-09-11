@@ -1,9 +1,9 @@
-"""Structural, fallback and independence tests for opt-in L0C materialization."""
+"""Structural, fallback and independence tests for default L0C materialization."""
 from pathlib import Path
 import re
 import subprocess
 import sys
-from check_l0c_drain_control import APPLIED, SSA, live_depths, run, scope, without_ssa
+from check_l0c_storage import APPLIED, SSA, live_depths, run, scope, without_ssa
 
 MARKER = "triton_ascend.cv_split_scheduling.explicit_l0c_applied = 1"
 
@@ -37,21 +37,18 @@ def check_storage(ir, lanes):
 
 
 def compare(tool, source, mode, lanes=4):
-    for widening in (True, False):
-        ordinary = run(tool, source, mode=mode, unroll=lanes, widening=widening)
-        explicit = run(tool, source, mode=mode, unroll=lanes, widening=widening,
-                       extra="l0c-buffer-mode=explicit")
-        backend = run(tool, source, mode=mode, unroll=lanes, widening=widening,
-                      extra="l0c-buffer-mode=backend")
-        assert backend == ordinary, 'backend default changed IR'
-        check_storage(explicit, lanes)
-        assert without_ssa(scope(ordinary, 'VECTOR')) == without_ssa(scope(explicit, 'VECTOR'))
-        old_allocations = re.findall(r'memref.alloc\(\).*', ordinary)
-        new_allocations = [line for line in re.findall(r'memref.alloc\(\).*', explicit)
-                           if 'address_space<cc>' not in line]
-        assert old_allocations == new_allocations
-        assert re.findall(r'hivm.hir.sync_block_[^\n]+', ordinary) == re.findall(r'hivm.hir.sync_block_[^\n]+', explicit)
-        assert live_depths(ordinary, lanes) == live_depths(explicit, lanes)
+    default = run(tool, source, mode=mode, unroll=lanes)
+    explicit = run(tool, source, mode=mode, unroll=lanes, storage="explicit")
+    backend = run(tool, source, mode=mode, unroll=lanes, storage="backend")
+    assert default == explicit, 'explicit storage is not the default'
+    check_storage(explicit, lanes)
+    assert without_ssa(scope(backend, 'VECTOR')) == without_ssa(scope(explicit, 'VECTOR'))
+    old_allocations = re.findall(r'memref.alloc\(\).*', backend)
+    new_allocations = [line for line in re.findall(r'memref.alloc\(\).*', explicit)
+                       if 'address_space<cc>' not in line]
+    assert old_allocations == new_allocations
+    assert re.findall(r'hivm.hir.sync_block_[^\n]+', backend) == re.findall(r'hivm.hir.sync_block_[^\n]+', explicit)
+    assert live_depths(backend, lanes) == live_depths(explicit, lanes) == [1, 1]
     print(f'EXPLICIT_STORAGE=PASS mode={mode} lanes={lanes}')
 
 
@@ -63,14 +60,14 @@ compare(tool, source, 'disabled', lanes=2)
 narrow = Path(fixture).with_name('cv_split_scheduling_fa_m64_n128_seq4096.mlir').read_text()
 compare(tool, narrow, 'disabled')
 for candidate in (narrow, source.replace('128', '256')):
-    ordinary = run(tool, candidate, mode='materialize', widening=False)
-    explicit = run(tool, candidate, mode='materialize', widening=False, extra='l0c-buffer-mode=explicit')
+    ordinary = run(tool, candidate, mode='materialize', storage='backend')
+    explicit = run(tool, candidate, mode='materialize')
     assert MARKER not in explicit and explicit == ordinary
 nonzero = source.replace('arith.constant 0.000000e+00 : f32', 'arith.constant 1.000000e+00 : f32')
 negative_zero = source.replace('arith.constant 0.000000e+00 : f32', 'arith.constant -0.000000e+00 : f32')
 for initial in (nonzero, negative_zero):
-    ordinary = run(tool, initial, widening=False)
-    explicit = run(tool, initial, widening=False, extra='l0c-buffer-mode=explicit')
+    ordinary = run(tool, initial, storage='backend')
+    explicit = run(tool, initial)
     assert MARKER not in explicit and ordinary == explicit
 invalid = subprocess.run([tool, '--cv_split_scheduling=compile-on-910-95=true l0c-buffer-mode=invalid'],
                          input=source, text=True, capture_output=True)

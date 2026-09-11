@@ -299,7 +299,6 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                 private_buffer_ub_budget_bytes=metadata["cv_split_private_buffer_ub_budget_bytes"],
                 enable_plan_driven_early_publish=metadata["cv_split_enable_plan_driven_early_publish"],
                 schedule_candidate_id=metadata["cv_split_schedule_candidate_id"],
-                enable_l0c_drain_widening=metadata["cv_split_enable_l0c_drain_widening"],
                 l0c_buffer_mode=metadata["cv_split_l0c_buffer_mode"],
                 post_split_schedule_mode=metadata[
                     "cv_split_post_split_schedule_mode"])
@@ -1218,12 +1217,10 @@ class NPUOptions:
     # without selecting one; nonnegative requests a deterministic candidate ID.
     # The initial override accepts only structurally all-one behavior.
     cv_split_schedule_candidate_id: int = -1
-    # Control only candidate-driven FIXPIPE anchor widening. Buffer ownership,
-    # candidate capabilities, V prefetch and full materialization are independent.
-    cv_split_enable_l0c_drain_widening: bool = True
-    # Independent storage policy. Explicit mode is opt-in and reports actual
-    # application in launch metadata; it does not enable/disable drain widening.
-    cv_split_l0c_buffer_mode: str = "backend"
+    # Explicit pools are the default for eligible CVSplit matrix families.
+    # The backend override is retained for diagnostics. Actual application or
+    # fallback is reported in launch metadata; drains stay with their producer.
+    cv_split_l0c_buffer_mode: str = "explicit"
     # Post-split schedule policy. "disabled" keeps the generic path and
     # "materialize" verifies and publishes both scopes transactionally.
     cv_split_post_split_schedule_mode: str = "disabled"

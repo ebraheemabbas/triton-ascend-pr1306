@@ -126,9 +126,6 @@ static bool verifyPlan(const PostCVSplitSchedulePlan &plan) {
   if (lanes < 2 || plan.scoreUbSlotCount == 0 ||
       plan.productUbSlotCount == 0 || plan.probabilitySlotCount != lanes ||
       plan.scoreUbSlotCount > lanes || plan.productUbSlotCount > lanes ||
-      plan.scoreL0CWindow == 0 || plan.productL0CWindow == 0 ||
-      plan.scoreL0CWindow > plan.scoreUbSlotCount ||
-      plan.productL0CWindow > plan.productUbSlotCount ||
       plan.slots.size() != 3 * lanes || plan.vectorLanes.size() != lanes ||
       plan.requiredEventCount != plan.events.size() ||
       plan.forwardEventCount != 3 * lanes ||
@@ -173,7 +170,7 @@ static bool verifyPlan(const PostCVSplitSchedulePlan &plan) {
 PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
     const PostCVSplitRequestSet &requests,
     const CrossCoreResourcePlan &currentResources,
-    const CrossCoreResourceLimits &limits, bool enableL0CDrainWidening) {
+    const CrossCoreResourceLimits &limits) {
   PostCVSplitSchedulePlan plan;
   plan.firstLogicalFlagId = limits.firstAvailableFlagId;
   plan.maximumLogicalFlagId = kMaximumLogicalFlagId;
@@ -317,8 +314,6 @@ PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
   plan.scoreUbSlotCount = std::min(2u, lanes);
   plan.productUbSlotCount = std::min(2u, lanes);
   plan.probabilitySlotCount = lanes;
-  plan.scoreL0CWindow = enableL0CDrainWidening ? plan.scoreUbSlotCount : 1;
-  plan.productL0CWindow = enableL0CDrainWidening ? plan.productUbSlotCount : 1;
   plan.scoreBytesPerSlot = scoreTransfer.bytes;
   plan.probabilityBytesPerSlot = probabilityTransfer.bytes;
   plan.productBytesPerSlot = productTransfer.bytes;
@@ -462,8 +457,6 @@ void logPostCVSplitSchedulePlan(const PostCVSplitSchedulePlan &plan) {
                  << plan.scoreUbSlotCount
                  << " probability-slots=" << plan.probabilitySlotCount
                  << " product-ub-slots=" << plan.productUbSlotCount
-                 << " score-l0c-window=" << plan.scoreL0CWindow
-                 << " product-l0c-window=" << plan.productL0CWindow
                  << " score-bytes=" << plan.scoreBytesPerSlot
                  << " probability-bytes=" << plan.probabilityBytesPerSlot
                  << " product-bytes=" << plan.productBytesPerSlot

@@ -83,14 +83,10 @@ def _make_torch_npu_mock(cfg_dir):
 def test_cv_split_l0c_storage_option_and_cache_key(monkeypatch):
     monkeypatch.setattr(compiler, "get_cann_version_file_hash", lambda: "fixed-toolchain")
     defaults = compiler.NPUOptions()
-    assert defaults.cv_split_l0c_buffer_mode == "backend"
-    assert defaults.hash() == compiler.NPUOptions(cv_split_l0c_buffer_mode="backend").hash()
-    for widening in (True, False):
-        backend = compiler.NPUOptions(cv_split_enable_l0c_drain_widening=widening)
-        explicit = compiler.NPUOptions(cv_split_l0c_buffer_mode="explicit",
-                                       cv_split_enable_l0c_drain_widening=widening)
-        assert explicit.cv_split_enable_l0c_drain_widening is widening
-        assert explicit.hash() != backend.hash()
+    assert defaults.cv_split_l0c_buffer_mode == "explicit"
+    assert defaults.hash() == compiler.NPUOptions(cv_split_l0c_buffer_mode="explicit").hash()
+    backend = compiler.NPUOptions(cv_split_l0c_buffer_mode="backend")
+    assert defaults.hash() != backend.hash()
 
 
 @pytest.mark.parametrize("applied", [True, False])
@@ -100,32 +96,19 @@ def test_cv_split_l0c_application_metadata(monkeypatch, applied):
                         lambda mod, name: int(applied) if name == marker else -1)
     metadata = {}
     compiler._adjust_metadata_by_module_result(
-        None, metadata, compiler.NPUOptions(cv_split_l0c_buffer_mode="explicit"))
+        None, metadata, compiler.NPUOptions())
     assert metadata["cv_split_l0c_buffers_applied"] is applied
     ordinary = {}
-    compiler._adjust_metadata_by_module_result(None, ordinary, compiler.NPUOptions())
+    compiler._adjust_metadata_by_module_result(
+        None, ordinary, compiler.NPUOptions(cv_split_l0c_buffer_mode="backend"))
     assert "cv_split_l0c_buffers_applied" not in ordinary
 
 
-def test_cv_split_l0c_drain_control_is_independent_and_cache_keyed(monkeypatch):
-    # Test option hashing without requiring a local CANN installation.
-    monkeypatch.setattr(compiler, "get_cann_version_file_hash", lambda: "fixed-toolchain")
-    defaults = compiler.NPUOptions()
-    assert defaults.cv_split_enable_l0c_drain_widening is True
-    explicit_on = compiler.NPUOptions(cv_split_enable_l0c_drain_widening=True)
-    assert defaults.hash() == explicit_on.hash()
-    for mode in ("disabled", "materialize"):
-        on = compiler.NPUOptions(cv_split_schedule_candidate_id=2,
-                                 cv_split_post_split_schedule_mode=mode,
-                                 cv_split_enable_plan_driven_early_publish=True)
-        off = compiler.NPUOptions(cv_split_schedule_candidate_id=2,
-                                  cv_split_post_split_schedule_mode=mode,
-                                  cv_split_enable_plan_driven_early_publish=True,
-                                  cv_split_enable_l0c_drain_widening=False)
-        assert off.cv_split_schedule_candidate_id == on.cv_split_schedule_candidate_id
-        assert off.cv_split_post_split_schedule_mode == on.cv_split_post_split_schedule_mode
-        assert off.cv_split_enable_plan_driven_early_publish is True
-        assert on.hash() != off.hash()
+@pytest.mark.parametrize("value", [True, False])
+def test_removed_l0c_widening_option_is_rejected(value):
+    assert "cv_split_enable_l0c_drain_widening" not in compiler.NPUOptions.__dataclass_fields__
+    with pytest.raises(TypeError, match="cv_split_enable_l0c_drain_widening"):
+        compiler.NPUOptions(cv_split_enable_l0c_drain_widening=value)
 
 
 def _write_acl_config(cfg_dir, config):
