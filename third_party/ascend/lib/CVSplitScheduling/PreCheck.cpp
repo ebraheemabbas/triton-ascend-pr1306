@@ -22,7 +22,9 @@
 
 #include "ascend/include/CVSplitScheduling/PreCheck.h"
 #include "ascend/include/CVSplitScheduling/HardwareConstants.h"
+#include "ascend/include/CVSplitScheduling/UnfusePVMatmuls.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -31,6 +33,8 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "mlir/Interfaces/DestinationStyleOpInterface.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
@@ -41,6 +45,9 @@
 using namespace mlir;
 using mlir::triton::cv_split::kNzTileSize;
 namespace {
+
+constexpr llvm::StringLiteral kLoopCarriedConsumersAttr =
+    "cv_split.loop_carried_consumers";
 
 static SmallVector<scf::ForOp> collectInnermostLoops(func::FuncOp funcOp) {
   SmallVector<scf::ForOp> loops;
@@ -277,4 +284,143 @@ mlir::triton::cv_split::preCheckCVSplitScheduling(func::FuncOp funcOp,
   }
 
   return candidate;
+}
+
+void mlir::triton::cv_split::markLoopCarriedConsumers(scf::ForOp loop) {
+  // Store operand numbers, not SSA names or operation order. Unrolling remaps
+  // the values but preserves these operand positions on cloned operations.
+  loop.walk([&](Operation *operation) {
+    if (operation == loop.getOperation() || isa<scf::YieldOp>(operation))
+      return;
+    SmallVector<int64_t> operands;
+    for (OpOperand &use : operation->getOpOperands()) {
+      auto argument = dyn_cast<BlockArgument>(use.get());
+      if (argument && argument.getOwner() == loop.getBody() &&
+          argument.getArgNumber() != 0)
+        operands.push_back(use.getOperandNumber());
+    }
+    if (!operands.empty())
+      operation->setAttr(kLoopCarriedConsumersAttr,
+                         DenseI64ArrayAttr::get(loop.getContext(), operands));
+  });
+}
+
+void mlir::triton::cv_split::removeLoopCarriedConsumerMarkers(Operation *root) {
+  root->walk([](Operation *operation) {
+    operation->removeAttr(kLoopCarriedConsumersAttr);
+  });
+}
+
+LogicalResult mlir::triton::cv_split::preCheckCrossIterationConsumers(
+    scf::ForOp loop, const Classification &classification,
+    const AccumulatorJoinRewriteResult &accumulatorJoins) {
+  if (!loop)
+    return failure();
+  Block *body = loop.getBody();
+  auto yield = dyn_cast<scf::YieldOp>(body->getTerminator());
+  if (!yield || yield.getNumOperands() != loop.getNumRegionIterArgs())
+    return failure();
+
+  // Full unrolling keeps one scaffold iteration. Its initial arguments do not
+  // consume the final yield; the real inter-iteration edges are now marked SSA
+  // edges in the body. Avoid inventing an extra execution of that scaffold.
+  auto lower = getConstantIntValue(loop.getLowerBound());
+  auto upper = getConstantIntValue(loop.getUpperBound());
+  auto step = getConstantIntValue(loop.getStep());
+  int64_t distance = 0;
+  bool singleIteration = lower && upper && step && *step > 0 &&
+                         !llvm::SubOverflow(*upper, *lower, distance) &&
+                         distance > 0 && distance <= *step;
+
+  auto reject = [&](Operation *consumer, StringRef reason) -> LogicalResult {
+    consumer->emitRemark() << "CVSplit cross-iteration pre-check rejected: "
+                           << reason;
+    return failure();
+  };
+  auto checkUse = [&](OpOperand &use) -> LogicalResult {
+    Operation *consumer = body->findAncestorOpInBlock(*use.getOwner());
+    if (!consumer || consumer == yield.getOperation())
+      return success();
+    auto consumerCore = classification.find(consumer);
+    if (consumerCore == classification.end())
+      return reject(consumer, "consumer has no single-core classification");
+
+    Value incoming = use.get();
+    llvm::DenseSet<Value> visited;
+    while (auto argument = dyn_cast<BlockArgument>(incoming)) {
+      if (argument.getOwner() != body || argument.getArgNumber() == 0)
+        return success(); // Outer value or loop induction value.
+      if (!visited.insert(incoming).second)
+        return success(); // A pure permutation of invariant initial values.
+      unsigned index = argument.getArgNumber() - 1;
+      incoming =
+          singleIteration ? loop.getInitArgs()[index] : yield.getOperand(index);
+    }
+    Operation *producer = incoming.getDefiningOp();
+    if (!producer || !loop->isAncestor(producer))
+      return success(); // No value produced in this loop crosses an iteration.
+    producer = body->findAncestorOpInBlock(*producer);
+    if (!producer)
+      return reject(consumer, "cannot bind the carried value's producer");
+    auto producerCore = classification.find(producer);
+    if (producerCore == classification.end())
+      return reject(consumer, "producer has no single-core classification");
+    if (producerCore->second == consumerCore->second)
+      return success();
+    consumer->emitRemark() << "CVSplit cross-iteration pre-check rejected: "
+                           << (producerCore->second == EngineType::CUBE
+                                   ? "CUBE -> VECTOR"
+                                   : "VECTOR -> CUBE")
+                           << " carried value from " << producer->getName()
+                           << " to " << consumer->getName() << " operand "
+                           << use.getOperandNumber();
+    return failure();
+  };
+
+  // An unfused DPS accumulator is now consumed by the VECTOR add, not by the
+  // CUBE matmul's new zero destination. Reuse the actual rewrite binding.
+  llvm::DenseMap<Operation *, Operation *> joins;
+  for (const AccumulatorJoinBinding &binding : accumulatorJoins.bindings)
+    joins.try_emplace(binding.matmulProducer, binding.vectorJoin);
+
+  WalkResult marked = loop.walk([&](Operation *operation) -> WalkResult {
+    auto operands =
+        operation->getAttrOfType<DenseI64ArrayAttr>(kLoopCarriedConsumersAttr);
+    if (!operands)
+      return WalkResult::advance();
+    for (int64_t index : operands.asArrayRef()) {
+      if (index < 0 ||
+          static_cast<uint64_t>(index) >= operation->getNumOperands()) {
+        (void)reject(operation,
+                     "invalid carried-operand binding after preparation");
+        return WalkResult::interrupt();
+      }
+      OpOperand *use = &operation->getOpOperand(static_cast<unsigned>(index));
+      if (Operation *join = joins.lookup(operation)) {
+        auto dps = dyn_cast<DestinationStyleOpInterface>(operation);
+        if (dps && dps.getNumDpsInits() == 1 &&
+            use == dps.getDpsInitOperand(0)) {
+          if (!isa<arith::AddFOp>(join) || join->getNumOperands() != 2) {
+            (void)reject(operation, "invalid accumulator-join binding");
+            return WalkResult::interrupt();
+          }
+          use = &join->getOpOperand(1);
+        }
+      }
+      if (failed(checkUse(*use)))
+        return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  if (marked.wasInterrupted())
+    return failure();
+
+  // Include state introduced during preparation (for example carried physical
+  // addresses), and follow forwarded argument/yield chains with cycle safety.
+  if (!singleIteration)
+    for (BlockArgument argument : loop.getRegionIterArgs())
+      for (OpOperand &use : argument.getUses())
+        if (failed(checkUse(use)))
+          return failure();
+  return success();
 }

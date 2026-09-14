@@ -843,6 +843,7 @@ public:
     // Safety cleanup for functions that returned before normal transfer materialization
     // cleanup point.
     removeUnrollOriginIdAttrs(*transformedModule);
+    cv_split::removeLoopCarriedConsumerMarkers(*transformedModule);
     cv_split::removeDCVPClassificationAttrs(*transformedModule);
     // Aggregate only successful functions. A rejected function was restored
     // before this point and cannot leak an explicit-storage success marker.
@@ -953,6 +954,7 @@ private:
 
   LogicalResult unrollCandidateLoop(scf::ForOp &loop) {
     tagUnrollOriginIds(loop);
+    cv_split::markLoopCarriedConsumers(loop);
 
     // Unroll phase: expose independent lanes
     bool fullyUnrolled = unrollFullyConsumesTripCount(loop, unrollFactor);
@@ -1163,6 +1165,16 @@ private:
         cv_split::unfuseVectorAccumulatorMatmuls(body, classification);
     if (failed(accumulatorJoins))
       return failure();
+
+    // Inspect the normalized recurrence: FA's accumulator is VECTOR-owned
+    // after separation. Other cross-core loop-carried consumers are rejected
+    // before any cross-core transfer or scope is materialized.
+    if (failed(cv_split::preCheckCrossIterationConsumers(
+            loop, classification, *accumulatorJoins)))
+      return failure();
+    cv_split::removeLoopCarriedConsumerMarkers(funcOp);
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split] Cross-iteration consumer pre-check passed\n");
 
     // Materialized-plan binding phase: bind the immutable logical boundaries to the real joins that
     // now exist and refresh order after scheduling. This remains diagnostic:

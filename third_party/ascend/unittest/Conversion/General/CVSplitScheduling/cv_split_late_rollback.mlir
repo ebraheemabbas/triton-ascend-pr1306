@@ -141,9 +141,12 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {
     %c16 = arith.constant 16 : index
     %result = scf.for %iv = %c0 to %c16 step %c1
         iter_args(%acc = %init) -> tensor<32x16xf32> {
+      // Keep the recurrence VECTOR-owned after accumulator separation so the
+      // cross-iteration gate does not hide the intended output-type failure.
+      %scaled = arith.mulf %acc, %init : tensor<32x16xf32>
       %matmul = linalg.matmul
           ins(%lhs, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
-          outs(%acc : tensor<32x16xf32>) -> tensor<32x16xf32>
+          outs(%scaled : tensor<32x16xf32>) -> tensor<32x16xf32>
       %vector = math.exp %matmul : tensor<32x16xf32>
       %probability = arith.truncf %vector : tensor<32x16xf32> to tensor<32x16xf16>
       %product = linalg.matmul

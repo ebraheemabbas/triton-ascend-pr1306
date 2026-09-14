@@ -23,16 +23,33 @@
 #ifndef TRITON_CV_SPLIT_SCHEDULING_PRE_CHECK_H
 #define TRITON_CV_SPLIT_SCHEDULING_PRE_CHECK_H
 
+#include "ascend/include/CVSplitScheduling/classifyAllOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Support/LogicalResult.h"
 
 namespace mlir::triton::cv_split {
 
+struct AccumulatorJoinRewriteResult;
+
 /// Checks the structural assumptions that must hold before CV split scheduling
 /// mutates `funcOp`. Returns the single supported candidate loop on success.
 FailureOr<scf::ForOp> preCheckCVSplitScheduling(func::FuncOp funcOp,
                                                 int unrollFactor);
+
+/// Record uses of the selected loop's iteration arguments before unrolling.
+/// The temporary operand markers survive cloning, including a full unroll.
+void markLoopCarriedConsumers(scf::ForOp loop);
+
+/// After accumulator separation, reject cross-core SSA loop-carried edges,
+/// including marked edges exposed inside the unrolled body. Same-iteration
+/// cross-core transfers and same-core recurrences remain legal. This does not
+/// replace the separate memory ownership/alias checks.
+LogicalResult preCheckCrossIterationConsumers(
+    scf::ForOp loop, const Classification &classification,
+    const AccumulatorJoinRewriteResult &accumulatorJoins);
+
+void removeLoopCarriedConsumerMarkers(Operation *root);
 
 } // namespace mlir::triton::cv_split
 
