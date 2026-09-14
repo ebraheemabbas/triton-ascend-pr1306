@@ -34,6 +34,7 @@
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/DestinationStyleOpInterface.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
@@ -337,6 +338,39 @@ LogicalResult mlir::triton::cv_split::preCheckCrossIterationConsumers(
                            << reason;
     return failure();
   };
+  // Scope separation deliberately reproduces scalar/index control in both
+  // scopes, irrespective of its provisional single-core stamp. Accept only
+  // a closed, pure scalar recurrence: a scalar extracted from a tensor or
+  // loaded from memory is not made safe merely by having a scalar result.
+  auto isReplicatedScalar = [&](Value value) {
+    SmallVector<Value> worklist{value};
+    llvm::DenseSet<Value> seen;
+    while (!worklist.empty()) {
+      Value current = worklist.pop_back_val();
+      if (!current.getType().isIntOrIndexOrFloat())
+        return false;
+      if (!seen.insert(current).second)
+        continue;
+      if (auto argument = dyn_cast<BlockArgument>(current)) {
+        if (argument.getOwner() == body && argument.getArgNumber() != 0) {
+          unsigned index = argument.getArgNumber() - 1;
+          worklist.push_back(loop.getInitArgs()[index]);
+          if (!singleIteration)
+            worklist.push_back(yield.getOperand(index));
+        }
+        continue;
+      }
+      Operation *definition = current.getDefiningOp();
+      if (!definition || !loop->isAncestor(definition))
+        continue;
+      if (definition->getNumRegions() != 0 || !isMemoryEffectFree(definition) ||
+          !llvm::all_of(definition->getResultTypes(),
+                        [](Type type) { return type.isIntOrIndexOrFloat(); }))
+        return false;
+      worklist.append(definition->operand_begin(), definition->operand_end());
+    }
+    return true;
+  };
   auto checkUse = [&](OpOperand &use) -> LogicalResult {
     Operation *consumer = body->findAncestorOpInBlock(*use.getOwner());
     if (!consumer || consumer == yield.getOperation())
@@ -344,6 +378,8 @@ LogicalResult mlir::triton::cv_split::preCheckCrossIterationConsumers(
     auto consumerCore = classification.find(consumer);
     if (consumerCore == classification.end())
       return reject(consumer, "consumer has no single-core classification");
+    if (isReplicatedScalar(use.get()))
+      return success();
 
     Value incoming = use.get();
     llvm::DenseSet<Value> visited;
@@ -372,7 +408,7 @@ LogicalResult mlir::triton::cv_split::preCheckCrossIterationConsumers(
                                    ? "CUBE -> VECTOR"
                                    : "VECTOR -> CUBE")
                            << " carried value from " << producer->getName()
-                           << " to " << consumer->getName() << " operand "
+                           << " to " << use.getOwner()->getName() << " operand "
                            << use.getOperandNumber();
     return failure();
   };

@@ -7,7 +7,7 @@ import sys
 
 tool, fixture = sys.argv[1:]
 pieces = Path(fixture).read_text().split("// -----")
-assert len(pieces) == 9
+assert len(pieces) == 10
 checked = 0
 for factor in (2, 4, 8):
     for full in (False, True):
@@ -36,5 +36,5 @@ for factor in (2, 4, 8):
                 assert "CVSplit cross-iteration pre-check rejected:" not in result.stderr
             assert "cv_split.loop_carried_consumers" not in result.stdout
             checked += 1
-assert checked == 54
-print("CROSS_ITERATION_ADMISSION_ROLLBACK_AND_CLEANUP=PASS cases=54")
+assert checked == 60
+print("CROSS_ITERATION_ADMISSION_ROLLBACK_AND_CLEANUP=PASS cases=60")
