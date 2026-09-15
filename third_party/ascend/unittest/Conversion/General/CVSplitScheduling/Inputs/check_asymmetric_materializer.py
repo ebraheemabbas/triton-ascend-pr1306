@@ -1,0 +1,43 @@
+"""Require actual asymmetric materialization and independent typed buffer pools."""
+from pathlib import Path
+import re
+import sys
+
+from check_l0c_storage import APPLIED, PRESERVE, live_depths, run, scope
+
+EXPLICIT = "triton_ascend.cv_split_scheduling.explicit_l0c_applied = 1"
+
+
+def check(tool, source, rows, score_width, head_dim):
+    ir = run(tool, source, mode="materialize")
+    assert APPLIED in ir and PRESERVE in ir and EXPLICIT in ir, "materializer fell back"
+    assert live_depths(ir, 4) == [1, 1]
+    cube = scope(ir, "CUBE")
+    vector = scope(ir, "VECTOR")
+    assert 'vector_mode = "simd"' in vector
+    assert "linalg.matmul" not in vector
+    assert len(re.findall(r" = linalg.matmul\b", cube)) == 8
+    cc = re.findall(r"memref.alloc\(\).*: memref<([^\n]+address_space<cc>)>", cube)
+    expected = [f"{2 * rows}x{width}xf32, #hivm.address_space<cc>"
+                for width in (score_width, score_width, head_dim, head_dim)]
+    assert sorted(cc) == sorted(expected), cc
+    # The four role-owned UB allocations replace the larger shared union roots.
+    ub = re.findall(r"memref.alloc\(\).*: memref<([^\n]+address_space<ub>)>", ir)
+    for width in set((score_width, head_dim)):
+        count = 4 if score_width == head_dim else 2
+        assert ub.count(f"{rows}x{width}xf32, #hivm.address_space<ub>") == count, ub
+    backend = run(tool, source, mode="materialize", storage="backend")
+    assert APPLIED in backend and PRESERVE in backend and EXPLICIT not in backend
+    assert re.findall(r"hivm.hir.sync_block_[^\n]+", ir) == re.findall(
+        r"hivm.hir.sync_block_[^\n]+", backend)
+    # An unavailable schedule must roll back, not produce half of a rewrite.
+    rejected = run(tool, source, mode="materialize", extra="private-buffer-ub-budget-bytes=0")
+    assert PRESERVE not in rejected and EXPLICIT not in rejected
+    print(f"MATERIALIZER=PASS rows={rows} score={score_width} product={head_dim}")
+
+
+tool, fixture = sys.argv[1:]
+path = Path(fixture)
+check(tool, path.read_text(), 64, 128, 64)
+check(tool, path.with_name("cv_split_l0c_storage.mlir").read_text(), 64, 128, 128)
+check(tool, path.with_name("cv_split_scheduling_fa_m64_n128_seq4096.mlir").read_text(), 32, 128, 64)

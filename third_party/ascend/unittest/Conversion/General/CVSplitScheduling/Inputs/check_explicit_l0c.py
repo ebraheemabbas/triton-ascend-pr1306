@@ -59,7 +59,8 @@ compare(tool, source, 'materialize')
 compare(tool, source, 'disabled', lanes=2)
 narrow = Path(fixture).with_name('cv_split_scheduling_fa_m64_n128_seq4096.mlir').read_text()
 compare(tool, narrow, 'disabled')
-for candidate in (narrow, source.replace('128', '256')):
+compare(tool, narrow, 'materialize')
+for candidate in (source.replace('128', '256'),):
     ordinary = run(tool, candidate, mode='materialize', storage='backend')
     explicit = run(tool, candidate, mode='materialize')
     assert MARKER not in explicit and explicit == ordinary

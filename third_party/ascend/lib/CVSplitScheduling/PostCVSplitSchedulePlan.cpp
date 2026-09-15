@@ -306,7 +306,13 @@ PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
 
   if (scoreTransfer.rows == 0 || scoreTransfer.columns == 0 ||
       scoreTransfer.columns % kVectorChunkElements != 0 ||
-      productCube->n == 0 || productTransfer.columns != productCube->n) {
+      productCube->n == 0 || productTransfer.columns != productCube->n ||
+      scoreCube->m != 2ULL * scoreTransfer.rows ||
+      scoreCube->n != scoreTransfer.columns ||
+      productCube->m != scoreCube->m || productCube->k != scoreCube->n ||
+      productTransfer.rows != scoreTransfer.rows ||
+      probabilityTransfer.rows != scoreCube->m ||
+      probabilityTransfer.columns != scoreCube->n) {
     plan.status = PostCVSplitSchedulePlanStatus::UnsupportedGeometry;
     return plan;
   }

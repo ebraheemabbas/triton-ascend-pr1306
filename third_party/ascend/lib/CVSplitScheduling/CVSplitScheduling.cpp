@@ -1213,7 +1213,6 @@ private:
         activePostSplitScheduleMode == PostSplitScheduleMode::Materialize;
     bool bindingReady = false;
     bool structuralCandidateReady = false;
-    bool symmetricGeometryReady = false;
     std::optional<cv_split::PostCVSplitDetachedSchedule>
         materializationSchedule;
     if (materializePostSplitSchedule) {
@@ -1231,10 +1230,6 @@ private:
           cv_split::PostCVSplitSchedulePlan postSplitPlan =
               cv_split::buildPostCVSplitSchedulePlan(
                   *requests, *materializedResources, *resourceLimits);
-          symmetricGeometryReady =
-              postSplitPlan.recurrence.scoreWidth != 0 &&
-              postSplitPlan.recurrence.headDimension ==
-                  postSplitPlan.recurrence.scoreWidth;
           cv_split::logPostCVSplitSchedulePlan(postSplitPlan);
 
           cv_split::PostCVSplitDetachedSchedule detachedSchedule =
@@ -1272,16 +1267,13 @@ private:
     }
 
     if (materializePostSplitSchedule &&
-        (!bindingReady || !structuralCandidateReady ||
-         !symmetricGeometryReady)) {
+        (!bindingReady || !structuralCandidateReady)) {
       LLVM_DEBUG(llvm::dbgs()
                  << "[cv-split] schedule-materialization rejected "
                     "binding-ready="
                  << (bindingReady ? "yes" : "no")
                  << " structural-candidate-ready="
                  << (structuralCandidateReady ? "yes" : "no")
-                 << " symmetric-geometry-ready="
-                 << (symmetricGeometryReady ? "yes" : "no")
                  << " mutation=no\n");
       return failure();
     }

@@ -22,6 +22,7 @@
 
 #include "ascend/include/CVSplitScheduling/ScopeSeparation.h"
 #include "ascend/include/CVSplitScheduling/BufferSlotAllocation.h"
+#include "ascend/include/CVSplitScheduling/BufferSlotPlan.h"
 #include "ascend/include/CVSplitScheduling/HardwareConstants.h"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
@@ -660,7 +661,9 @@ struct OwnershipLanePlan {
 
 struct BufferOwnershipPlan {
   SmallVector<OwnershipLanePlan> lanes;
+  // Physical roots and logical per-role views are different for unequal widths.
   SmallVector<Value> oldBuffers;
+  SmallVector<memref::ReinterpretCastOp> oldViews;
   MemRefType scoreBufferType;
   MemRefType productBufferType;
   unsigned scoreSlotCount = 0;
@@ -2218,10 +2221,60 @@ materializeVectorLaneRegions(MutableArrayRef<VectorToCubePack> packs,
   return materializeGroupedSoftmaxRecurrence(lanes, groupedAlphaScope);
 }
 
-static FailureOr<BufferOwnershipPlan> buildBufferOwnershipPlan(
-    scf::ForOp cubeLoop, scf::ForOp vectorLoop,
-    const CrossScopeTransferInfo &transferInfo,
-    const PostCVSplitDetachedSchedule &schedule) {
+// Recognize precisely the offset-zero contiguous prefix emitted by BufferPool.
+// Do not infer safety for arbitrary subviews, dynamic offsets or escaping
+// aliases.
+static FailureOr<memref::AllocOp>
+getOwnedUnionRoot(Value buffer,
+                  SmallVectorImpl<memref::ReinterpretCastOp> &views) {
+  auto allocation = buffer.getDefiningOp<memref::AllocOp>();
+  if (allocation)
+    return allocation;
+  auto view = buffer.getDefiningOp<memref::ReinterpretCastOp>();
+  if (!view)
+    return failure();
+  allocation = view.getSource().getDefiningOp<memref::AllocOp>();
+  if (!allocation)
+    return failure();
+  auto type = view.getType();
+  auto rootType = allocation.getType();
+  auto space = dyn_cast_or_null<hivm::AddressSpaceAttr>(type.getMemorySpace());
+  if (!space || space.getAddressSpace() != hivm::AddressSpace::UB ||
+      !type.hasStaticShape() || !rootType.hasStaticShape() ||
+      type.getRank() != 2 || rootType.getRank() != 2 ||
+      !type.getLayout().isIdentity() || !rootType.getLayout().isIdentity() ||
+      type.getMemorySpace() != rootType.getMemorySpace() ||
+      type.getElementType() != rootType.getElementType() ||
+      type.getDimSize(0) <= 0 || type.getDimSize(1) <= 0 ||
+      type.getDimSize(0) != rootType.getDimSize(0) ||
+      rootType.getDimSize(1) <= 0)
+    return failure();
+  auto offsets = view.getMixedOffsets();
+  auto sizes = view.getMixedSizes();
+  auto strides = view.getMixedStrides();
+  if (offsets.size() != 1 || sizes.size() != 2 || strides.size() != 2 ||
+      getConstantIntValue(offsets[0]) != 0 ||
+      getConstantIntValue(sizes[0]) != type.getDimSize(0) ||
+      getConstantIntValue(sizes[1]) != type.getDimSize(1) ||
+      getConstantIntValue(strides[0]) != type.getDimSize(1) ||
+      getConstantIntValue(strides[1]) != 1)
+    return failure();
+  uint64_t rootElements, viewElements;
+  if (!checkedBufferMultiply(rootType.getDimSize(0), rootType.getDimSize(1),
+                             rootElements) ||
+      !checkedBufferMultiply(type.getDimSize(0), type.getDimSize(1),
+                             viewElements) ||
+      viewElements > rootElements)
+    return failure();
+  if (!llvm::is_contained(views, view))
+    views.push_back(view);
+  return allocation;
+}
+
+static FailureOr<BufferOwnershipPlan>
+buildBufferOwnershipPlan(scf::ForOp cubeLoop, scf::ForOp vectorLoop,
+                         const CrossScopeTransferInfo &transferInfo,
+                         const PostCVSplitDetachedSchedule &schedule) {
   if (schedule.status != PostCVSplitDetachedScheduleStatus::Ready ||
       !schedule.verified || schedule.logicalLaneCount == 0 ||
       transferInfo.cubeToVectorChains.size() !=
@@ -2294,10 +2347,13 @@ static FailureOr<BufferOwnershipPlan> buildBufferOwnershipPlan(
       return failure();
     roleType = bufferType;
     slotCount = std::max(slotCount, publish->slot + 1);
-    plan.lanes.push_back({role, publish->lane, publish->slot, oldBuffer,
-                          cubeDrain, vectorCast});
-    if (oldBufferSet.insert(oldBuffer).second)
-      plan.oldBuffers.push_back(oldBuffer);
+    plan.lanes.push_back(
+        {role, publish->lane, publish->slot, oldBuffer, cubeDrain, vectorCast});
+    auto allocation = getOwnedUnionRoot(oldBuffer, plan.oldViews);
+    if (failed(allocation))
+      return failure();
+    if (oldBufferSet.insert(allocation->getResult()).second)
+      plan.oldBuffers.push_back(allocation->getResult());
   }
   if (scoreLanes.size() != schedule.logicalLaneCount ||
       productLanes.size() != schedule.logicalLaneCount ||
@@ -2313,15 +2369,37 @@ static FailureOr<BufferOwnershipPlan> buildBufferOwnershipPlan(
     if (!allocation || allocation->getBlock() != cubeScope->getBlock())
       return failure();
   }
+  // Account for all old uses before any mutation. This also prevents retiring
+  // a base allocation while an unrelated view or consumer still references it.
+  SmallVector<Value> oldStorage(plan.oldBuffers);
+  for (auto view : plan.oldViews) {
+    if (view->getBlock() != cubeScope->getBlock())
+      return failure();
+    oldStorage.push_back(view.getResult());
+  }
+  for (Value storage : oldStorage)
+    for (Operation *user : storage.getUsers()) {
+      if (isa<annotation::MarkOp>(user))
+        continue;
+      if (auto view = dyn_cast<memref::ReinterpretCastOp>(user);
+          view && llvm::is_contained(plan.oldViews, view) &&
+          view.getSource() == storage)
+        continue;
+      if (!llvm::any_of(plan.lanes, [&](const OwnershipLanePlan &lane) {
+            return lane.oldBuffer == storage &&
+                   (lane.cubeDrain == user || lane.vectorCast == user);
+          }))
+        return failure();
+    }
   return plan;
 }
 
-static LogicalResult materializeBufferOwnership(
-    scf::ForOp cubeLoop, scf::ForOp vectorLoop,
-    const CrossScopeTransferInfo &transferInfo,
-    const PostCVSplitDetachedSchedule &schedule) {
-  FailureOr<BufferOwnershipPlan> plan = buildBufferOwnershipPlan(
-      cubeLoop, vectorLoop, transferInfo, schedule);
+static LogicalResult
+materializeBufferOwnership(scf::ForOp cubeLoop, scf::ForOp vectorLoop,
+                           const CrossScopeTransferInfo &transferInfo,
+                           const PostCVSplitDetachedSchedule &schedule) {
+  FailureOr<BufferOwnershipPlan> plan =
+      buildBufferOwnershipPlan(cubeLoop, vectorLoop, transferInfo, schedule);
   if (failed(plan))
     return failure();
 
@@ -2345,8 +2423,9 @@ static LogicalResult materializeBufferOwnership(
   };
   SmallVector<Value> scoreSlots = createSlots(
       plan->scoreBufferType, plan->scoreSlotCount, "cvsplit.schedule.score");
-  SmallVector<Value> productSlots = createSlots(
-      plan->productBufferType, plan->productSlotCount, "cvsplit.schedule.product");
+  SmallVector<Value> productSlots =
+      createSlots(plan->productBufferType, plan->productSlotCount,
+                  "cvsplit.schedule.product");
 
   for (const OwnershipLanePlan &lane : plan->lanes) {
     ArrayRef<Value> slots = lane.role == PostCVSplitLineageRole::Score
@@ -2359,6 +2438,19 @@ static LogicalResult materializeBufferOwnership(
     lane.vectorCast->setOperand(0, replacement);
   }
 
+  // Rewritten drains/casts no longer use the logical views. Retire those first
+  // so the union roots can be released without leaving dangling alias users.
+  for (auto view : plan->oldViews) {
+    SmallVector<Operation *> marks;
+    for (Operation *user : view.getResult().getUsers()) {
+      if (!isa<annotation::MarkOp>(user))
+        return failure();
+      marks.push_back(user);
+    }
+    for (Operation *mark : marks)
+      mark->erase();
+    view.erase();
+  }
   for (Value oldBuffer : plan->oldBuffers) {
     SmallVector<Operation *> marks;
     for (Operation *user : oldBuffer.getUsers()) {
