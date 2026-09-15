@@ -33,9 +33,6 @@ def check(tool, source, rows, score_width, head_dim):
     assert APPLIED in backend and PRESERVE in backend and EXPLICIT not in backend
     assert re.findall(r"hivm.hir.sync_block_[^\n]+", ir) == re.findall(
         r"hivm.hir.sync_block_[^\n]+", backend)
-    # An unavailable schedule must roll back, not produce half of a rewrite.
-    rejected = run(tool, source, mode="materialize", extra="private-buffer-ub-budget-bytes=0")
-    assert PRESERVE not in rejected and EXPLICIT not in rejected
     print(f"MATERIALIZER=PASS rows={rows} score={score_width} product={head_dim}")
 
 
@@ -44,3 +41,10 @@ path = Path(fixture)
 check(tool, path.read_text(), 64, 128, 64)
 check(tool, path.with_name("cv_split_l0c_storage.mlir").read_text(), 64, 128, 128)
 check(tool, path.with_name("cv_split_scheduling_fa_m64_n128_seq4096.mlir").read_text(), 32, 128, 64)
+# Score width 32 cannot use the materializer's 64-element vector chunks.
+# Unlike zero *additional* UB budget, this is an unavailable geometry and
+# must roll back the complete rewrite, not publish only one core's scopes.
+unsupported = path.with_name("cv_split_scheduling_fa.mlir").read_text()
+rejected = run(tool, unsupported, mode="materialize")
+assert APPLIED not in rejected and PRESERVE not in rejected and EXPLICIT not in rejected
+print("UNSUPPORTED_GEOMETRY_ROLLBACK=PASS")
