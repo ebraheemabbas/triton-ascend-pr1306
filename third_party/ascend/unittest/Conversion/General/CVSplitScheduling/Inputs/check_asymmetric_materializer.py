@@ -21,8 +21,11 @@ def check(tool, source, rows, score_width, head_dim):
     expected = [f"{2 * rows}x{width}xf32, #hivm.address_space<cc>"
                 for width in (score_width, score_width, head_dim, head_dim)]
     assert sorted(cc) == sorted(expected), cc
-    # The four role-owned UB allocations replace the larger shared union roots.
-    ub = re.findall(r"memref.alloc\(\).*: memref<([^\n]+address_space<ub>)>", ir)
+    # Transfer pools live in the common parent of CUBE and VECTOR. Per-lane
+    # SIMD scratch inside VECTOR may have the same shape, but is not a pool.
+    # Count only shared storage, retaining the exact two-slots-per-role check.
+    shared = ir.replace(cube, "", 1).replace(vector, "", 1)
+    ub = re.findall(r"memref.alloc\(\).*: memref<([^\n]+address_space<ub>)>", shared)
     for width in set((score_width, head_dim)):
         count = 4 if score_width == head_dim else 2
         assert ub.count(f"{rows}x{width}xf32, #hivm.address_space<ub>") == count, ub
