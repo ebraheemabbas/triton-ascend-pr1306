@@ -1,7 +1,7 @@
-// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=8" 2>/dev/null | FileCheck %s --check-prefix=LANES8
-// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=8" 2>/dev/null | FileCheck %s --check-prefix=FLAGS8
-// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=2" 2>/dev/null | FileCheck %s --check-prefix=LANES2
-// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=2" 2>/dev/null | FileCheck %s --check-prefix=FLAGS2
+// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=8 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>/dev/null | FileCheck %s --check-prefix=LANES8
+// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=8 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>/dev/null | FileCheck %s --check-prefix=FLAGS8
+// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=2 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>/dev/null | FileCheck %s --check-prefix=LANES2
+// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=2 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>/dev/null | FileCheck %s --check-prefix=FLAGS2
 //
 // Flag demand is set by the transfer phases and the inter-core buffer depth,
 // not by the unroll factor.  Lanes that share a buffer slot are already ordered

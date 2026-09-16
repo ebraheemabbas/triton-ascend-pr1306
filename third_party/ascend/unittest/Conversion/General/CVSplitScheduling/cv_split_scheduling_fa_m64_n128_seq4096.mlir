@@ -1,4 +1,4 @@
-// RUN: triton-opt %s "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" | FileCheck %s
+// RUN: triton-opt %s "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" | FileCheck %s
 //
 // Size-variant regression for the FA CV split path.
 // BM=64 BN=128 N=4096 unroll-factor=4 pass output.

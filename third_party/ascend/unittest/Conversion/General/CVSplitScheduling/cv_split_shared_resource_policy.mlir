@@ -1,8 +1,8 @@
-// RUN: sed 's/inter_core_buf_count = 2/inter_core_buf_count = 1/' %S/cv_split_scheduling_fa.mlir | triton-opt "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" | FileCheck %s --check-prefix=DEPTH1
-// RUN: sed 's/inter_core_buf_count = 2/inter_core_buf_count = 3/' %S/cv_split_scheduling_fa.mlir | triton-opt "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" 2>/dev/null | FileCheck %s --check-prefix=REJECT
-// RUN: sed '/^  func.func @_attn_fwd/a\    hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 0' %S/cv_split_scheduling_fa.mlir | triton-opt "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" | FileCheck %s --check-prefix=COLLISION
-// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" "--add_dynamic_cv_pipeline=compile-on-910-95=true" | FileCheck %s --check-prefix=AUTO-COMMIT
-// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=3" "--add_dynamic_cv_pipeline=compile-on-910-95=true" | FileCheck %s --check-prefix=AUTO-FALLBACK
+// RUN: sed 's/inter_core_buf_count = 2/inter_core_buf_count = 1/' %S/cv_split_scheduling_fa.mlir | triton-opt "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" | FileCheck %s --check-prefix=DEPTH1
+// RUN: sed 's/inter_core_buf_count = 2/inter_core_buf_count = 3/' %S/cv_split_scheduling_fa.mlir | triton-opt "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>/dev/null | FileCheck %s --check-prefix=REJECT
+// RUN: sed '/^  func.func @_attn_fwd/a\    hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 0' %S/cv_split_scheduling_fa.mlir | triton-opt "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" | FileCheck %s --check-prefix=COLLISION
+// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" "--add_dynamic_cv_pipeline=compile-on-910-95=true" | FileCheck %s --check-prefix=AUTO-COMMIT
+// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=3 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" "--add_dynamic_cv_pipeline=compile-on-910-95=true" | FileCheck %s --check-prefix=AUTO-FALLBACK
 //
 // This contract proves that CV split consumes DynamicCVPipeline's canonical
 // inter-core buffer-count attribute.  Depth one produces one physical buffer

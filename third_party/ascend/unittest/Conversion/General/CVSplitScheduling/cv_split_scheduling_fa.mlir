@@ -1,4 +1,4 @@
-// RUN: triton-opt %s "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" | FileCheck %s
+// RUN: triton-opt %s "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" | FileCheck %s
 //
 // POC regression (v-split-poc / bd80cb91): line-by-line structural checks on FA
 // BM=32 BN=32 N=8192 unroll-factor=4 pass output.

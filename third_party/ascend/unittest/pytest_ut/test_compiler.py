@@ -2,6 +2,7 @@ import json
 import os
 import sys
 from unittest.mock import MagicMock
+from types import SimpleNamespace
 
 import pytest
 import triton.backends.ascend.compiler as compiler
@@ -47,30 +48,110 @@ def test_cv_pipeline_selection(dynamic, cv_split, target_is_a5, expected):
     assert compiler._select_cv_pipeline_policy(metadata, target_is_a5) == expected
 
 
-def test_cv_split_a5_default_is_transactional_auto():
-    """The two switches carry no value of their own.
-
-    Both are left unset on the dataclass and resolved in `parse_options` from
-    `is_compile_on_910_95()`, the same way `compile_on_910_95` itself is -- so
-    on an A5 target both halves of the transactional default turn on, and on
-    anything else neither does.
-
-    This asserts that they are unset and that an explicit choice survives, not
-    which callable the field happens to hold. Pinning the field default is what
-    this test used to do, and it went stale the moment the resolution moved.
-    """
+def test_cv_split_defaults_are_opt_in_with_materialization():
+    """CVSplit opt-in is separate from its default materialization policy."""
     fields = compiler.NPUOptions.__dataclass_fields__
-    assert fields["enable_cv_split_scheduling"].default is None
+    assert fields["enable_cv_split_scheduling"].default is False
     assert fields["enable_dynamic_cv_pipeline"].default is None
     assert fields["cv_split_unroll_factor"].default == 4
-
-    # Unset stays unset until parse_options fills it in.
-    assert compiler.NPUOptions().enable_cv_split_scheduling is None
-    assert compiler.NPUOptions().enable_dynamic_cv_pipeline is None
-
-    # An explicit choice is never overwritten by that resolution.
+    defaults = compiler.NPUOptions()
+    assert defaults.enable_cv_split_scheduling is False
+    assert defaults.enable_dynamic_cv_pipeline is None
+    assert defaults.cv_split_post_split_schedule_mode == "materialize"
+    assert defaults.cv_split_enable_plan_driven_early_publish is True
+    assert defaults.cv_split_schedule_candidate_id == -1
+    assert defaults.cv_split_l0c_buffer_mode == "explicit"
+    assert defaults.limit_auto_multi_buffer_of_local_buffer is None
+    assert compiler.NPUOptions(enable_cv_split_scheduling=True).enable_cv_split_scheduling is True
     assert compiler.NPUOptions(enable_cv_split_scheduling=False).enable_cv_split_scheduling is False
     assert compiler.NPUOptions(enable_dynamic_cv_pipeline=True).enable_dynamic_cv_pipeline is True
+
+
+_UNSET = object()
+
+
+@pytest.mark.parametrize("arch,is_a5", [("Ascend910B1", False), ("Ascend910_9589", True),
+                                       ("Ascend950PR_9579", True)])
+@pytest.mark.parametrize("requested", [_UNSET, None, False, True])
+def test_cv_split_parse_options_requires_opt_in(arch, is_a5, requested):
+    backend = compiler.AscendBackend(SimpleNamespace(backend="npu", arch=arch))
+    opts = {} if requested is _UNSET else {"enable_cv_split_scheduling": requested}
+    result = backend.parse_options(opts)
+    assert result.enable_cv_split_scheduling is (requested is True)
+    assert result.enable_dynamic_cv_pipeline is is_a5
+    assert result.cv_split_post_split_schedule_mode == "materialize"
+    assert result.cv_split_enable_plan_driven_early_publish is True
+    assert result.cv_split_schedule_candidate_id == -1
+
+
+def test_cv_split_explicit_policy_overrides_survive_parse_options():
+    backend = compiler.AscendBackend(SimpleNamespace(backend="npu", arch="Ascend950PR_9579"))
+    requested = dict(enable_cv_split_scheduling=True, enable_dynamic_cv_pipeline=False,
+                     cv_split_post_split_schedule_mode="disabled",
+                     cv_split_enable_plan_driven_early_publish=False,
+                     cv_split_schedule_candidate_id=2, cv_split_l0c_buffer_mode="backend",
+                     limit_auto_multi_buffer_of_local_buffer="no-limit")
+    result = backend.parse_options(dict(requested))
+    assert all(getattr(result, name) == value for name, value in requested.items())
+
+
+@pytest.mark.parametrize("explicit_applied,preserve", [(False, False), (False, True), (True, False), (True, True)])
+@pytest.mark.parametrize("requested", [_UNSET, None, "no-l0c", "no-limit", "no-ub"])
+def test_cv_split_local_multibuffer_policy_preserves_user_choice(explicit_applied, preserve, requested):
+    metadata = dict(cv_split_l0c_buffers_applied=explicit_applied,
+                    cv_split_preserve_explicit_schedule=preserve)
+    if requested is not _UNSET:
+        metadata["limit_auto_multi_buffer_of_local_buffer"] = requested
+    original = dict(metadata)
+    automatic = "no-l0c" if explicit_applied and preserve else "no-limit"
+    expected = automatic if requested is _UNSET or requested is None else requested
+    assert compiler.get_auto_multi_buffer_of_local_buffer_option(metadata) == expected
+    assert metadata == original, "resolving effective policy must not overwrite user options"
+
+
+@pytest.mark.parametrize("metadata", [{}, {"cv_split_l0c_buffers_applied": True},
+                                      {"cv_split_preserve_explicit_schedule": True},
+                                      {"enable_cv_split_scheduling": True,
+                                       "cv_split_post_split_schedule_mode": "materialize",
+                                       "cv_split_l0c_buffer_mode": "explicit"}])
+def test_cv_split_requested_policy_is_not_proof_of_application(metadata):
+    assert compiler.get_auto_multi_buffer_of_local_buffer_option(metadata) == "no-limit"
+
+
+@pytest.mark.parametrize("requested", [None, "no-l0c", "no-limit", "no-ub"])
+@pytest.mark.parametrize("explicit_applied,preserve", [(False, False), (False, True), (True, False), (True, True)])
+def test_cv_split_local_multibuffer_bisheng_argument(monkeypatch, requested, explicit_applied, preserve):
+    """Exercise the real A5 argv builder without invoking a compiler or NPU."""
+    calls = []
+
+    def fake_run(command, **kwargs):
+        from pathlib import Path
+        calls.append(command)
+        Path(command[command.index("-o") + 1] + ".o").write_bytes(b"test-kernel")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(compiler, "NPUUtils", lambda: SimpleNamespace(has_device_limit=lambda: False))
+    monkeypatch.setattr(compiler, "_get_npucompiler_path", lambda: ("/fake/bishengir-compile", {}))
+    monkeypatch.setattr(compiler, "_check_bishengir_api_change", lambda: True)
+    monkeypatch.setattr(compiler, "_downgrade_ir_for_bishengir", lambda text: text)
+    monkeypatch.setattr(compiler, "_is_auto_map_parallel_blocks_enabled", lambda: False)
+    monkeypatch.setattr(compiler, "_is_ascend_sanitizer_enabled", lambda: False)
+    monkeypatch.setattr(compiler, "_enable_msdebug", lambda: False)
+    monkeypatch.setattr(compiler, "_enable_print_ub_bits", lambda: False)
+    monkeypatch.setattr(compiler.subprocess, "run", fake_run)
+    options = compiler.NPUOptions(arch="Ascend950PR_9579", debug=False,
+                                  limit_auto_multi_buffer_of_local_buffer=requested)
+    metadata = dict(options.__dict__, hash="test", target=SimpleNamespace(arch=options.arch),
+                    cv_split_l0c_buffers_applied=explicit_applied)
+    attribute = " attributes {triton_ascend.cv_split_scheduling.preserve_explicit_schedule}" if preserve else ""
+    source = ('module' + attribute + ' { func.func @test() attributes '
+              '{mix_mode = "mix", parallel_mode = "simd"} { return } }')
+    assert compiler.linalg_to_bin_enable_npu_compile_910_95(source, metadata, options) == b"test-kernel"
+    assert len(calls) == 1
+    prefix = "--limit-auto-multi-buffer-of-local-buffer="
+    expected = requested if requested is not None else ("no-l0c" if explicit_applied and preserve else "no-limit")
+    assert [arg for arg in calls[0] if arg.startswith(prefix)] == [prefix + expected]
+    assert metadata["limit_auto_multi_buffer_of_local_buffer"] == requested
 
 
 def _make_torch_npu_mock(cfg_dir):

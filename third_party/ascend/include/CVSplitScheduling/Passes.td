@@ -37,24 +37,26 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
            "loop unroll factor (2, 4, or 8)">,
     Option<"enablePlanDrivenEarlyPublish",
            "enable-plan-driven-early-publish",
-           "bool", /*default*/"false",
+           "bool", /*default*/"true",
            "publish the terminal VECTOR-to-CUBE boundary in each unroll "
            "lineage at its earliest legal plan anchor instead of waiting for "
-           "independent scalar/rank-1 local state. This optional experiment "
+           "independent scalar/rank-1 local state. This default policy "
            "keeps storage, slot reuse, and arithmetic "
            "unchanged, and a missing/invalid analysis plan keeps the generic "
            "late-publish behavior.">,
     Option<"scheduleCandidateId", "schedule-candidate-id",
            "int", /*default*/"-1",
            "developer override selecting one immutable structural "
-           "schedule candidate by deterministic ID. Negative diagnoses only. "
-           "the initial override accepts only the structurally all-one control and keeps "
-           "the qualified generic reorder unchanged.">,
+           "schedule candidate by deterministic ID. -1 diagnoses candidates "
+           "without selecting one; materialization does not select a hidden "
+           "candidate.">,
     Option<"postSplitScheduleMode", "post-split-schedule-mode",
-           "std::string", /*default*/"\"disabled\"",
+           "std::string", /*default*/"\"materialize\"",
            "post-CVSplit schedule handling: 'disabled' keeps the qualified generic path and 'materialize' "
            "transactionally publishes the complete detached schedule and "
-           "publishes both CUBE and VECTOR scopes after every proof passes">,
+           "publishes both CUBE and VECTOR scopes after every proof passes. "
+           "Materialization requires a selected structural candidate; -1 "
+           "retains its existing no-selection behavior.">,
     Option<"l0cBufferMode", "l0c-buffer-mode",
            "std::string", /*default*/"\"explicit\"",
            "L0C storage: 'explicit' defaults to verified two-slot rotation per "

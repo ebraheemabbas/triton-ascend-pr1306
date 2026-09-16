@@ -23,7 +23,8 @@ for factor in (2, 4, 8):
             result = subprocess.run([
                 tool, "--mlir-print-op-generic",
                 "--debug-only=cv-split-scheduling",
-                f"--cv_split_scheduling=compile-on-910-95=true unroll-factor={factor}"
+                f"--cv_split_scheduling=compile-on-910-95=true unroll-factor={factor} "
+                "post-split-schedule-mode=disabled enable-plan-driven-early-publish=false"
             ], input=source, text=True, capture_output=True, check=True)
             reject = name.startswith("reject_") and not (
                 full and factor == 2 and name == "reject_forwarded_c2v")

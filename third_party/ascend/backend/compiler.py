@@ -628,6 +628,17 @@ def get_mixed_cv_option(metadata):
     return metadata["enable_mixed_cv"]
 
 
+def get_auto_multi_buffer_of_local_buffer_option(metadata):
+    """Keep user policy; avoid replicating the materializer's owned L0C pools."""
+    requested = metadata.get("limit_auto_multi_buffer_of_local_buffer")
+    if requested is not None:
+        return requested
+    if (metadata.get("cv_split_l0c_buffers_applied", False)
+            and _preserves_explicit_cv_split_schedule(metadata)):
+        return "no-l0c"
+    return "no-limit"
+
+
 def _save_npuir_debug_output(stdout_bytes: bytes, stderr_bytes: bytes, tmpdir: str, metadata_hash: str):
     stdout = stdout_bytes.decode('utf-8') if stdout_bytes else ''
     stderr = stderr_bytes.decode('utf-8') if stderr_bytes else ''
@@ -776,9 +787,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += \
                 [f"--set-workspace-multibuffer={set_workspace_multibuffer}"]
 
-        auto_multi_buffer = metadata["limit_auto_multi_buffer_of_local_buffer"]
-        if auto_multi_buffer is None:
-            auto_multi_buffer = "no-limit"
+        auto_multi_buffer = get_auto_multi_buffer_of_local_buffer_option(metadata)
         _compile_option_list += \
             [f"--limit-auto-multi-buffer-of-local-buffer={auto_multi_buffer}"]
         auto_multi_buffer_buffer = metadata["limit_auto_multi_buffer_buffer"]
@@ -1202,28 +1211,24 @@ class NPUOptions:
     enable_ub_refine_opt: bool = False
     # Multi-cache insertion optimization: avoid redundant tensor compute in the middle of an `if`.
     enable_buffer_insert_optimization: bool = True
-    # A5 defaults to transactional auto mode: CV split is attempted first and
-    # the unchanged DynamicCVPipeline runs when the candidate rejects. Callers
-    # retain an immediate kill switch by setting this option to False.
-    # Left None here and resolved in parse_options, like every other
-    # target-dependent default: is_compile_on_910_95 is a function, so testing
-    # it directly would be true on every target.
-    enable_cv_split_scheduling: bool = None
+    # CV split is opt-in on every target. When explicitly enabled alongside
+    # DynamicCVPipeline, it runs first and DCVP handles unchanged candidates.
+    enable_cv_split_scheduling: bool = False
     cv_split_unroll_factor: int = 4
-    # Plan-driven early-publication control. Keep off until the plan-driven publication
-    # policy has passed compile, simulator, accuracy, and profiler qualification.
-    cv_split_enable_plan_driven_early_publish: bool = False
-    # Structural schedule override. Negative diagnoses structural candidates
-    # without selecting one; nonnegative requests a deterministic candidate ID.
-    # The initial override accepts only structurally all-one behavior.
+    # Publish at the earliest proven plan anchor when CV split is enabled.
+    cv_split_enable_plan_driven_early_publish: bool = True
+    # Structural schedule override. -1 diagnoses candidates without selecting
+    # one; nonnegative requests a deterministic candidate ID. Materialization
+    # does not silently select a candidate when this remains -1.
     cv_split_schedule_candidate_id: int = -1
     # Explicit pools are the default for eligible CVSplit matrix families.
     # The backend override is retained for diagnostics. Actual application or
     # fallback is reported in launch metadata; drains stay with their producer.
     cv_split_l0c_buffer_mode: str = "explicit"
-    # Post-split schedule policy. "disabled" keeps the generic path and
-    # "materialize" verifies and publishes both scopes transactionally.
-    cv_split_post_split_schedule_mode: str = "disabled"
+    # Verify and publish both scopes transactionally by default. "disabled"
+    # retains the generic path. Candidate selection remains explicit: -1 does
+    # not select a structural candidate, so materialization may reject.
+    cv_split_post_split_schedule_mode: str = "materialize"
     # Spare UB, in bytes, that cross-scope transfers may spend to stop reusing
     # buffers across unrolled lanes. It funds merging the two CUBE->VECTOR
     # roles onto one union slot per lane, which is what lets HEAD_DIM differ
@@ -1492,9 +1497,10 @@ class AscendBackend(BaseBackend):
                 object.__setattr__(options, "enable_dynamic_cv_pipeline", options.compile_on_910_95)
             if not internal_options:
                 _normalize_bishengir_simt_optimization_for_context(options, opts)
-            # Lazy init enable_cv_split_scheduling if not provided
+            # None, like omission, keeps CV split off; do not infer opt-in
+            # from the target or the current runtime device.
             if options.enable_cv_split_scheduling is None:
-                object.__setattr__(options, "enable_cv_split_scheduling", is_compile_on_910_95())
+                object.__setattr__(options, "enable_cv_split_scheduling", False)
             # Costmodel path should avoid extra BC<->MLIR conversion stages
             # to keep compile-only autotune routing lightweight and stable.
             if getattr(options, "enable_costmodel_backend", False):

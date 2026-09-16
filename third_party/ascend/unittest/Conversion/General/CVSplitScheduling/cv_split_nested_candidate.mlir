@@ -1,4 +1,4 @@
-// RUN: triton-opt %s "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" 2>/dev/null | FileCheck %s
+// RUN: triton-opt %s "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>/dev/null | FileCheck %s
 
 // A function may contain enclosing control loops as long as it has exactly one
 // innermost candidate loop. Verify that the inner mixed CUBE/VECTOR loop is

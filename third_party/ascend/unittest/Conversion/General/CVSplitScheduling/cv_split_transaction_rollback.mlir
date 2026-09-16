@@ -1,5 +1,5 @@
-// RUN: triton-opt %s "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" 2>/dev/null | FileCheck %s --check-prefix=IR
-// RUN: triton-opt %s --debug-only=cv-split-scheduling "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" 2>&1 >/dev/null | FileCheck %s --check-prefix=DIAG
+// RUN: triton-opt %s "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>/dev/null | FileCheck %s --check-prefix=IR
+// RUN: triton-opt %s --debug-only=cv-split-scheduling "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>&1 >/dev/null | FileCheck %s --check-prefix=DIAG
 
 // The loop has both CUBE and VECTOR work, so it reaches transfer discovery,
 // but the independent VECTOR chain consumes no matmul result. Transfer discovery rejects

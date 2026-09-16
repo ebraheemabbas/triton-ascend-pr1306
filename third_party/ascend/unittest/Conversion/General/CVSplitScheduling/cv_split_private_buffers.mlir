@@ -1,9 +1,9 @@
-// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" 2>/dev/null | FileCheck %s --check-prefix=AUTO
-// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" 2>/dev/null | FileCheck %s --check-prefix=AUTOVIEW
-// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 private-buffer-ub-budget-bytes=0" 2>/dev/null | FileCheck %s --check-prefix=DECLINED
-// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 private-buffer-ub-budget-bytes=0" 2>/dev/null | FileCheck %s --check-prefix=DECLINEDTYPE
-// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=2" 2>/dev/null | FileCheck %s --check-prefix=NOREUSE
-// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=2" 2>/dev/null | FileCheck %s --check-prefix=NOREUSETYPE
+// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>/dev/null | FileCheck %s --check-prefix=AUTO
+// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>/dev/null | FileCheck %s --check-prefix=AUTOVIEW
+// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 private-buffer-ub-budget-bytes=0 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>/dev/null | FileCheck %s --check-prefix=DECLINED
+// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 private-buffer-ub-budget-bytes=0 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>/dev/null | FileCheck %s --check-prefix=DECLINEDTYPE
+// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=2 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>/dev/null | FileCheck %s --check-prefix=NOREUSE
+// RUN: triton-opt %S/cv_split_scheduling_fa.mlir "--cv_split_scheduling=compile-on-910-95=true unroll-factor=2 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>/dev/null | FileCheck %s --check-prefix=NOREUSETYPE
 //
 // A transfer slot owned by one unrolled lane is never reused, so it has no
 // write-after-read pair to order and the producing core cannot overwrite what

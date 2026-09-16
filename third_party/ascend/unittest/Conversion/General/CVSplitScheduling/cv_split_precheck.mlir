@@ -1,9 +1,9 @@
-// RUN: triton-opt %s "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" 2>/dev/null | FileCheck %s --check-prefix=REJECT
-// RUN: triton-opt %s "--cv_split_scheduling=compile-on-910-95=true unroll-factor=3" 2>/dev/null | FileCheck %s --check-prefix=BAD-UNROLL
-// RUN: triton-opt %s --debug-only=cv-split-scheduling "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" 2>&1 >/dev/null | FileCheck %s --check-prefix=ACCEPT
-// RUN: triton-opt %s --debug-only=cv-split-scheduling "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" 2>&1 >/dev/null | FileCheck %s --check-prefix=DIAG
-// RUN: triton-opt %s --debug-only=cv-split-scheduling "--cv_split_scheduling=compile-on-910-95=true unroll-factor=2" 2>&1 >/dev/null | FileCheck %s --check-prefix=FACTOR2
-// RUN: triton-opt %s --debug-only=cv-split-scheduling "--cv_split_scheduling=compile-on-910-95=true unroll-factor=8" 2>&1 >/dev/null | FileCheck %s --check-prefix=FACTOR8
+// RUN: triton-opt %s "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>/dev/null | FileCheck %s --check-prefix=REJECT
+// RUN: triton-opt %s "--cv_split_scheduling=compile-on-910-95=true unroll-factor=3 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>/dev/null | FileCheck %s --check-prefix=BAD-UNROLL
+// RUN: triton-opt %s --debug-only=cv-split-scheduling "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>&1 >/dev/null | FileCheck %s --check-prefix=ACCEPT
+// RUN: triton-opt %s --debug-only=cv-split-scheduling "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>&1 >/dev/null | FileCheck %s --check-prefix=DIAG
+// RUN: triton-opt %s --debug-only=cv-split-scheduling "--cv_split_scheduling=compile-on-910-95=true unroll-factor=2 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>&1 >/dev/null | FileCheck %s --check-prefix=FACTOR2
+// RUN: triton-opt %s --debug-only=cv-split-scheduling "--cv_split_scheduling=compile-on-910-95=true unroll-factor=8 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" 2>&1 >/dev/null | FileCheck %s --check-prefix=FACTOR8
 
 // Pre-check rejection must happen before unrolling or scope construction.
 // REJECT-NOT: scope.scope

@@ -1,4 +1,4 @@
-// RUN: triton-opt %s "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" | FileCheck %s
+// RUN: triton-opt %s "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4 post-split-schedule-mode=disabled enable-plan-driven-early-publish=false" | FileCheck %s
 
 // Verify that the CUBE scope hoists an iteration-invariant L1 layout view and
 // its memory-space cast before the cloned loop.

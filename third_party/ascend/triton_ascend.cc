@@ -163,9 +163,9 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       py::arg("pm"), py::arg("compile_on_910_95"), py::arg("unroll_factor"),
       py::arg("promote_fully_unrolled") = true,
       py::arg("private_buffer_ub_budget_bytes") = -1,
-      py::arg("enable_plan_driven_early_publish") = false,
+      py::arg("enable_plan_driven_early_publish") = true,
       py::arg("schedule_candidate_id") = -1,
-      py::arg("post_split_schedule_mode") = "disabled",
+      py::arg("post_split_schedule_mode") = "materialize",
       py::arg("l0c_buffer_mode") = "explicit");
 
   m.def(
