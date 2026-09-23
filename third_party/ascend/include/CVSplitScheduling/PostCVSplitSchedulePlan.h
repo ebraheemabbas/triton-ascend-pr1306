@@ -121,6 +121,8 @@ struct PostCVSplitSchedulePlan {
   unsigned requiredEventCount = 0;
   unsigned reductionRootValue = 0;
   bool affineTreeRequired = false;
+  // Representation only; both paths expose the same NZ probability slots.
+  bool directNzPacking = true;
   bool selectionEligible = false;
   PostCVSplitBackendRequirements backend;
   llvm::SmallVector<PostCVSplitSlotAssignment> slots;
@@ -131,10 +133,11 @@ struct PostCVSplitSchedulePlan {
 
 /// Builds and verifies a numeric, parameterized post-CVSplit schedule plan without
 /// retaining MLIR handles or mutating IR.
-PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
-    const PostCVSplitRequestSet &requests,
-    const CrossCoreResourcePlan &currentResources,
-    const CrossCoreResourceLimits &limits);
+PostCVSplitSchedulePlan
+buildPostCVSplitSchedulePlan(const PostCVSplitRequestSet &requests,
+                             const CrossCoreResourcePlan &currentResources,
+                             const CrossCoreResourceLimits &limits,
+                             bool directNzPacking = true);
 
 void logPostCVSplitSchedulePlan(const PostCVSplitSchedulePlan &plan);
 

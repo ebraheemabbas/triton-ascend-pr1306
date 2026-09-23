@@ -57,6 +57,12 @@ def CVSplitScheduling : Pass<"cv_split_scheduling", "mlir::ModuleOp"> {
            "publishes both CUBE and VECTOR scopes after every proof passes. "
            "Materialization requires a selected structural candidate; -1 "
            "retains its existing no-selection behavior.">,
+    Option<"probabilityPacking", "probability-packing",
+           "std::string", /*default*/"\"direct_nz\"",
+           "probability packing inside materialized softmax SIMD regions: "
+           "'direct_nz' writes chunks in NZ order; 'nd_transpose' forms ND "
+           "probabilities then reshapes/transposes to the same NZ output. "
+           "Does not enable materialization or change the generic path.">,
     Option<"l0cBufferMode", "l0c-buffer-mode",
            "std::string", /*default*/"\"explicit\"",
            "L0C storage: 'explicit' defaults to verified two-slot rotation per "

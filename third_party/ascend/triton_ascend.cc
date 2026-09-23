@@ -148,13 +148,15 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
          bool promoteFullyUnrolled, int64_t privateBufferUbBudgetBytes,
          bool enablePlanDrivenEarlyPublish, int scheduleCandidateId,
          const std::string &postSplitScheduleMode,
-         const std::string &l0cBufferMode) {
+         const std::string &l0cBufferMode,
+         const std::string &probabilityPacking) {
         CVSplitSchedulingOptions opts;
         opts.compileOn91095 = compileOn91095;
         opts.unrollFactor = unrollFactor;
         opts.enablePlanDrivenEarlyPublish = enablePlanDrivenEarlyPublish;
         opts.scheduleCandidateId = scheduleCandidateId;
         opts.postSplitScheduleMode = postSplitScheduleMode;
+        opts.probabilityPacking = probabilityPacking;
         opts.l0cBufferMode = l0cBufferMode;
         opts.promoteFullyUnrolled = promoteFullyUnrolled;
         opts.privateBufferUbBudgetBytes = privateBufferUbBudgetBytes;
@@ -166,7 +168,8 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       py::arg("enable_plan_driven_early_publish") = true,
       py::arg("schedule_candidate_id") = -1,
       py::arg("post_split_schedule_mode") = "materialize",
-      py::arg("l0c_buffer_mode") = "explicit");
+      py::arg("l0c_buffer_mode") = "explicit",
+      py::arg("probability_packing") = "direct_nz");
 
   m.def(
       "add_graph_optimize",

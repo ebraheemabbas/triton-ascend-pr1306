@@ -768,12 +768,21 @@ public:
     this->scheduleCandidateId = options.scheduleCandidateId;
     this->l0cBufferMode = options.l0cBufferMode;
     this->postSplitScheduleMode = options.postSplitScheduleMode;
+    this->probabilityPacking = options.probabilityPacking;
     this->promoteFullyUnrolled = options.promoteFullyUnrolled;
     this->privateBufferUbBudgetBytes = options.privateBufferUbBudgetBytes;
   }
 
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
+    if (probabilityPacking.getValue() != "direct_nz" &&
+        probabilityPacking.getValue() != "nd_transpose") {
+      moduleOp.emitError() << "invalid probability-packing '"
+                           << probabilityPacking
+                           << "'; expected direct_nz or nd_transpose";
+      signalPassFailure();
+      return;
+    }
     if (l0cBufferMode.getValue() != "backend" &&
         l0cBufferMode.getValue() != "explicit") {
       moduleOp.emitError() << "invalid l0c-buffer-mode '" << l0cBufferMode
@@ -1229,7 +1238,8 @@ private:
         if (succeeded(requests)) {
           cv_split::PostCVSplitSchedulePlan postSplitPlan =
               cv_split::buildPostCVSplitSchedulePlan(
-                  *requests, *materializedResources, *resourceLimits);
+                  *requests, *materializedResources, *resourceLimits,
+                  probabilityPacking.getValue() == "direct_nz");
           cv_split::logPostCVSplitSchedulePlan(postSplitPlan);
 
           cv_split::PostCVSplitDetachedSchedule detachedSchedule =

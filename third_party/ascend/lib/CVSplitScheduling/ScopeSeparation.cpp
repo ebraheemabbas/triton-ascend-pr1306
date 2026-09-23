@@ -1450,9 +1450,8 @@ struct OnlineSoftmaxLaneState {
 
 static FailureOr<OnlineSoftmaxLaneState>
 materializeOnlineSoftmaxLane(VectorToCubePack &pack, unsigned lane,
-                                      bool deferLaneSum,
-                                      Value &sharedScaleScalar,
-                                      Value &sharedScaleRow) {
+                             bool deferLaneSum, bool directNzPacking,
+                             Value &sharedScaleScalar, Value &sharedScaleRow) {
   Operation *probabilityProducer = pack.pSrc.getDefiningOp();
   Operation *anchor = pack.anchor;
   auto probabilityType = dyn_cast<RankedTensorType>(pack.pSrc.getType());
@@ -1623,6 +1622,9 @@ materializeOnlineSoftmaxLane(VectorToCubePack &pack, unsigned lane,
   int64_t n16 = width / kNzTileSize;
   auto packedType =
       RankedTensorType::get({n16, rows, kNzTileSize}, pElement);
+  auto probabilityRowsType =
+      directNzPacking ? packedType
+                      : RankedTensorType::get({rows, width}, pElement);
 
   auto scaleFill = scale.getDefiningOp<linalg::FillOp>();
   if (!scaleFill || scaleFill.getInputs().size() != 1 ||
@@ -1708,7 +1710,9 @@ materializeOnlineSoftmaxLane(VectorToCubePack &pack, unsigned lane,
   Value scaledRowsInit =
       createLoopStorage(builder, scaledType, "cvsplit.softmax.scaled-rows");
   Value packedRowsInit =
-      createLoopStorage(builder, packedType, "cvsplit.softmax.packed-rows");
+      createLoopStorage(builder, probabilityRowsType,
+                        directNzPacking ? "cvsplit.softmax.packed-rows"
+                                        : "cvsplit.softmax.nd-rows");
   Value maxRowsInit =
       createLoopStorage(builder, maximumType, "cvsplit.softmax.max-rows");
   Value deferredAddInit;
@@ -1889,6 +1893,12 @@ materializeOnlineSoftmaxLane(VectorToCubePack &pack, unsigned lane,
                       ? eb.create<arith::AddFOp>(loc, sumChunks, exponential)
                             .getResult()
                       : exponential;
+    if (!directNzPacking) {
+      auto ndChunkType = RankedTensorType::get({1, chunkWidth}, pElement);
+      Value ndChunk = eb.create<arith::TruncFOp>(loc, ndChunkType, exponential);
+      packedRows = insertRowChunk(eb, ndChunk, packedRows, chunk);
+      continue;
+    }
     auto shapeType = RankedTensorType::get({3}, b.getI64Type());
     auto shape = eb.create<arith::ConstantOp>(
         loc, shapeType,
@@ -1931,12 +1941,30 @@ materializeOnlineSoftmaxLane(VectorToCubePack &pack, unsigned lane,
              << "[cv-split] online-softmax-build-progress lane=" << lane
              << " checkpoint=exp-pack-loop-created\n");
 
+  Value probability = expLoop.getResult(1);
+  if (!directNzPacking) {
+    // Keep the transpose INSIDE the same SIMD region so Bisheng may fuse it
+    // into the producer's stores. The external NZ type, copy and event anchor
+    // remain identical to direct packing.
+    auto shapeType = RankedTensorType::get({3}, b.getI64Type());
+    auto shape = b.create<arith::ConstantOp>(
+        loc, shapeType,
+        DenseElementsAttr::get(shapeType,
+                               ArrayRef<int64_t>{rows, n16, kNzTileSize}));
+    auto ndType = RankedTensorType::get({rows, n16, kNzTileSize}, pElement);
+    Value nd = b.create<tensor::ReshapeOp>(loc, ndType, probability, shape);
+    Value nzInit =
+        b.create<tensor::EmptyOp>(loc, packedType.getShape(), pElement);
+    probability = b.create<linalg::TransposeOp>(loc, nd, nzInit,
+                                                ArrayRef<int64_t>{1, 0, 2})
+                      ->getResult(0);
+  }
   if (deferLaneSum)
     b.create<scope::ReturnOp>(
-        loc, ValueRange{expLoop.getResult(0), maximum, expLoop.getResult(1)});
+        loc, ValueRange{expLoop.getResult(0), maximum, probability});
   else
     b.create<scope::ReturnOp>(
-        loc, ValueRange{maximum, expLoop.getResult(0), expLoop.getResult(1)});
+        loc, ValueRange{maximum, expLoop.getResult(0), probability});
   LLVM_DEBUG(llvm::dbgs()
              << "[cv-split] online-softmax-build-progress lane=" << lane
              << " checkpoint=scope-return-created\n");
@@ -2202,16 +2230,16 @@ static LogicalResult materializeGroupedSoftmaxRecurrence(
 
 static LogicalResult
 materializeVectorLaneRegions(MutableArrayRef<VectorToCubePack> packs,
-                            Operation *&groupedAlphaScope) {
+                             Operation *&groupedAlphaScope,
+                             bool directNzPacking) {
   SmallVector<OnlineSoftmaxLaneState> lanes;
   lanes.reserve(packs.size());
   Value sharedScaleScalar;
   Value sharedScaleRow;
   for (auto [lane, pack] : llvm::enumerate(packs)) {
-    FailureOr<OnlineSoftmaxLaneState> result =
-        materializeOnlineSoftmaxLane(
-            pack, lane, lane + 1 == packs.size(), sharedScaleScalar,
-            sharedScaleRow);
+    FailureOr<OnlineSoftmaxLaneState> result = materializeOnlineSoftmaxLane(
+        pack, lane, lane + 1 == packs.size(), directNzPacking,
+        sharedScaleScalar, sharedScaleRow);
     if (failed(result))
       return failure();
     pack.pSrc = result->packedProbability;
@@ -2894,7 +2922,9 @@ retileVectorScopeForRowSplit(scope::ScopeOp vecScope, scf::ForOp cubeLoop,
   if (failed(retileVectorScopeOps(vecScope, blockM)))
     return failure();
   if (materializePostSplitSchedule &&
-      failed(materializeVectorLaneRegions(packs, groupedAlphaScope)))
+      (!detachedSchedule || !detachedSchedule->verified ||
+       failed(materializeVectorLaneRegions(packs, groupedAlphaScope,
+                                           detachedSchedule->directNzPacking))))
     return failure();
   FailureOr<unsigned> nStores =
       retileOutputStores(vecScope, sbidx, loc, blockM);

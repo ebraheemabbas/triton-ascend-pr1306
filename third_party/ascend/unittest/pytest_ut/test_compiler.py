@@ -170,6 +170,35 @@ def test_cv_split_l0c_storage_option_and_cache_key(monkeypatch):
     assert defaults.hash() != backend.hash()
 
 
+@pytest.mark.parametrize("packing", ["direct_nz", "nd_transpose"])
+def test_cv_split_probability_packing_option(monkeypatch, packing):
+    monkeypatch.setattr(compiler, "get_cann_version_file_hash", lambda: "fixed-toolchain")
+    backend = compiler.AscendBackend(SimpleNamespace(backend="npu", arch="Ascend950PR_9579"))
+    requested = dict(enable_cv_split_scheduling=True, enable_dynamic_cv_pipeline=False,
+                     cv_split_schedule_candidate_id=2,
+                     cv_split_probability_packing=packing)
+    options = backend.parse_options(requested)
+    assert options.cv_split_probability_packing == packing
+    assert options.cv_split_post_split_schedule_mode == "materialize"
+    assert options.cv_split_l0c_buffer_mode == "explicit"
+    assert options.cv_split_schedule_candidate_id == 2
+    assert options.enable_dynamic_cv_pipeline is False
+    default = compiler.NPUOptions()
+    direct = compiler.NPUOptions(cv_split_probability_packing="direct_nz")
+    transposed = compiler.NPUOptions(cv_split_probability_packing="nd_transpose")
+    assert default.cv_split_probability_packing == "direct_nz"
+    assert default.hash() == direct.hash()
+    assert direct.hash() != transposed.hash()
+    # Selecting a representation must not implicitly enable CVSplit.
+    assert compiler.NPUOptions(cv_split_probability_packing=packing).enable_cv_split_scheduling is False
+
+
+@pytest.mark.parametrize("packing", [None, "", "nz", "ND_TRANSPOSE", "invalid", 0])
+def test_cv_split_probability_packing_rejects_invalid_values(packing):
+    with pytest.raises(ValueError, match="cv_split_probability_packing"):
+        compiler.NPUOptions(cv_split_probability_packing=packing)
+
+
 @pytest.mark.parametrize("applied", [True, False])
 def test_cv_split_l0c_application_metadata(monkeypatch, applied):
     marker = "triton_ascend.cv_split_scheduling.explicit_l0c_applied"

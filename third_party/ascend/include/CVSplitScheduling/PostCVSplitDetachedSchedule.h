@@ -38,7 +38,7 @@ enum class PostCVSplitDetachedCommandKind {
   ProductPublish,
   ScoreWait,
   RowwiseSoftmax,
-  DirectNzPack,
+  ProbabilityPack,
   ProbabilityPublish,
   ScoreRelease,
   ProductWait,
@@ -90,6 +90,7 @@ struct PostCVSplitDetachedSchedule {
   bool verified = false;
   bool publicationEligible = false;
   bool mutationPerformed = false;
+  bool directNzPacking = true;
   PostCVSplitBackendRequirements backend;
   llvm::SmallVector<PostCVSplitDetachedCommand> cubeCommands;
   llvm::SmallVector<PostCVSplitDetachedCommand> vectorCommands;

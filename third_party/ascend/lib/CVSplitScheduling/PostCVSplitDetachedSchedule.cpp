@@ -91,8 +91,8 @@ commandName(PostCVSplitDetachedCommandKind kind) {
     return "score-wait";
   case PostCVSplitDetachedCommandKind::RowwiseSoftmax:
     return "rowwise-softmax";
-  case PostCVSplitDetachedCommandKind::DirectNzPack:
-    return "direct-nz-pack";
+  case PostCVSplitDetachedCommandKind::ProbabilityPack:
+    return "probability-pack";
   case PostCVSplitDetachedCommandKind::ProbabilityPublish:
     return "probability-publish";
   case PostCVSplitDetachedCommandKind::ScoreRelease:
@@ -328,15 +328,15 @@ static PostCVSplitDetachedScheduleStatus verifyCommandOrder(
              PostCVSplitDetachedCommandKind::ProductPublish})
       if (countCommands(schedule.cubeCommands, kind, lane) != 1)
         return PostCVSplitDetachedScheduleStatus::InvalidCommandOrder;
-    for (PostCVSplitDetachedCommandKind kind : {
-             PostCVSplitDetachedCommandKind::ScoreWait,
-             PostCVSplitDetachedCommandKind::RowwiseSoftmax,
-             PostCVSplitDetachedCommandKind::DirectNzPack,
-             PostCVSplitDetachedCommandKind::ProbabilityPublish,
-             PostCVSplitDetachedCommandKind::ScoreRelease,
-             PostCVSplitDetachedCommandKind::ProductWait,
-             PostCVSplitDetachedCommandKind::ProductAccumulate,
-             PostCVSplitDetachedCommandKind::ProductRelease})
+    for (PostCVSplitDetachedCommandKind kind :
+         {PostCVSplitDetachedCommandKind::ScoreWait,
+          PostCVSplitDetachedCommandKind::RowwiseSoftmax,
+          PostCVSplitDetachedCommandKind::ProbabilityPack,
+          PostCVSplitDetachedCommandKind::ProbabilityPublish,
+          PostCVSplitDetachedCommandKind::ScoreRelease,
+          PostCVSplitDetachedCommandKind::ProductWait,
+          PostCVSplitDetachedCommandKind::ProductAccumulate,
+          PostCVSplitDetachedCommandKind::ProductRelease})
       if (countCommands(schedule.vectorCommands, kind, lane) != 1)
         return PostCVSplitDetachedScheduleStatus::InvalidCommandOrder;
 
@@ -349,44 +349,43 @@ static PostCVSplitDetachedScheduleStatus verifyCommandOrder(
                   findCommandIndex(schedule.cubeCommands,
                                    PostCVSplitDetachedCommandKind::ScorePublish,
                                    lane)}) ||
-        !ordered({findCommandIndex(
-                      schedule.cubeCommands,
-                      PostCVSplitDetachedCommandKind::ProbabilityWait, lane),
-                  findCommandIndex(
-                      schedule.cubeCommands,
-                      PostCVSplitDetachedCommandKind::ProductMatmul, lane),
-                  findCommandIndex(
-                      schedule.cubeCommands,
-                      PostCVSplitDetachedCommandKind::ProductReleaseWait,
-                      lane),
-                  findCommandIndex(
-                      schedule.cubeCommands,
-                      PostCVSplitDetachedCommandKind::ProductPublish, lane)}) ||
-        !ordered({findCommandIndex(schedule.vectorCommands,
-                                   PostCVSplitDetachedCommandKind::ScoreWait,
-                                   lane),
-                  findCommandIndex(
-                      schedule.vectorCommands,
-                      PostCVSplitDetachedCommandKind::RowwiseSoftmax, lane),
-                  findCommandIndex(
-                      schedule.vectorCommands,
-                      PostCVSplitDetachedCommandKind::DirectNzPack, lane),
-                  findCommandIndex(
-                      schedule.vectorCommands,
-                      PostCVSplitDetachedCommandKind::ProbabilityPublish,
-                      lane),
-                  findCommandIndex(
-                      schedule.vectorCommands,
-                      PostCVSplitDetachedCommandKind::ScoreRelease, lane),
-                  findCommandIndex(schedule.vectorCommands,
-                                   PostCVSplitDetachedCommandKind::ProductWait,
-                                   lane),
-                  findCommandIndex(
-                      schedule.vectorCommands,
-                      PostCVSplitDetachedCommandKind::ProductAccumulate, lane),
-                  findCommandIndex(
-                      schedule.vectorCommands,
-                      PostCVSplitDetachedCommandKind::ProductRelease, lane)}))
+        !ordered(
+            {findCommandIndex(schedule.cubeCommands,
+                              PostCVSplitDetachedCommandKind::ProbabilityWait,
+                              lane),
+             findCommandIndex(schedule.cubeCommands,
+                              PostCVSplitDetachedCommandKind::ProductMatmul,
+                              lane),
+             findCommandIndex(
+                 schedule.cubeCommands,
+                 PostCVSplitDetachedCommandKind::ProductReleaseWait, lane),
+             findCommandIndex(schedule.cubeCommands,
+                              PostCVSplitDetachedCommandKind::ProductPublish,
+                              lane)}) ||
+        !ordered(
+            {findCommandIndex(schedule.vectorCommands,
+                              PostCVSplitDetachedCommandKind::ScoreWait, lane),
+             findCommandIndex(schedule.vectorCommands,
+                              PostCVSplitDetachedCommandKind::RowwiseSoftmax,
+                              lane),
+             findCommandIndex(schedule.vectorCommands,
+                              PostCVSplitDetachedCommandKind::ProbabilityPack,
+                              lane),
+             findCommandIndex(
+                 schedule.vectorCommands,
+                 PostCVSplitDetachedCommandKind::ProbabilityPublish, lane),
+             findCommandIndex(schedule.vectorCommands,
+                              PostCVSplitDetachedCommandKind::ScoreRelease,
+                              lane),
+             findCommandIndex(schedule.vectorCommands,
+                              PostCVSplitDetachedCommandKind::ProductWait,
+                              lane),
+             findCommandIndex(schedule.vectorCommands,
+                              PostCVSplitDetachedCommandKind::ProductAccumulate,
+                              lane),
+             findCommandIndex(schedule.vectorCommands,
+                              PostCVSplitDetachedCommandKind::ProductRelease,
+                              lane)}))
       return PostCVSplitDetachedScheduleStatus::InvalidCommandOrder;
   }
   return PostCVSplitDetachedScheduleStatus::Ready;
@@ -453,6 +452,8 @@ static PostCVSplitDetachedScheduleStatus verifyLiveDepths(
 static PostCVSplitDetachedScheduleStatus verifyGeometryAndReduction(
     const PostCVSplitSchedulePlan &plan,
     PostCVSplitDetachedSchedule &schedule) {
+  if (schedule.directNzPacking != plan.directNzPacking)
+    return PostCVSplitDetachedScheduleStatus::InvalidCommandOrder;
   const unsigned lanes = plan.recurrence.logicalLaneCount;
   for (unsigned lane = 0; lane < lanes; ++lane) {
     const PostCVSplitVectorLanePlan *lanePlan = findVectorLane(plan, lane);
@@ -467,7 +468,7 @@ static PostCVSplitDetachedScheduleStatus verifyGeometryAndReduction(
              cmd.lane == lane;
     });
     auto packing = llvm::find_if(schedule.vectorCommands, [&](const auto &cmd) {
-      return cmd.kind == PostCVSplitDetachedCommandKind::DirectNzPack &&
+      return cmd.kind == PostCVSplitDetachedCommandKind::ProbabilityPack &&
              cmd.lane == lane;
     });
     if (softmax == schedule.vectorCommands.end() ||
@@ -480,7 +481,8 @@ static PostCVSplitDetachedScheduleStatus verifyGeometryAndReduction(
         packing->rows != lanePlan->rows ||
         packing->chunkWidth != lanePlan->chunkWidth ||
         packing->chunkCount != lanePlan->chunkCount ||
-        !packing->directNzPacking)
+        lanePlan->directNzPacking != plan.directNzPacking ||
+        packing->directNzPacking != lanePlan->directNzPacking)
       return PostCVSplitDetachedScheduleStatus::InvalidCommandOrder;
   }
 
@@ -534,6 +536,7 @@ verifyDetachedSchedule(const PostCVSplitSchedulePlan &plan,
 PostCVSplitDetachedSchedule
 buildPostCVSplitDetachedSchedule(const PostCVSplitSchedulePlan &plan) {
   PostCVSplitDetachedSchedule schedule;
+  schedule.directNzPacking = plan.directNzPacking;
   schedule.logicalLaneCount = plan.recurrence.logicalLaneCount;
   schedule.backend = plan.backend;
   if (!isBuildablePlan(plan))
@@ -680,7 +683,7 @@ buildPostCVSplitDetachedSchedule(const PostCVSplitSchedulePlan &plan) {
     softmax.chunkCount = lanePlan->chunkCount;
     PostCVSplitDetachedCommand &packing =
         appendWork(schedule, PostCVSplitDetachedSide::Vector,
-                   PostCVSplitDetachedCommandKind::DirectNzPack,
+                   PostCVSplitDetachedCommandKind::ProbabilityPack,
                    PostCVSplitLineageRole::Probability, lane,
                    probabilitySlot->slot, PrincipalResource::Vector);
     packing.rows = lanePlan->rows;

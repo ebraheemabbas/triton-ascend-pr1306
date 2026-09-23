@@ -150,7 +150,7 @@ static bool verifyPlan(const PostCVSplitSchedulePlan &plan) {
     uint64_t covered;
     if (lane.lane >= lanes || lane.rows != plan.recurrence.vectorRows ||
         lane.chunkWidth != kVectorChunkElements ||
-        !lane.directNzPacking ||
+        lane.directNzPacking != plan.directNzPacking ||
         !checkedBufferMultiply(lane.chunkWidth, lane.chunkCount, covered) ||
         covered != plan.recurrence.scoreWidth)
       return false;
@@ -167,11 +167,13 @@ static bool verifyPlan(const PostCVSplitSchedulePlan &plan) {
 
 } // namespace
 
-PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
-    const PostCVSplitRequestSet &requests,
-    const CrossCoreResourcePlan &currentResources,
-    const CrossCoreResourceLimits &limits) {
+PostCVSplitSchedulePlan
+buildPostCVSplitSchedulePlan(const PostCVSplitRequestSet &requests,
+                             const CrossCoreResourcePlan &currentResources,
+                             const CrossCoreResourceLimits &limits,
+                             bool directNzPacking) {
   PostCVSplitSchedulePlan plan;
+  plan.directNzPacking = directNzPacking;
   plan.firstLogicalFlagId = limits.firstAvailableFlagId;
   plan.maximumLogicalFlagId = kMaximumLogicalFlagId;
   if (requests.target.archFamily != CVSplitArchFamily::A5 ||
@@ -347,9 +349,9 @@ PostCVSplitSchedulePlan buildPostCVSplitSchedulePlan(
         {PostCVSplitLineageRole::Probability, lane, lane});
     plan.slots.push_back({PostCVSplitLineageRole::Product, lane,
                           rotatingBufferSlot(lane, plan.productUbSlotCount)});
-    plan.vectorLanes.push_back(
-        {lane, scoreTransfer.rows, kVectorChunkElements,
-         scoreTransfer.columns / kVectorChunkElements, true});
+    plan.vectorLanes.push_back({lane, scoreTransfer.rows, kVectorChunkElements,
+                                scoreTransfer.columns / kVectorChunkElements,
+                                directNzPacking});
   }
 
   unsigned nextFlag = plan.firstLogicalFlagId;

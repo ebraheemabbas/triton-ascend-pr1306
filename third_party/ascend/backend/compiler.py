@@ -301,7 +301,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                 schedule_candidate_id=metadata["cv_split_schedule_candidate_id"],
                 l0c_buffer_mode=metadata["cv_split_l0c_buffer_mode"],
                 post_split_schedule_mode=metadata[
-                    "cv_split_post_split_schedule_mode"])
+                    "cv_split_post_split_schedule_mode"],
+                probability_packing=metadata["cv_split_probability_packing"])
 
         if try_dynamic_cv:
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
@@ -1229,6 +1230,9 @@ class NPUOptions:
     # retains the generic path. Candidate selection remains explicit: -1 does
     # not select a structural candidate, so materialization may reject.
     cv_split_post_split_schedule_mode: str = "materialize"
+    # Representation of P inside the materialized softmax SIMD region.
+    # Both modes publish the same NZ buffer to L1 with the same schedule.
+    cv_split_probability_packing: str = "direct_nz"
     # Spare UB, in bytes, that cross-scope transfers may spend to stop reusing
     # buffers across unrolled lanes. It funds merging the two CUBE->VECTOR
     # roles onto one union slot per lane, which is what lets HEAD_DIM differ
@@ -1275,6 +1279,11 @@ class NPUOptions:
 
     def __post_init__(self, arch):
         from triton.backends.ascend import _apply_ascend_patch
+
+        if self.cv_split_probability_packing not in ("direct_nz", "nd_transpose"):
+            raise ValueError(
+                "cv_split_probability_packing must be 'direct_nz' or 'nd_transpose', "
+                f"got {self.cv_split_probability_packing!r}")
 
         _apply_ascend_patch()
         object.__setattr__(self, "target_arch", arch)
