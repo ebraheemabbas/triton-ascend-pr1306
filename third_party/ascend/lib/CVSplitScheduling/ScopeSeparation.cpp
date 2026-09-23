@@ -1943,21 +1943,57 @@ materializeOnlineSoftmaxLane(VectorToCubePack &pack, unsigned lane,
 
   Value probability = expLoop.getResult(1);
   if (!directNzPacking) {
-    // Keep the transpose INSIDE the same SIMD region so Bisheng may fuse it
-    // into the producer's stores. The external NZ type, copy and event anchor
-    // remain identical to direct packing.
-    auto shapeType = RankedTensorType::get({3}, b.getI64Type());
-    auto shape = b.create<arith::ConstantOp>(
-        loc, shapeType,
-        DenseElementsAttr::get(shapeType,
-                               ArrayRef<int64_t>{rows, n16, kNzTileSize}));
-    auto ndType = RankedTensorType::get({rows, n16, kNzTileSize}, pElement);
-    Value nd = b.create<tensor::ReshapeOp>(loc, ndType, probability, shape);
+    // Ordinary P is complete before this packing loop. Tile its transpose to
+    // the same register-sized chunks as softmax: a whole rows*N transpose in
+    // an explicit SIMD region exceeds Bisheng's vector capacity.
+    // Keep this loop inside the producer VF; external NZ type/copy/events
+    // are unchanged. Backend loop/store fusion remains an optimization choice.
     Value nzInit =
         b.create<tensor::EmptyOp>(loc, packedType.getShape(), pElement);
-    probability = b.create<linalg::TransposeOp>(loc, nd, nzInit,
+    auto packLoop =
+        b.create<scf::ForOp>(loc, lower, upper, step, ValueRange{nzInit});
+    Block *packBody = packLoop.getBody();
+    if (!packBody->empty())
+      packBody->back().erase();
+    OpBuilder pb = OpBuilder::atBlockEnd(packBody);
+    Value packRow = pb.create<arith::IndexCastOp>(loc, pb.getIndexType(),
+                                                  packLoop.getInductionVar());
+    Value nzRows = packLoop.getRegionIterArgs()[0];
+    for (int64_t chunk = 0; chunk < width; chunk += chunkWidth) {
+      auto chunkType = RankedTensorType::get({1, chunkWidth}, pElement);
+      Value slice = pb.create<tensor::ExtractSliceOp>(
+          loc, chunkType, probability,
+          SmallVector<OpFoldResult>{packRow, pb.getIndexAttr(chunk)},
+          SmallVector<OpFoldResult>{pb.getIndexAttr(1),
+                                    pb.getIndexAttr(chunkWidth)},
+          SmallVector<OpFoldResult>{pb.getIndexAttr(1), pb.getIndexAttr(1)});
+      auto shapeType = RankedTensorType::get({3}, pb.getI64Type());
+      auto shape = pb.create<arith::ConstantOp>(
+          loc, shapeType,
+          DenseElementsAttr::get(
+              shapeType,
+              ArrayRef<int64_t>{1, chunkWidth / kNzTileSize, kNzTileSize}));
+      auto ndType = RankedTensorType::get(
+          {1, chunkWidth / kNzTileSize, kNzTileSize}, pElement);
+      Value nd = pb.create<tensor::ReshapeOp>(loc, ndType, slice, shape);
+      Value chunkInit = pb.create<tensor::EmptyOp>(
+          loc, ArrayRef<int64_t>{chunkWidth / kNzTileSize, 1, kNzTileSize},
+          pElement);
+      Value nz = pb.create<linalg::TransposeOp>(loc, nd, chunkInit,
                                                 ArrayRef<int64_t>{1, 0, 2})
-                      ->getResult(0);
+                     ->getResult(0);
+      nzRows = pb.create<tensor::InsertSliceOp>(
+          loc, nz, nzRows,
+          SmallVector<OpFoldResult>{pb.getIndexAttr(chunk / kNzTileSize),
+                                    packRow, pb.getIndexAttr(0)},
+          SmallVector<OpFoldResult>{pb.getIndexAttr(chunkWidth / kNzTileSize),
+                                    pb.getIndexAttr(1),
+                                    pb.getIndexAttr(kNzTileSize)},
+          SmallVector<OpFoldResult>{pb.getIndexAttr(1), pb.getIndexAttr(1),
+                                    pb.getIndexAttr(1)});
+    }
+    pb.create<scf::YieldOp>(loc, nzRows);
+    probability = packLoop.getResult(0);
   }
   if (deferLaneSum)
     b.create<scope::ReturnOp>(

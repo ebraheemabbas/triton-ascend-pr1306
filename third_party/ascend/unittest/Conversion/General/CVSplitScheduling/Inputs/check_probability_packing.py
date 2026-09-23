@@ -59,14 +59,15 @@ def check(tool, source, unroll, rows, width=128):
     direct_regions, nd_regions = simd_regions(direct_vector), simd_regions(nd_vector)
     assert len(direct_regions) == len(nd_regions), "SIMD region boundaries changed"
     assert "linalg.transpose" not in direct_vector
-    assert nd_vector.count("linalg.transpose") == unroll
+    assert nd_vector.count("linalg.transpose") == unroll * (width // 64)
     # Each transpose must remain INSIDE its producer SIMD region, with NZ output.
     pack_regions = [region for region in nd_regions if "linalg.transpose" in region]
     assert len(pack_regions) == unroll
     for region in pack_regions:
-        assert region.count("linalg.transpose") == 1
+        assert region.count("linalg.transpose") == width // 64
         assert f"tensor<{rows}x{width}xf16>" in region
-        assert f"tensor<{rows}x{width // 16}x16xf16>" in region
+        assert "tensor<1x4x16xf16>" in region
+        assert "tensor<4x1x16xf16>" in region
         assert f"tensor<{width // 16}x{rows}x16xf16>" in region
         assert "permutation = [1, 0, 2]" in region
     for ir in (direct, nd):
@@ -74,7 +75,28 @@ def check(tool, source, unroll, rows, width=128):
     print(f"PACKING=PASS U{unroll} rows={rows} width={width}")
 
 
+def check_tiled_layout():
+    for rows in (16, 32, 64, 128):
+        for width in (64, 128, 256):
+            nd = list(range(rows * width))
+            actual = [None] * len(nd)
+            for row in range(rows):
+                for chunk in range(0, width, 64):
+                    for block in range(4):
+                        for inner in range(16):
+                            col = chunk + block * 16 + inner
+                            dst = ((chunk // 16 + block) * rows + row) * 16 + inner
+                            assert actual[dst] is None
+                            actual[dst] = nd[row * width + col]
+            expected = [nd[row * width + block * 16 + inner]
+                        for block in range(width // 16)
+                        for row in range(rows) for inner in range(16)]
+            assert actual == expected
+    print("TILED_ND_TRANSPOSE_LAYOUT=PASS 12 geometries")
+
+
 def main():
+    check_tiled_layout()
     tool, fixture = sys.argv[1:]
     root = Path(fixture).parent
     for name, rows in (("cv_split_asymmetric_materializer.mlir", 64),
